@@ -554,9 +554,24 @@ export function streamKiro(
       });
 
       let systemPrompt = context.systemPrompt ?? "";
-      // NOTE: thinking is controlled via additionalModelRequestFields.thinking
-      // (adaptive thinking config), NOT via <thinking_mode> XML tags in the
-      // content. Kiro's API rejects those tags as "Improperly formed request".
+      // Inject `<thinking_mode>` directive into the system prompt when
+      // reasoning is enabled. This triggers Kiro to stream `reasoningContentEvent`
+      // frames. The directive goes in the seed prompt content (first userInputMessage),
+      // NOT in additionalModelRequestFields. Matches the real Kiro CLI behavior.
+      if (thinkingEnabled && !reasoningHidden) {
+        const reasoningLevel = String(options?.reasoning ?? "");
+        const budget =
+          reasoningLevel === "xhigh" || reasoningLevel === "max"
+            ? 50000
+            : reasoningLevel === "high"
+              ? 30000
+              : reasoningLevel === "medium"
+                ? 20000
+                : 10000;
+        systemPrompt = `<thinking_mode>enabled</thinking_mode><max_thinking_length>${budget}</max_thinking_length>${
+          systemPrompt ? `\n${systemPrompt}` : ""
+        }`;
+      }
 
       // Build envState from the host process (matches real Kiro CLI).
       const envState: KiroEnvState = {
@@ -595,13 +610,19 @@ export function streamKiro(
         if (firstMsg?.role === "assistant") {
           const am = firstMsg;
           let armContent = "";
+          let armReasoningText = "";
+          let armReasoningSignature = "";
           const armToolUses: Array<{ name: string; toolUseId: string; input: Record<string, unknown> }> = [];
           if (Array.isArray(am.content)) {
             for (const b of am.content) {
               if (b.type === "text") {
                 armContent += (b as TextContent).text;
               } else if (b.type === "thinking") {
-                armContent = `<thinking>${(b as unknown as { thinking: string }).thinking}</thinking>\n\n${armContent}`;
+                // Accumulate thinking text + signature for the reasoningContent field.
+                // The real Kiro CLI uses a structured field, NOT <thinking> XML tags.
+                const tb = b as unknown as { thinking: string; thinkingSignature?: string };
+                armReasoningText += tb.thinking;
+                if (tb.thinkingSignature) armReasoningSignature = tb.thinkingSignature;
               } else if (b.type === "toolCall") {
                 const tc = b as ToolCall;
                 armToolUses.push({
@@ -612,8 +633,12 @@ export function streamKiro(
               }
             }
           }
-          if (armContent || armToolUses.length > 0) {
+          const hasReasoning = armReasoningText.length > 0;
+          if (armContent || armToolUses.length > 0 || hasReasoning) {
             const last = history[history.length - 1];
+            const reasoningContent = hasReasoning
+              ? { reasoningText: { text: armReasoningText, signature: armReasoningSignature } }
+              : undefined;
             if (last && !last.userInputMessage && last.assistantResponseMessage) {
               last.assistantResponseMessage.content += `\n\n${armContent}`;
               if (armToolUses.length > 0) {
@@ -622,11 +647,15 @@ export function streamKiro(
                   ...armToolUses,
                 ];
               }
+              if (reasoningContent) {
+                last.assistantResponseMessage.reasoningContent = reasoningContent;
+              }
             } else {
               history.push({
                 assistantResponseMessage: {
                   content: armContent,
                   ...(armToolUses.length > 0 ? { toolUses: armToolUses } : {}),
+                  ...(reasoningContent ? { reasoningContent } : {}),
                 },
               });
             }
@@ -799,15 +828,13 @@ export function streamKiro(
           }
         }
 
-        // Request the adaptive thinking block so that Kiro streams the reasoning text.
-        if (supportsThinkingConfig && thinkingEnabled) {
-          request.additionalModelRequestFields = request.additionalModelRequestFields || {};
-          request.additionalModelRequestFields.thinking = {
-            type: "adaptive",
-            display: "summarized",
-          };
-          log.debug("thinking.set", { type: "adaptive", display: "summarized", model: model.id });
-        }
+        // NOTE: Do NOT set additionalModelRequestFields.thinking here.
+        // The real Kiro CLI never sends a thinking config — reasoning is
+        // enabled by default when output_config.effort is present.
+        // Setting thinking.type: "adaptive" explicitly was SUPPRESSING
+        // reasoning for simpler prompts (the model would decide not to
+        // think). Without it, Kiro streams reasoningContentEvent frames
+        // unconditionally when effort ≥ "high".
 
         // -- HTTP request with capacity-retry inner loop -----------------
         // Emit `start` and arm the hidden-reasoning countdown. The
@@ -973,6 +1000,7 @@ export function streamKiro(
         let totalContent = "";
         let lastContentData = "";
         let usageEvent: { inputTokens?: number; outputTokens?: number } | null = null;
+        let meteringCredits: number | undefined;
         let receivedContextUsage = false;
         let chunkSeq = 0;
         let eventSeq = 0;
@@ -1177,6 +1205,10 @@ export function streamKiro(
                 usageEvent = event.data;
                 break;
               }
+              case "metering": {
+                meteringCredits = event.data.usage;
+                break;
+              }
               case "error": {
                 streamError = event.data.message
                   ? `${event.data.error}: ${event.data.message}`
@@ -1251,6 +1283,10 @@ export function streamKiro(
           calculateCost(model, output.usage);
         } catch {
           output.usage.cost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
+        }
+        if (meteringCredits !== undefined) {
+          if (!output.usage.cost) output.usage.cost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
+          output.usage.cost.total = meteringCredits;
         }
 
         const textBlock =

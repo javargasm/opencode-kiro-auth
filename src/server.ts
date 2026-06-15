@@ -126,6 +126,9 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
   return new Promise((resolve) => {
     const server = Bun.serve({
       port,
+      // Reasoning models can take 30-60s before emitting the first token
+      // while thinking. Bun's default 10s idle timeout is far too short.
+      idleTimeout: 300,
       async fetch(req) {
         // Handle CORS preflight
         if (req.method === "OPTIONS") {

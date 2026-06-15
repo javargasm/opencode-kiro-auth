@@ -16,7 +16,8 @@ export type KiroStreamEvent =
   | { type: "reasoning"; data: { text: string; signature?: string } }
   | { type: "followupPrompt"; data: string }
   | { type: "usage"; data: { inputTokens?: number; outputTokens?: number } }
-  | { type: "error"; data: { error: string; message?: string } };
+  | { type: "error"; data: { error: string; message?: string } }
+  | { type: "metering"; data: { usage: number } };
 
 /** Find the matching `}` for the `{` at `start`. Returns -1 if incomplete. */
 export function findJsonEnd(text: string, start: number): number {
@@ -48,16 +49,20 @@ export function findJsonEnd(text: string, start: number): number {
   return -1;
 }
 
-export function parseKiroEvent(parsed: Record<string, unknown>): KiroStreamEvent | null {
+export function parseKiroEventMulti(parsed: Record<string, unknown>): KiroStreamEvent[] {
+  const events: KiroStreamEvent[] = [];
+
   if (parsed.content !== undefined) {
-    return { type: "content", data: parsed.content as string };
+    events.push({ type: "content", data: parsed.content as string });
   }
 
-  if (parsed.reasoningText !== undefined || parsed.signature !== undefined || (parsed.text !== undefined && !parsed.content && !parsed.name && !parsed.message)) {
+  if (parsed.reasoningContent !== undefined || parsed.reasoningText !== undefined || parsed.signature !== undefined || (parsed.text !== undefined && !parsed.content && !parsed.name && !parsed.message)) {
     let text = "";
     let signature: string | undefined;
 
-    if (parsed.reasoningText) {
+    if (parsed.reasoningContent !== undefined) {
+      text = parsed.reasoningContent as string;
+    } else if (parsed.reasoningText) {
       const rt = parsed.reasoningText as Record<string, unknown>;
       text = ((rt.text ?? rt.Text) || "") as string;
       signature = (rt.signature ?? rt.Signature) as string | undefined;
@@ -66,13 +71,31 @@ export function parseKiroEvent(parsed: Record<string, unknown>): KiroStreamEvent
       signature = parsed.signature as string | undefined;
     }
 
-    return {
+    events.push({
       type: "reasoning",
       data: { text, signature },
-    };
+    });
   }
 
-  if (parsed.name && parsed.toolUseId) {
+  const toolUseBlock = parsed.toolUse as Record<string, unknown> | undefined;
+  if (toolUseBlock && toolUseBlock.name && toolUseBlock.toolUseId) {
+    const rawInput = toolUseBlock.input;
+    const input =
+      typeof rawInput === "string"
+        ? rawInput
+        : rawInput && typeof rawInput === "object" && Object.keys(rawInput as Record<string, unknown>).length > 0
+          ? JSON.stringify(rawInput)
+          : "";
+    events.push({
+      type: "toolUse",
+      data: {
+        name: toolUseBlock.name as string,
+        toolUseId: toolUseBlock.toolUseId as string,
+        input,
+        stop: toolUseBlock.stop as boolean | undefined,
+      },
+    });
+  } else if (parsed.name && parsed.toolUseId) {
     const rawInput = parsed.input;
     const input =
       typeof rawInput === "string"
@@ -80,7 +103,7 @@ export function parseKiroEvent(parsed: Record<string, unknown>): KiroStreamEvent
         : rawInput && typeof rawInput === "object" && Object.keys(rawInput as Record<string, unknown>).length > 0
           ? JSON.stringify(rawInput)
           : "";
-    return {
+    events.push({
       type: "toolUse",
       data: {
         name: parsed.name as string,
@@ -88,57 +111,77 @@ export function parseKiroEvent(parsed: Record<string, unknown>): KiroStreamEvent
         input,
         stop: parsed.stop as boolean | undefined,
       },
-    };
+    });
   }
 
-  if (parsed.input !== undefined && !parsed.name) {
-    return {
+  if (parsed.input !== undefined && !parsed.name && !toolUseBlock) {
+    events.push({
       type: "toolUseInput",
       data: {
         input: typeof parsed.input === "string" ? parsed.input : JSON.stringify(parsed.input),
       },
-    };
+    });
   }
 
-  if (parsed.stop !== undefined && parsed.contextUsagePercentage === undefined) {
-    return { type: "toolUseStop", data: { stop: parsed.stop as boolean } };
-  }
-
-  if (parsed.contextUsagePercentage !== undefined) {
-    return {
-      type: "contextUsage",
-      data: { contextUsagePercentage: parsed.contextUsagePercentage as number },
-    };
+  if (parsed.stop !== undefined && parsed.contextUsagePercentage === undefined && !toolUseBlock) {
+    events.push({ type: "toolUseStop", data: { stop: parsed.stop as boolean } });
   }
 
   if (parsed.followupPrompt !== undefined) {
-    return { type: "followupPrompt", data: parsed.followupPrompt as string };
+    events.push({ type: "followupPrompt", data: parsed.followupPrompt as string });
   }
 
   if (parsed.error !== undefined || parsed.Error !== undefined) {
     const err = (parsed.error || parsed.Error || "unknown") as string | Record<string, unknown>;
     const message = (parsed.message || parsed.Message || parsed.reason) as string | undefined;
-    return {
+    events.push({
       type: "error",
       data: {
         error: typeof err === "string" ? err : JSON.stringify(err),
         message,
       },
-    };
+    });
   }
 
   if (parsed.usage !== undefined) {
     const u = parsed.usage as Record<string, unknown>;
-    return {
+    events.push({
       type: "usage",
       data: {
         inputTokens: u.inputTokens as number | undefined,
         outputTokens: u.outputTokens as number | undefined,
       },
-    };
+    });
+  }
+  
+  const metadata = parsed.metadata as Record<string, any> | undefined;
+  if (metadata) {
+    if (metadata.contextUsagePercentage !== undefined) {
+      events.push({
+        type: "contextUsage",
+        data: { contextUsagePercentage: metadata.contextUsagePercentage as number },
+      });
+    }
+    if (metadata.metering && metadata.metering.unit === "credit" && metadata.metering.usage !== undefined) {
+      events.push({
+        type: "metering",
+        data: { usage: metadata.metering.usage as number },
+      });
+    }
   }
 
-  return null;
+  if (parsed.contextUsagePercentage !== undefined && !metadata) {
+    events.push({
+      type: "contextUsage",
+      data: { contextUsagePercentage: parsed.contextUsagePercentage as number },
+    });
+  }
+
+  if (parsed.unit === "credit" && parsed.usage !== undefined && typeof parsed.usage === "number") {
+    events.push({ type: "metering", data: { usage: parsed.usage as number } });
+  }
+
+  return events;
 }
 
 /**
@@ -148,6 +191,9 @@ export function parseKiroEvent(parsed: Record<string, unknown>): KiroStreamEvent
 const EVENT_PATTERNS = [
   '{"content":',
   '{"reasoningText":',
+  '{"reasoningContent":',
+  '{"metadata":',
+  '{"metering":',
   '{"signature":',
   '{"text":',
   '{"name":',
@@ -221,9 +267,9 @@ export function parseKiroEvents(
         string,
         unknown
       >;
-      const event = parseKiroEvent(parsed);
-      if (event) {
-        events.push(event);
+      const newEvents = parseKiroEventMulti(parsed);
+      if (newEvents.length > 0) {
+        events.push(...newEvents);
       } else if (log.isDebug()) {
         // Frame parsed cleanly but didn't match any known event shape.
         // This is the primary signal for a new upstream event type

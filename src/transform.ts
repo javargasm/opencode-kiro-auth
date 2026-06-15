@@ -74,6 +74,12 @@ export interface KiroUserInputMessage {
 export interface KiroAssistantResponseMessage {
   content: string;
   toolUses?: KiroToolUse[];
+  reasoningContent?: {
+    reasoningText: {
+      text: string;
+      signature: string;
+    };
+  };
 }
 
 export interface KiroHistoryEntry {
