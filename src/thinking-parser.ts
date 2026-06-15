@@ -16,6 +16,7 @@ const THINKING_TAG_VARIANTS: Array<{ open: string; close: string }> = [
   { open: "<think>", close: "</think>" },
   { open: "<reasoning>", close: "</reasoning>" },
   { open: "<thought>", close: "</thought>" },
+  { open: "<internal_thinking>", close: "</internal_thinking>" },
 ];
 
 /** Longest suffix of `text` that matches a prefix of `tag`. */
