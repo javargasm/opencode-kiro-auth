@@ -106,6 +106,8 @@ export function extractImages(msg: Message): ImageContent[] {
 
 export function getContentText(msg: Message): string {
   if (msg.role === "toolResult") {
+    if (typeof msg.content === "string") return msg.content;
+    if (!Array.isArray(msg.content)) return "";
     return msg.content.map((c) => (c.type === "text" ? c.text : "")).join("");
   }
   if (typeof msg.content === "string") return msg.content;

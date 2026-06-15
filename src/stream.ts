@@ -785,13 +785,12 @@ export function streamKiro(
         };
 
         // Attach adaptive thinking effort when the model supports it.
-        // OpenCode effort levels (low, medium, high, xhigh, max) map 1:1 to
-        // Kiro's Adaptive Thinking `output_config.effort` values.
+        // Pi has 5 levels (minimal…xhigh), Kiro has 5 (low…max).
+        // Pi's extra bottom level (`minimal`) means each maps one up.
         const staticModel = kiroModels.find((m) => m.id === model.id) as KiroModel | undefined;
         const dynamicModel = getCachedDynamicModels()?.find((m) => m.id === model.id);
         const supportedEfforts = staticModel?.supportedEfforts ?? dynamicModel?.supportedEfforts;
         const supportsThinkingConfig = staticModel?.supportsThinkingConfig ?? dynamicModel?.supportsThinkingConfig;
-        
         if (supportedEfforts && supportedEfforts.length > 0 && options?.reasoning && typeof options.reasoning === "string") {
           if (supportedEfforts.includes(options.reasoning)) {
             request.additionalModelRequestFields = request.additionalModelRequestFields || {};

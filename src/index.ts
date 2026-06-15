@@ -14,9 +14,10 @@ import {
   pollForToken, 
   refreshKiroToken 
 } from "./oauth";
-import { 
+import {
   kiroModels, 
-  type KiroModelDef 
+  type KiroModelDef,
+  getCachedDynamicModels
 } from "./models";
 
 // Global server instance to manage lifecycle across reloads
@@ -314,8 +315,9 @@ export const KiroPlugin: Plugin = async (input) => {
       kiro.api = kiro.api ?? `http://127.0.0.1:${localPort}/v1`;
       kiro.models = kiro.models ?? {};
 
-      // Inject static models (user-defined models in config take precedence)
-      for (const m of kiroModels) {
+      // Inject dynamic models if available, otherwise fallback to static models.
+      const allModels = getCachedDynamicModels() || kiroModels;
+      for (const m of allModels) {
         if (kiro.models[m.id]) continue; // don't overwrite user customizations
         kiro.models[m.id] = {
           id: m.id,

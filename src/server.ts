@@ -2,8 +2,11 @@ import type { Server } from "bun";
 import type { Message, Model, Api, Context } from "./types";
 import { streamKiro, seedProfileArn } from "./stream";
 import { log } from "./debug";
+import { KIRO_MODEL_IDS, fetchAvailableModels, buildModelsFromApi, setCachedDynamicModels } from "./models";
 import { resolveKiroModel, resolveApiRegion } from "./models";
 import { refreshKiroToken } from "./oauth";
+import { stats } from "./dashboard-stats";
+import { getDashboardHtml } from "./dashboard-ui";
 
 // ── Gateway credential store ─────────────────────────────────────────
 // The gateway owns the Kiro auth lifecycle: import → store → refresh.
@@ -51,6 +54,16 @@ export async function initGatewayAuth(): Promise<void> {
     };
 
     log.info(`[gateway-auth] Initialized (method=${imported.authMethod}, region=${imported.region})`);
+
+    // Fetch available models from the backend to ensure dynamic models are used
+    try {
+      const apiModels = await fetchAvailableModels(imported.accessToken, imported.region, imported.profileArn);
+      const built = buildModelsFromApi(apiModels);
+      setCachedDynamicModels(built);
+      log.info(`[kiro-models.fetched] Found ${built.length} available models`);
+    } catch (err) {
+      log.warn("[gateway-auth] Failed to fetch dynamic models (will fallback to static list)", err);
+    }
   } catch (err) {
     log.error("[gateway-auth] Init failed", err);
   }
@@ -127,6 +140,18 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
 
         const url = new URL(req.url);
 
+        // Dashboard endpoints
+        if (url.pathname === "/dashboard") {
+          return new Response(getDashboardHtml(), {
+            headers: { "Content-Type": "text/html" },
+          });
+        }
+        if (url.pathname === "/dashboard/api/stats") {
+          return new Response(JSON.stringify(stats.getStats()), {
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+
         // Health check endpoint
         if (url.pathname === "/health" || url.pathname === "/") {
           return new Response(JSON.stringify({ status: "healthy", service: "opencode-kiro-gateway" }), {
@@ -198,20 +223,13 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
               maxTokens: 128_000,
             };
 
-            let reasoningEffort = body.reasoning_effort;
-            if (body.thinking) {
-              if (body.thinking.type === "disabled") {
-                reasoningEffort = undefined;
-              } else {
-                const budget = body.thinking.budget_tokens ?? 20000;
-                if (budget <= 10000) reasoningEffort = "low";
-                else if (budget <= 20000) reasoningEffort = "medium";
-                else if (budget <= 30000) reasoningEffort = "high";
-                else reasoningEffort = "xhigh";
-              }
-            } else {
-              reasoningEffort = reasoningEffort ?? "medium";
-            }
+            log.debug("[gateway] body-keys", Object.keys(body));
+
+            // OpenCode sends effort in `output_config.effort` (Anthropic extended thinking format)
+            // or fallback to `reasoning_effort` (standard Anthropic field).
+            const reasoningEffort = body.output_config?.effort
+              ?? body.reasoning_effort
+              ?? undefined;
 
             log.info(`[gateway] → ${kiroEndpoint} model=${anthropicModelId} region=${apiRegion} stream=${streamRequested}`);
 
@@ -290,11 +308,9 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
                     );
 
                     let contentBlockIndex = 0;
-                    let activeBlockType: "thinking" | "text" | null = null;
+                    let activeBlockType: "thinking" | "text" | "tool_use" | null = null;
 
-                    const ensureBlockStarted = (type: "thinking" | "text") => {
-                      if (activeBlockType === type) return;
-
+                    const closeActiveBlock = () => {
                       if (activeBlockType !== null) {
                         controller.enqueue(
                           "event: content_block_stop\ndata: " +
@@ -303,7 +319,13 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
                             index: contentBlockIndex - 1
                           }) + "\n\n"
                         );
+                        activeBlockType = null;
                       }
+                    };
+
+                    const ensureBlockStarted = (type: "thinking" | "text") => {
+                      if (activeBlockType === type) return;
+                      closeActiveBlock();
 
                       activeBlockType = type;
                       controller.enqueue(
@@ -348,19 +370,11 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
                           }) + "\n\n"
                         );
                       } else if (event.type === "toolcall_start") {
-                        if (activeBlockType !== null) {
-                          controller.enqueue(
-                            "event: content_block_stop\ndata: " +
-                            JSON.stringify({
-                              type: "content_block_stop",
-                              index: contentBlockIndex - 1
-                            }) + "\n\n"
-                          );
-                          activeBlockType = null;
-                        }
+                        closeActiveBlock();
 
                         const tc = event.partial.content[event.contentIndex];
                         if (tc && tc.type === "toolCall") {
+                          activeBlockType = "tool_use";
                           controller.enqueue(
                             "event: content_block_start\ndata: " +
                             JSON.stringify({
@@ -400,21 +414,25 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
                       processEvent(event);
                     }
 
-                    if (activeBlockType !== null) {
-                      controller.enqueue(
-                        "event: content_block_stop\ndata: " +
-                        JSON.stringify({
-                          type: "content_block_stop",
-                          index: contentBlockIndex - 1
-                        }) + "\n\n"
-                      );
-                    }
+                    closeActiveBlock();
 
                     let finishReason = "end_turn";
                     const finalMsg = await kiroStream.result();
                     if (finalMsg.content.some((b: any) => b.type === "toolCall")) {
                       finishReason = "tool_use";
                     }
+
+                    const inputTokens = finalMsg.usage?.input ?? 0;
+                    const outputTokens = finalMsg.usage?.output ?? 0;
+                    const credits = finalMsg.usage?.cost?.total ?? 0;
+                    stats.recordRequest({
+                      id: msgId,
+                      model: anthropicModelId,
+                      inputTokens,
+                      outputTokens,
+                      credits,
+                      stream: true
+                    });
 
                     controller.enqueue(
                       "event: message_delta\ndata: " +
@@ -425,7 +443,7 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
                           stop_sequence: null
                         },
                         usage: {
-                          output_tokens: finalMsg.usage?.output ?? 0
+                          output_tokens: outputTokens
                         }
                       }) + "\n\n"
                     );
@@ -488,8 +506,22 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
                 finishReason = "tool_use";
               }
 
+              const msgId = `msg_${crypto.randomUUID()}`;
+              
+              const inputTokens = finalMsg.usage?.input ?? 0;
+              const outputTokens = finalMsg.usage?.output ?? 0;
+              const credits = finalMsg.usage?.cost?.total ?? 0;
+              stats.recordRequest({
+                id: msgId,
+                model: anthropicModelId,
+                inputTokens,
+                outputTokens,
+                credits,
+                stream: false
+              });
+
               const responseBody = {
-                id: `msg_${crypto.randomUUID()}`,
+                id: msgId,
                 type: "message",
                 role: "assistant",
                 content: anthropicContent,
@@ -497,8 +529,8 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
                 stop_reason: finishReason,
                 stop_sequence: null,
                 usage: {
-                  input_tokens: finalMsg.usage?.input ?? 0,
-                  output_tokens: finalMsg.usage?.output ?? 0,
+                  input_tokens: inputTokens,
+                  output_tokens: outputTokens,
                 }
               };
 
