@@ -1,0 +1,42 @@
+{
+  "name": "opencode-kiro",
+  "version": "0.1.0",
+  "description": "Kiro provider plugin for OpenCode: AWS Builder ID / Identity Center login and OpenAI compatible local gateway for CodeWhisperer streaming.",
+  "type": "module",
+  "license": "MIT",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "clean": "rm -rf dist",
+    "build:js": "bun build src/index.ts --outdir dist --target node --format esm --external '@opencode-ai/*'",
+    "build:types": "tsc -p tsconfig.build.json",
+    "build": "bun run clean && bun run build:js && bun run build:types",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "test:watch": "bun test --watch",
+    "check": "bun run typecheck && bun run test",
+    "prepack": "bun run build"
+  },
+  "dependencies": {},
+  "devDependencies": {
+
+    "@opencode-ai/plugin": "^1.17.3",
+    "@types/bun": "latest",
+    "@vitest/coverage-v8": "2.1.9",
+    "typescript": "^5.0.0",
+    "vitest": "^2.0.0"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "*"
+  }
+}

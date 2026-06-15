@@ -1,0 +1,32 @@
+# dependencies
+node_modules/
+
+# output
+dist/
+*.tgz
+
+# code coverage
+coverage/
+*.lcov
+
+# logs
+logs/
+*.log
+
+# dotenv environment variable files
+.env
+.env.*
+
+# caches
+.cache/
+*.tsbuildinfo
+
+# IDEs and OS files
+.idea/
+.vscode/
+.DS_Store
+
+# Local OpenCode runtime state
+.atl/
+.codegraph/
+.opencode/
