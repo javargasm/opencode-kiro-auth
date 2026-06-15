@@ -32,10 +32,6 @@ export const KIRO_MODEL_IDS = new Set<string>([
   "auto",
 ]);
 
-/** Convert pi's dash form to the Kiro API's dot form (e.g. 4-6 → 4.6). */
-export function dashToDot(modelId: string): string {
-  return modelId.replace(/(\d)-(\d)/g, "$1.$2");
-}
 
 /** Convert Kiro API's dot form to pi's dash form (e.g. 4.6 → 4-6). */
 export function dotToDash(modelId: string): string {
@@ -84,78 +80,7 @@ export function resolveApiRegion(ssoRegion: string | undefined): string {
   return API_REGION_MAP[ssoRegion] ?? ssoRegion;
 }
 
-/**
- * Models available per API region (allowlist). Unknown regions return an
- * empty list — update this map when Kiro launches in a new region.
- * Source: https://kiro.dev/docs/cli/models/
- */
-const MODELS_BY_REGION: Record<string, Set<string>> = {
-  "us-east-1": new Set([
-    "claude-fable-5",
-    "claude-opus-4-8",
-    "claude-opus-4-7",
-    "claude-opus-4-6",
-    "claude-opus-4-6-1m",
-    "claude-sonnet-4-6",
-    "claude-sonnet-4-6-1m",
-    "claude-opus-4-5",
-    "claude-sonnet-4-5",
-    "claude-sonnet-4-5-1m",
-    "claude-sonnet-4",
-    "claude-haiku-4-5",
-    "deepseek-3-2",
-    "kimi-k2-5",
-    "minimax-m2-1",
-    "minimax-m2-5",
-    "glm-4-7",
-    "glm-4-7-flash",
-    "qwen3-coder-next",
-    "qwen3-coder-480b",
-    "agi-nova-beta-1m",
-    "auto",
-  ]),
-  "eu-central-1": new Set([
-    "claude-fable-5",
-    "claude-opus-4-8",
-    "claude-opus-4-7",
-    "claude-opus-4-6",
-    "claude-sonnet-4-6",
-    "claude-opus-4-5",
-    "claude-sonnet-4-5",
-    "claude-sonnet-4",
-    "claude-haiku-4-5",
-    "minimax-m2-1",
-    "minimax-m2-5",
-    "qwen3-coder-next",
-    "auto",
-  ]),
-};
-
-export function filterModelsByRegion<T extends { id: string }>(
-  models: T[],
-  apiRegion: string,
-): T[] {
-  const allowed = MODELS_BY_REGION[apiRegion];
-  if (!allowed) {
-    console.warn(
-      `[opencode-kiro] Unknown API region "${apiRegion}" — no models available. Update MODELS_BY_REGION in models.ts.`,
-    );
-    return [];
-  }
-  return models.filter((m) => allowed.has(m.id));
-}
-
-/** Runtime endpoint per API region. Kiro CLI 2.5+ migrated from amazonaws.com to kiro.dev. */
-const RUNTIME_ENDPOINTS: Record<string, string> = {
-  "us-east-1": "https://runtime.us-east-1.kiro.dev",
-  "eu-central-1": "https://runtime.eu-central-1.kiro.dev",
-};
-
-export function resolveRuntimeUrl(apiRegion: string): string {
-  return RUNTIME_ENDPOINTS[apiRegion] ?? `https://runtime.${apiRegion}.kiro.dev`;
-}
-
-const BASE_URL = resolveRuntimeUrl("us-east-1");
+const BASE_URL = "https://runtime.us-east-1.kiro.dev";
 const ZERO_COST = Object.freeze({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
 
 /** Fields every Kiro model shares. Spread into each literal below. */
@@ -508,24 +433,11 @@ function firstTokenTimeout(dotId: string): number {
   return 90_000;
 }
 
-export interface KiroModelDef {
-  id: string;
-  name: string;
-  reasoning: boolean;
-  input: ("text" | "image")[];
-  contextWindow: number;
-  maxTokens: number;
-  firstTokenTimeout?: number;
-  reasoningHidden?: boolean;
-  supportedEfforts?: string[];
-  supportsThinkingConfig?: boolean;
-}
-
 /**
  * Build pi model definitions from the Kiro ListAvailableModels API response.
  * Adds any new model IDs dynamically to KIRO_MODEL_IDS so resolveKiroModel passes.
  */
-export function buildModelsFromApi(apiModels: KiroApiModel[]): KiroModelDef[] {
+export function buildModelsFromApi(apiModels: KiroApiModel[]): KiroModel[] {
   return apiModels.map((m) => {
     // Register the model ID dynamically to allow resolveKiroModel to pass
     KIRO_MODEL_IDS.add(m.modelId);
@@ -546,6 +458,7 @@ export function buildModelsFromApi(apiModels: KiroApiModel[]): KiroModelDef[] {
     const supportsThinkingConfig = !!m.additionalModelRequestFieldsSchema?.properties?.thinking;
 
     return {
+      ...KIRO_DEFAULTS,
       id: dashId,
       name: m.modelName,
       reasoning: isReasoningModel(m.modelId),
@@ -561,12 +474,12 @@ export function buildModelsFromApi(apiModels: KiroApiModel[]): KiroModelDef[] {
 }
 
 // Module-level cache for dynamically loaded models
-let cachedDynamicModels: KiroModelDef[] | null = null;
+let cachedDynamicModels: KiroModel[] | null = null;
 
-export function getCachedDynamicModels(): KiroModelDef[] | null {
+export function getCachedDynamicModels(): KiroModel[] | null {
   return cachedDynamicModels;
 }
 
-export function setCachedDynamicModels(models: KiroModelDef[] | null): void {
+export function setCachedDynamicModels(models: KiroModel[] | null): void {
   cachedDynamicModels = models;
 }

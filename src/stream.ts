@@ -14,7 +14,7 @@ import type {
   ToolCall,
   ToolResultMessage,
 } from "./types";
-import { type AssistantMessageEventStream, calculateCost, createAssistantMessageEventStream } from "./types";
+import { AssistantMessageEventStream, calculateCost } from "./types";
 import { log, previewChunk } from "./debug";
 import { parseKiroEvents } from "./event-parser";
 import { isPermanentError } from "./health";
@@ -22,10 +22,12 @@ import type { KiroModel } from "./models";
 import { kiroModels, resolveKiroModel, getCachedDynamicModels } from "./models";
 import { ThinkingTagParser } from "./thinking-parser";
 import { countTokens } from "./tokenizer";
+import { abortableDelay } from "./oauth";
 
 import {
   buildHistory,
   convertImagesToKiro,
+  convertToolsToKiro,
   extractImages,
   getContentText,
   type KiroEnvState,
@@ -152,21 +154,6 @@ function emitHiddenReasoningLate(
 	});
 }
 
-function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
-  if (signal?.aborted) return Promise.reject(signal.reason);
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(resolve, ms);
-    signal?.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(timer);
-        reject(signal.reason);
-      },
-      { once: true },
-    );
-  });
-}
-
 // ---- profileArn cache --------------------------------------------------
 
 const profileArnCache = new Map<string, string>();
@@ -255,6 +242,7 @@ interface KiroRequest {
     output_config?: { effort?: string };
     thinking?: { type: "adaptive" | "disabled"; display?: "summarized" | "omitted" };
     max_tokens?: number;
+
   };
 }
 
@@ -262,199 +250,6 @@ interface KiroToolCallState {
   toolUseId: string;
   name: string;
   input: string;
-}
-
-interface KiroToolUseSummary {
-  name: string;
-  toolUseId: string;
-  inputType: string;
-  inputKeys: string[];
-}
-
-interface KiroToolResultSummary {
-  toolUseId: string;
-  status: "success" | "error";
-  contentCount: number;
-  textChars: number;
-}
-
-interface KiroHistoryEntrySummary {
-  index: number;
-  role: "user" | "assistant" | "unknown";
-  contentChars: number;
-  imageCount?: number;
-  toolUses?: KiroToolUseSummary[];
-  toolResults?: KiroToolResultSummary[];
-}
-
-interface KiroToolSpecSummary {
-  name: string;
-  descriptionChars: number;
-  schemaKeys: string[];
-  propertyNames: string[];
-  requiredCount: number;
-}
-
-interface KiroRequestShapeSummary {
-  conversationId: string;
-  modelId?: string;
-  requestJsonChars: number;
-  historyLen: number;
-  roleSequence: string[];
-  history: KiroHistoryEntrySummary[];
-  current: {
-    contentChars: number;
-    imageCount: number;
-    toolResultCount: number;
-    toolSpecCount: number;
-    toolSpecNames: string[];
-    toolResults: KiroToolResultSummary[];
-    toolSpecs: KiroToolSpecSummary[];
-  };
-  toolIntegrity: {
-    toolUseIds: string[];
-    toolResultIds: string[];
-    duplicateToolUseIds: string[];
-    duplicateToolResultIds: string[];
-    unmatchedToolResults: string[];
-    toolUsesWithoutResults: string[];
-  };
-  additionalModelRequestFieldKeys: string[];
-  hasProfileArn: boolean;
-  agentMode?: string;
-}
-
-function uniqueSorted(values: string[]): string[] {
-  return [...new Set(values)].sort();
-}
-
-function duplicateValues(values: string[]): string[] {
-  const seen = new Set<string>();
-  const dupes = new Set<string>();
-  for (const value of values) {
-    if (seen.has(value)) dupes.add(value);
-    else seen.add(value);
-  }
-  return [...dupes].sort();
-}
-
-function objectKeys(value: unknown): string[] {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
-  return Object.keys(value as Record<string, unknown>).sort();
-}
-
-function summarizeToolUse(toolUse: { name: string; toolUseId: string; input: Record<string, unknown> }): KiroToolUseSummary {
-  const input = toolUse.input;
-  return {
-    name: toolUse.name,
-    toolUseId: toolUse.toolUseId,
-    inputType: Array.isArray(input) ? "array" : typeof input,
-    inputKeys: objectKeys(input),
-  };
-}
-
-function summarizeToolResult(toolResult: KiroToolResult): KiroToolResultSummary {
-  return {
-    toolUseId: toolResult.toolUseId,
-    status: toolResult.status,
-    contentCount: toolResult.content.length,
-    textChars: toolResult.content.reduce((sum, part) => sum + part.text.length, 0),
-  };
-}
-
-function summarizeToolSpec(toolSpec: KiroToolSpec): KiroToolSpecSummary {
-  const spec = toolSpec.toolSpecification;
-  const schema = spec.inputSchema.json;
-  const properties = schema.properties as Record<string, unknown> | undefined;
-  const required = schema.required;
-  return {
-    name: spec.name,
-    descriptionChars: spec.description.length,
-    schemaKeys: objectKeys(schema),
-    propertyNames: properties && typeof properties === "object" && !Array.isArray(properties)
-      ? Object.keys(properties).sort()
-      : [],
-    requiredCount: Array.isArray(required) ? required.length : 0,
-  };
-}
-
-function summarizeHistoryEntry(entry: KiroHistoryEntry, index: number): KiroHistoryEntrySummary {
-  if (entry.userInputMessage) {
-    const toolResults = entry.userInputMessage.userInputMessageContext?.toolResults ?? [];
-    return {
-      index,
-      role: "user",
-      contentChars: entry.userInputMessage.content.length,
-      imageCount: entry.userInputMessage.images?.length ?? 0,
-      ...(toolResults.length > 0 ? { toolResults: toolResults.map(summarizeToolResult) } : {}),
-    };
-  }
-  if (entry.assistantResponseMessage) {
-    const toolUses = entry.assistantResponseMessage.toolUses ?? [];
-    return {
-      index,
-      role: "assistant",
-      contentChars: entry.assistantResponseMessage.content.length,
-      ...(toolUses.length > 0 ? { toolUses: toolUses.map(summarizeToolUse) } : {}),
-    };
-  }
-  return { index, role: "unknown", contentChars: 0 };
-}
-
-function collectToolIntegrity(history: KiroHistoryEntry[], currentToolResults: KiroToolResult[]) {
-  const toolUseIds: string[] = [];
-  const toolResultIds: string[] = currentToolResults.map((toolResult) => toolResult.toolUseId);
-
-  for (const entry of history) {
-    for (const toolUse of entry.assistantResponseMessage?.toolUses ?? []) {
-      toolUseIds.push(toolUse.toolUseId);
-    }
-    for (const toolResult of entry.userInputMessage?.userInputMessageContext?.toolResults ?? []) {
-      toolResultIds.push(toolResult.toolUseId);
-    }
-  }
-
-  const useSet = new Set(toolUseIds);
-  const resultSet = new Set(toolResultIds);
-  return {
-    toolUseIds: uniqueSorted(toolUseIds),
-    toolResultIds: uniqueSorted(toolResultIds),
-    duplicateToolUseIds: duplicateValues(toolUseIds),
-    duplicateToolResultIds: duplicateValues(toolResultIds),
-    unmatchedToolResults: uniqueSorted(toolResultIds.filter((id) => !useSet.has(id))),
-    toolUsesWithoutResults: uniqueSorted(toolUseIds.filter((id) => !resultSet.has(id))),
-  };
-}
-
-function summarizeKiroRequest(request: KiroRequest, requestBody: string): KiroRequestShapeSummary {
-  const current = request.conversationState.currentMessage.userInputMessage;
-  const history = request.conversationState.history ?? [];
-  const currentContext = current.userInputMessageContext;
-  const currentToolResults = currentContext?.toolResults ?? [];
-  const currentTools = currentContext?.tools ?? [];
-  const historySummary = history.map(summarizeHistoryEntry);
-
-  return {
-    conversationId: request.conversationState.conversationId,
-    modelId: current.modelId,
-    requestJsonChars: requestBody.length,
-    historyLen: history.length,
-    roleSequence: historySummary.map((entry) => entry.role),
-    history: historySummary,
-    current: {
-      contentChars: current.content.length,
-      imageCount: current.images?.length ?? 0,
-      toolResultCount: currentToolResults.length,
-      toolSpecCount: currentTools.length,
-      toolSpecNames: currentTools.map((toolSpec) => toolSpec.toolSpecification.name).sort(),
-      toolResults: currentToolResults.map(summarizeToolResult),
-      toolSpecs: currentTools.map(summarizeToolSpec),
-    },
-    toolIntegrity: collectToolIntegrity(history, currentToolResults),
-    additionalModelRequestFieldKeys: objectKeys(request.additionalModelRequestFields),
-    hasProfileArn: !!request.profileArn,
-    agentMode: request.agentMode,
-  };
 }
 
 function emitToolCall(
@@ -493,7 +288,7 @@ export function streamKiro(
   context: Context,
   options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
-  const stream = createAssistantMessageEventStream();
+  const stream = new AssistantMessageEventStream();
   (async () => {
     const output: AssistantMessage = {
       role: "assistant",
@@ -743,45 +538,7 @@ export function streamKiro(
         };
         if (currentToolResults.length > 0) uimc.toolResults = currentToolResults;
         if (context.tools?.length) {
-          // Bedrock / Amazon Q strict schema requirements:
-          // 1. No $schema
-          // 2. No empty required arrays
-          // Note: additionalProperties IS supported by Bedrock and MUST be
-          // preserved — it constrains the model to only use declared properties,
-          // preventing hallucinated fields and schema-mismatch errors on the host.
-          const deepCleanSchema = (obj: any): any => {
-            if (Array.isArray(obj)) {
-              return obj.map(deepCleanSchema);
-            } else if (obj !== null && typeof obj === "object") {
-              const cleaned: any = {};
-              for (const [k, v] of Object.entries(obj)) {
-                if (k === "$schema") continue;
-                if (k === "required" && Array.isArray(v) && v.length === 0) continue;
-                cleaned[k] = deepCleanSchema(v);
-              }
-              return cleaned;
-            }
-            return obj;
-          };
-
-          uimc.tools = context.tools.map((t) => {
-            const params = deepCleanSchema(t.parameters) as Record<string, any>;
-            // Bedrock / Amazon Q often expects __tool_use_purpose in properties.
-            // We'll inject it just in case it's a hard requirement, though it might not be.
-            if (params.properties) {
-              params.properties.__tool_use_purpose = {
-                type: "string",
-                description: "A brief explanation why you are making this tool use.",
-              };
-            }
-            return {
-              toolSpecification: {
-                name: t.name,
-                description: t.description || `Use ${t.name}`,
-                inputSchema: { json: params },
-              },
-            };
-          });
+          uimc.tools = convertToolsToKiro(context.tools);
         }
 
         if (firstMsg?.role === "user") {
@@ -861,8 +618,7 @@ export function streamKiro(
           const mid = crypto.randomUUID().replace(/-/g, "");
           const ua = `aws-sdk-rust/1.0.0 ua/2.1 os/other lang/rust api/codewhispererstreaming#1.28.3 m/E app/AmazonQ-For-CLI md/appVersion-1.28.3-${mid}`;
           const requestBody = JSON.stringify(request);
-          const requestShape = log.isDebug() ? summarizeKiroRequest(request, requestBody) : undefined;
-          if (requestShape) log.debug("request.shape", requestShape);
+
 
           log.debug("request.send", {
             attempt: retryCount,
@@ -876,7 +632,9 @@ export function streamKiro(
 
           // Dump request body for debugging (debug level, file always written)
           log.debug(`[stream] req=${requestBody.length}c hist=${history.length} content=${currentContent.length}c profileArn=${!!profileArn}`);
-          try { require("fs").writeFileSync("/tmp/kiro-last-request.json", requestBody); } catch {}
+          if (log.isDebug()) {
+            try { require("fs").writeFileSync("/tmp/kiro-last-request.json", requestBody); } catch {}
+          }
 
           response = await fetch(endpoint, {
             method: "POST",
@@ -907,7 +665,7 @@ export function streamKiro(
           log.debug("response.error", {
             status: response.status,
             body: errText,
-            ...(requestShape ? { requestShape } : {}),
+
           });
 
           if (isCapacityError(errText) && capacityRetryCount < CAPACITY_MAX_RETRIES) {

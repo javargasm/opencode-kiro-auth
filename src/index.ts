@@ -16,7 +16,6 @@ import {
 } from "./oauth";
 import {
   kiroModels, 
-  type KiroModelDef,
   getCachedDynamicModels
 } from "./models";
 

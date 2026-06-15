@@ -166,6 +166,7 @@ const ALLOWED_SCHEMA_KEYS = new Set([
   "items", "default", "oneOf", "anyOf", "allOf",
   "minimum", "maximum", "minLength", "maxLength",
   "minItems", "maxItems", "pattern", "const", "title",
+  "additionalProperties",
 ]);
 
 function sanitizeSchema(obj: unknown): unknown {
@@ -177,6 +178,8 @@ function sanitizeSchema(obj: unknown): unknown {
   for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
     // Skip fields Kiro doesn't understand
     if (!ALLOWED_SCHEMA_KEYS.has(key) && key !== "__tool_use_purpose") continue;
+    // Omit empty required arrays (Bedrock strict schema requirement)
+    if (key === "required" && Array.isArray(value) && value.length === 0) continue;
     // Clamp extreme integer bounds (Zod emits ±MAX_SAFE_INTEGER)
     if ((key === "minimum" || key === "maximum") && typeof value === "number") {
       if (Math.abs(value) > 1_000_000_000) continue; // drop extreme bounds
@@ -194,7 +197,7 @@ export function convertToolsToKiro(tools: Tool[]): KiroToolSpec[] {
     return {
       toolSpecification: {
         name: tool.name,
-        description: tool.description,
+        description: tool.description || `Use ${tool.name}`,
         inputSchema: {
           json: {
             ...sanitized,

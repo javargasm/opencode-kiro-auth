@@ -29,7 +29,6 @@
 
     "@opencode-ai/plugin": "^1.17.3",
     "@types/bun": "latest",
-    "@vitest/coverage-v8": "2.1.9",
     "typescript": "^5.0.0",
     "vitest": "^2.0.0"
   },
