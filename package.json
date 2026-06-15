@@ -1,16 +1,16 @@
 {
-  "name": "@javargasm/opencode-kiro",
+  "name": "@javargasm/opencode-kiro-auth",
   "version": "0.1.0",
   "description": "Kiro provider plugin for OpenCode: AWS Builder ID / Identity Center login and OpenAI compatible local gateway for CodeWhisperer streaming.",
   "type": "module",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/javargasm/opencode-kiro.git"
+    "url": "git+https://github.com/javargasm/opencode-kiro-auth.git"
   },
-  "homepage": "https://github.com/javargasm/opencode-kiro#readme",
+  "homepage": "https://github.com/javargasm/opencode-kiro-auth#readme",
   "bugs": {
-    "url": "https://github.com/javargasm/opencode-kiro/issues"
+    "url": "https://github.com/javargasm/opencode-kiro-auth/issues"
   },
   "keywords": [
     "opencode-package",
