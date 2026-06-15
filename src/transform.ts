@@ -148,17 +148,48 @@ export function toKiroToolUseId(id: string): string {
   return `tooluse_${digest}`;
 }
 
+/**
+ * Strip JSON Schema fields that Kiro's API doesn't accept.
+ * MCP tools (from Zod) emit things like exclusiveMinimum, $schema,
+ * additionalProperties, etc. that cause "Improperly formed request".
+ */
+const ALLOWED_SCHEMA_KEYS = new Set([
+  "type", "properties", "required", "description", "enum",
+  "items", "default", "oneOf", "anyOf", "allOf",
+  "minimum", "maximum", "minLength", "maxLength",
+  "minItems", "maxItems", "pattern", "const", "title",
+]);
+
+function sanitizeSchema(obj: unknown): unknown {
+  if (obj === null || obj === undefined) return obj;
+  if (Array.isArray(obj)) return obj.map(sanitizeSchema);
+  if (typeof obj !== "object") return obj;
+
+  const result: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
+    // Skip fields Kiro doesn't understand
+    if (!ALLOWED_SCHEMA_KEYS.has(key) && key !== "__tool_use_purpose") continue;
+    // Clamp extreme integer bounds (Zod emits ±MAX_SAFE_INTEGER)
+    if ((key === "minimum" || key === "maximum") && typeof value === "number") {
+      if (Math.abs(value) > 1_000_000_000) continue; // drop extreme bounds
+    }
+    result[key] = sanitizeSchema(value);
+  }
+  return result;
+}
+
 export function convertToolsToKiro(tools: Tool[]): KiroToolSpec[] {
   return tools.map((tool) => {
     const schema = tool.parameters as Record<string, unknown>;
-    const props = (schema.properties ?? {}) as Record<string, unknown>;
+    const sanitized = sanitizeSchema(schema) as Record<string, unknown>;
+    const props = (sanitized.properties ?? {}) as Record<string, unknown>;
     return {
       toolSpecification: {
         name: tool.name,
         description: tool.description,
         inputSchema: {
           json: {
-            ...schema,
+            ...sanitized,
             properties: {
               ...props,
               __tool_use_purpose: TOOL_PURPOSE_FIELD,

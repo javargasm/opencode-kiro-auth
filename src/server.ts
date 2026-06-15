@@ -1,8 +1,113 @@
 import type { Server } from "bun";
 import type { Message, Model, Api, Context } from "./types";
-import { streamKiro } from "./stream";
+import { streamKiro, seedProfileArn } from "./stream";
 import { log } from "./debug";
-import { resolveKiroModel } from "./models";
+import { resolveKiroModel, resolveApiRegion } from "./models";
+import { refreshKiroToken } from "./oauth";
+
+// ── Gateway credential store ─────────────────────────────────────────
+// The gateway owns the Kiro auth lifecycle: import → store → refresh.
+// OpenCode's auth loader is kept only for the login UI flow; actual API
+// calls use these credentials directly.
+
+interface GatewayCredentials {
+  accessToken: string;
+  /** pipe-packed: refreshToken|clientId|clientSecret|authMethod */
+  refreshPacked: string;
+  region: string;
+  authMethod: "idc" | "desktop";
+  profileArn?: string;
+  expiresAt: number;
+}
+
+let _creds: GatewayCredentials | null = null;
+
+export function getAuthRegion(): string { return _creds?.region ?? "us-east-1"; }
+
+/** Called once at plugin startup from index.ts */
+export async function initGatewayAuth(): Promise<void> {
+  try {
+    const { importFromKiroCli } = await import("./kiro-cli-sync");
+    const imported = await importFromKiroCli();
+    if (!imported) {
+      log.warn("[gateway-auth] No Kiro CLI credentials found");
+      return;
+    }
+
+    const packParts = [
+      imported.refreshToken,
+      imported.clientId || "",
+      imported.clientSecret || "",
+      imported.authMethod,
+    ];
+
+    _creds = {
+      accessToken: imported.accessToken,
+      refreshPacked: packParts.join("|"),
+      region: imported.region,
+      authMethod: imported.authMethod,
+      profileArn: imported.profileArn,
+      expiresAt: Date.now() + 3500 * 1000, // assume ~1h validity
+    };
+
+    log.info(`[gateway-auth] Initialized (method=${imported.authMethod}, region=${imported.region})`);
+  } catch (err) {
+    log.error("[gateway-auth] Init failed", err);
+  }
+}
+
+/** Get a fresh access token, refreshing if expired. */
+async function getAccessToken(): Promise<string> {
+  if (!_creds) throw new Error("Kiro credentials not initialized — run /login kiro");
+
+  if (Date.now() >= _creds.expiresAt) {
+    log.info("[gateway-auth] Token expired, refreshing...");
+    const refreshed = await refreshKiroToken(
+      _creds.refreshPacked,
+      _creds.region,
+      _creds.authMethod,
+    );
+    _creds.accessToken = refreshed.access;
+    _creds.refreshPacked = refreshed.refresh;
+    _creds.expiresAt = refreshed.expires;
+    log.info("[gateway-auth] Token refreshed successfully");
+  }
+
+  return _creds.accessToken;
+}
+
+/** @internal — test helper to inject credentials without Kiro CLI */
+export function _seedCredentials(token: string, region = "us-east-1") {
+  _creds = {
+    accessToken: token,
+    refreshPacked: "",
+    region,
+    authMethod: "idc",
+    expiresAt: Date.now() + 3600_000,
+  };
+}
+
+/**
+ * Format an error response matching Anthropic's API error schema.
+ * @ai-sdk/anthropic parses this format to surface errors to the caller.
+ * Without it, errors are silently swallowed as "Unexpected server error".
+ */
+function anthropicError(
+  status: number,
+  type: "authentication_error" | "invalid_request_error" | "api_error" | "not_found_error" | "overloaded_error",
+  message: string,
+): Response {
+  return new Response(
+    JSON.stringify({ type: "error", error: { type, message } }),
+    {
+      status,
+      headers: {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+      },
+    },
+  );
+}
 
 export function startGatewayServer(port: number = 0): Promise<Server<any>> {
   return new Promise((resolve) => {
@@ -31,48 +136,62 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
 
         // Anthropic Messages endpoint
         if ((url.pathname === "/v1/messages" || url.pathname === "/messages") && req.method === "POST") {
-          const authHeader = req.headers.get("Authorization");
-          if (!authHeader || !authHeader.startsWith("Bearer ")) {
-            return new Response(JSON.stringify({ error: { message: "Unauthorized: Missing or invalid Authorization header" } }), {
-              status: 401,
-              headers: { "Content-Type": "application/json" },
-            });
+          // Gateway owns auth — get a fresh token from the credential store.
+          // OpenCode still sends a token in headers (for its own bookkeeping)
+          // but we ignore it and use our own.
+          let accessToken: string;
+          try {
+            accessToken = await getAccessToken();
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            return anthropicError(401, "authentication_error", `Kiro: ${msg}`);
           }
-
-          const accessToken = authHeader.substring(7).trim();
           let body: any;
           try {
             body = await req.json();
           } catch (e) {
-            return new Response(JSON.stringify({ error: { message: "Bad Request: Invalid JSON body" } }), {
-              status: 400,
-              headers: { "Content-Type": "application/json" },
-            });
+            return anthropicError(400, "invalid_request_error", "Bad Request: Invalid JSON body");
           }
 
           const anthropicModelId = body.model;
           const anthropicMessages = body.messages || [];
-          const systemPrompt = body.system || "";
+          // Anthropic system can be string or array of content blocks
+          let systemPrompt = "";
+          if (typeof body.system === "string") {
+            systemPrompt = body.system;
+          } else if (Array.isArray(body.system)) {
+            systemPrompt = body.system
+              .map((b: any) => (typeof b === "string" ? b : b.text || ""))
+              .join("\n");
+          }
           const streamRequested = !!body.stream;
           const temperature = body.temperature ?? 0.5;
 
+          log.debug(`[gateway] sys=${systemPrompt.length}c msgs=${anthropicMessages.length} tools=${body.tools?.length ?? 0}`);
+
           try {
             const piMessages = translateAnthropicToPi(anthropicMessages);
-            const kiroModelId = resolveKiroModel(anthropicModelId);
 
             const context: Context = {
               messages: piMessages,
-              systemPrompt,
+              // Don't send OpenCode's system prompt to Kiro — it's designed
+              // for Anthropic's native API and bloats the content to 34KB+.
+              // Kiro uses its own agent prompt via the synthetic seed pair.
+              systemPrompt: "",
               tools: body.tools ? translateAnthropicToolsToPi(body.tools) : undefined,
             };
+
+            // Region and endpoint come from the credential store
+            const apiRegion = resolveApiRegion(_creds!.region);
+            const kiroEndpoint = `https://runtime.${apiRegion}.kiro.dev`;
 
             const piModel: Model<Api> = {
               id: anthropicModelId,
               name: anthropicModelId,
               provider: "kiro",
               api: "kiro-api",
-              baseUrl: "https://runtime.us-east-1.kiro.dev", // Will be resolved per region inside streamKiro using the accessToken
-              reasoning: true, // Let streamKiro figure out details
+              baseUrl: kiroEndpoint,
+              reasoning: true,
               input: ["text", "image"],
               cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
               contextWindow: 1_000_000,
@@ -94,6 +213,13 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
               reasoningEffort = reasoningEffort ?? "medium";
             }
 
+            log.info(`[gateway] → ${kiroEndpoint} model=${anthropicModelId} region=${apiRegion} stream=${streamRequested}`);
+
+            // Seed profileArn from the credential store (already imported at init)
+            if (_creds!.profileArn) {
+              seedProfileArn(kiroEndpoint, _creds!.profileArn);
+            }
+
             const kiroStream = streamKiro(piModel, context, {
               apiKey: accessToken,
               reasoning: reasoningEffort,
@@ -101,6 +227,47 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
             });
 
             if (streamRequested) {
+              // Buffer first event: if the stream fails immediately (auth, profileArn, etc.)
+              // return a clean HTTP error instead of a broken SSE stream.
+              const iter = kiroStream[Symbol.asyncIterator]();
+              let firstResult: IteratorResult<any>;
+              try {
+                firstResult = await iter.next();
+              } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                log.error("[gateway] Stream failed before first event:", msg);
+                return anthropicError(502, "api_error", `Kiro: ${msg}`);
+              }
+
+              if (firstResult.done) {
+                return anthropicError(502, "api_error", "Kiro: stream ended without producing events");
+              }
+
+              // Collect buffered events until we get a content event or error.
+              // The stream produces "start" first (non-content), then content deltas or errors.
+              const bufferedEvents: any[] = [firstResult.value];
+
+              // If first event is "start" (no content yet), keep reading until we get real content or an error
+              while (bufferedEvents[bufferedEvents.length - 1]?.type === "start") {
+                try {
+                  const next = await iter.next();
+                  if (next.done) break;
+                  bufferedEvents.push(next.value);
+                } catch (err) {
+                  const msg = err instanceof Error ? err.message : String(err);
+                  log.error("[gateway] Stream failed during buffering:", msg);
+                  return anthropicError(502, "api_error", `Kiro: ${msg}`);
+                }
+              }
+
+              // If any buffered event is an error, return HTTP error
+              const errorEvent = bufferedEvents.find((e) => e.type === "error");
+              if (errorEvent) {
+                const errMsg = errorEvent.error?.errorMessage || errorEvent.reason || "Unknown Kiro error";
+                log.error("[gateway] Kiro stream error:", errMsg);
+                return anthropicError(502, "api_error", `Kiro: ${errMsg}`);
+              }
+
               const streamResponse = new ReadableStream({
                 async start(controller) {
                   try {
@@ -152,7 +319,8 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
                       );
                     };
 
-                    for await (const event of kiroStream) {
+                    // Process the buffered first event + remaining events
+                    const processEvent = (event: any) => {
                       if (event.type === "thinking_delta") {
                         ensureBlockStarted("thinking");
                         controller.enqueue(
@@ -220,6 +388,16 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
                           }) + "\n\n"
                         );
                       }
+                    };
+
+                    // Replay all buffered events
+                    for (const ev of bufferedEvents) {
+                      processEvent(ev);
+                    }
+
+                    // Continue with remaining events
+                    for await (const event of { [Symbol.asyncIterator]: () => iter }) {
+                      processEvent(event);
                     }
 
                     if (activeBlockType !== null) {
@@ -255,7 +433,7 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
                     controller.enqueue("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
                     controller.close();
                   } catch (err) {
-                    log.error("Gateway stream error", err);
+                    log.error("[gateway] Stream error:", err);
                     controller.enqueue(
                       "event: error\ndata: " +
                       JSON.stringify({
@@ -332,21 +510,13 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
               });
             }
           } catch (err) {
-            log.error("Completions error", err);
-            return new Response(JSON.stringify({ error: { message: err instanceof Error ? err.message : String(err) } }), {
-              status: 500,
-              headers: {
-                "Content-Type": "application/json",
-                "Access-Control-Allow-Origin": "*",
-              },
-            });
+            const msg = err instanceof Error ? err.message : String(err);
+            log.error("[gateway] Completions error:", msg);
+            return anthropicError(500, "api_error", `Kiro gateway: ${msg}`);
           }
         }
 
-        return new Response(JSON.stringify({ error: { message: "Not Found" } }), {
-          status: 404,
-          headers: { "Content-Type": "application/json" },
-        });
+        return anthropicError(404, "not_found_error", `Not Found: ${url.pathname}`);
       }
     });
 

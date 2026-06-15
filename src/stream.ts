@@ -65,8 +65,8 @@ const TRANSIENT_MAX_DELAY_MS = 15_000;
 const CONTEXT_TRUNCATION_MAX_RETRIES = 3;
 const CONTEXT_TRUNCATION_DROP_RATIO = 0.3;
 
-const TOO_BIG_PATTERNS = ["CONTENT_LENGTH_EXCEEDS_THRESHOLD", "Input is too long", "Improperly formed"];
-const NON_RETRYABLE_BODY_PATTERNS = ["MONTHLY_REQUEST_COUNT"];
+const TOO_BIG_PATTERNS = ["CONTENT_LENGTH_EXCEEDS_THRESHOLD", "Input is too long"];
+const NON_RETRYABLE_BODY_PATTERNS = ["MONTHLY_REQUEST_COUNT", "Improperly formed"];
 const CAPACITY_PATTERN = "INSUFFICIENT_MODEL_CAPACITY";
 
 function exponentialBackoff(attempt: number, baseMs: number, maxMs: number): number {
@@ -187,6 +187,17 @@ export function resetProfileArnCache(skipResolution = false): void {
   profileArnSkipResolution = skipResolution;
 }
 
+/**
+ * Pre-seed the profileArn cache for a given endpoint. When set,
+ * `resolveProfileArn` returns the seeded value without hitting the
+ * management endpoint. Use this to inject a known profileArn from
+ * external sources (e.g. Kiro CLI auth.json) as a fallback when the
+ * management API returns 400.
+ */
+export function seedProfileArn(endpoint: string, arn: string): void {
+  profileArnCache.set(endpoint, arn);
+}
+
 export async function resolveProfileArn(accessToken: string, endpoint: string): Promise<string | undefined> {
   if (profileArnSkipResolution) return undefined;
   const cached = profileArnCache.get(endpoint);
@@ -211,19 +222,19 @@ export async function resolveProfileArn(accessToken: string, endpoint: string): 
       body: "{}",
     });
     if (!resp.ok) {
-      log.warn(`profileArn resolution failed: ${resp.status} ${resp.statusText}`);
+      log.debug(`profileArn resolution failed: ${resp.status} ${resp.statusText}`);
       return undefined;
     }
     const j = (await resp.json()) as { profiles?: Array<{ arn?: string }> };
     const arn = j.profiles?.find((p) => p.arn)?.arn;
     if (!arn) {
-      log.warn("profileArn resolution returned no profile ARN");
+      log.debug("profileArn resolution returned no profile ARN");
       return undefined;
     }
     profileArnCache.set(endpoint, arn);
     return arn;
   } catch (error) {
-    log.warn(`profileArn resolution threw: ${error instanceof Error ? error.message : String(error)}`);
+    log.debug(`profileArn resolution threw: ${error instanceof Error ? error.message : String(error)}`);
     return undefined;
   }
 }
@@ -460,7 +471,7 @@ function emitToolCall(
       delete args.__tool_use_purpose;
     }
   } catch (e) {
-    log.warn(
+    log.info(
       `failed to parse tool input for "${state.name}" (${state.toolUseId}): ${e instanceof Error ? e.message : String(e)}`,
     );
     return false;
@@ -543,21 +554,9 @@ export function streamKiro(
       });
 
       let systemPrompt = context.systemPrompt ?? "";
-      // Skip the `<thinking_mode>` directive when the provider hides
-      // reasoning — the directive is a no-op there and costs prompt tokens.
-      if (thinkingEnabled && !reasoningHidden) {
-        const budget =
-          options?.reasoning === "xhigh"
-            ? 50000
-            : options?.reasoning === "high"
-              ? 30000
-              : options?.reasoning === "medium"
-                ? 20000
-                : 10000;
-        systemPrompt = `<thinking_mode>enabled</thinking_mode><max_thinking_length>${budget}</max_thinking_length>${
-          systemPrompt ? `\n${systemPrompt}` : ""
-        }`;
-      }
+      // NOTE: thinking is controlled via additionalModelRequestFields.thinking
+      // (adaptive thinking config), NOT via <thinking_mode> XML tags in the
+      // content. Kiro's API rejects those tags as "Improperly formed request".
 
       // Build envState from the host process (matches real Kiro CLI).
       const envState: KiroEnvState = {
@@ -652,7 +651,7 @@ export function streamKiro(
           }
           if (toolResultImages.length > 0) {
             const { images: converted, omitted } = convertImagesToKiro(toolResultImages);
-            if (omitted > 0) log.warn(`${omitted} tool-result image(s) omitted (size/count limit)`);
+            if (omitted > 0) log.info(`${omitted} tool-result image(s) omitted (size/count limit)`);
             currentImages = currentImages ? [...currentImages, ...converted] : converted;
           }
           currentContent = currentToolResults.length > 0 ? "Tool results provided." : "Please proceed with the task.";
@@ -675,7 +674,7 @@ export function streamKiro(
           }
           if (toolResultImages.length > 0) {
             const { images: converted, omitted } = convertImagesToKiro(toolResultImages);
-            if (omitted > 0) log.warn(`${omitted} tool-result image(s) omitted (size/count limit)`);
+            if (omitted > 0) log.info(`${omitted} tool-result image(s) omitted (size/count limit)`);
             currentImages = currentImages ? [...currentImages, ...converted] : converted;
           }
           currentContent = "Tool results provided.";
@@ -760,7 +759,7 @@ export function streamKiro(
           const imgs = extractImages(firstMsg);
           if (imgs.length > 0) {
             const { images: converted, omitted } = convertImagesToKiro(imgs);
-            if (omitted > 0) log.warn(`${omitted} user image(s) omitted (size/count limit)`);
+            if (omitted > 0) log.info(`${omitted} user image(s) omitted (size/count limit)`);
             currentImages = converted;
           }
         }
@@ -849,6 +848,10 @@ export function streamKiro(
             requestJsonChars: requestBody.length,
           });
 
+          // Dump request body for debugging (debug level, file always written)
+          log.debug(`[stream] req=${requestBody.length}c hist=${history.length} content=${currentContent.length}c profileArn=${!!profileArn}`);
+          try { require("fs").writeFileSync("/tmp/kiro-last-request.json", requestBody); } catch {}
+
           response = await fetch(endpoint, {
             method: "POST",
             headers: {
@@ -888,7 +891,7 @@ export function streamKiro(
               CAPACITY_BASE_DELAY_MS,
               CAPACITY_MAX_DELAY_MS,
             );
-            log.warn(
+            log.info(
               `INSUFFICIENT_MODEL_CAPACITY — retrying in ${delayMs}ms (${capacityRetryCount}/${CAPACITY_MAX_RETRIES})`,
             );
             await abortableDelay(delayMs, options?.signal);
@@ -904,7 +907,7 @@ export function streamKiro(
               const dropCount = Math.max(1, Math.floor(history.length * CONTEXT_TRUNCATION_DROP_RATIO));
               const before = history.length;
               history.splice(0, dropCount);
-              log.warn(
+              log.info(
                 `context too large — truncated history from ${before} to ${history.length} entries ` +
                 `(attempt ${contextTruncationAttempt}/${CONTEXT_TRUNCATION_MAX_RETRIES})`,
               );
@@ -922,7 +925,7 @@ export function streamKiro(
               TRANSIENT_BASE_DELAY_MS,
               TRANSIENT_MAX_DELAY_MS,
             ) + jitter;
-            log.warn(
+            log.info(
               `transient error ${response.status} — retrying in ${delayMs}ms ` +
               `(${transientRetryCount}/${TRANSIENT_MAX_RETRIES})`,
             );
@@ -1193,7 +1196,7 @@ export function streamKiro(
           if (retryCount < MAX_RETRIES) {
             retryCount++;
             const delayMs = exponentialBackoff(retryCount - 1, 1000, MAX_RETRY_DELAY_MS);
-            log.warn(
+            log.info(
               `stream ${firstTokenTimedOut ? "first-token timed out" : idleCancelled ? "idle timed out" : `error: ${streamError}`} — retrying (${retryCount}/${MAX_RETRIES})`,
             );
             // Cancel the pending shim BEFORE the backoff delay so
@@ -1260,7 +1263,7 @@ export function streamKiro(
           if (retryCount < MAX_RETRIES) {
             retryCount++;
             const delayMs = exponentialBackoff(retryCount - 1, 1000, MAX_RETRY_DELAY_MS);
-            log.warn(`empty response — retrying (${retryCount}/${MAX_RETRIES})`);
+            log.info(`empty response — retrying (${retryCount}/${MAX_RETRIES})`);
             // Cancel the pending shim BEFORE the backoff delay so
             // it can't fire mid-wait. Retry re-arms a fresh timer.
             cancelHiddenShim();
@@ -1269,7 +1272,7 @@ export function streamKiro(
             await abortableDelay(delayMs, options?.signal);
             continue;
           }
-          log.warn(`empty response persisted after ${MAX_RETRIES} retries`);
+          log.info(`empty response persisted after ${MAX_RETRIES} retries`);
           // No retries left — cancel any pending shim so it doesn't
           // fire after the empty-response path returns.
           cancelHiddenShim();
