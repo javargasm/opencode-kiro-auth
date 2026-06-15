@@ -1,4 +1,4 @@
-# opencode-kiro
+# @javargasm/opencode-kiro-auth
 
 Kiro provider plugin for [OpenCode](https://opencode.ai). Authenticates via AWS Builder ID or IAM Identity Center and exposes all Kiro models through an Anthropic-compatible local gateway.
 
@@ -44,7 +44,7 @@ Add the plugin to your `opencode.json`:
 {
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
-    "opencode-kiro"
+    "@javargasm/opencode-kiro-auth"
   ]
 }
 ```
@@ -56,8 +56,8 @@ OpenCode will auto-install the package on startup.
 1. Clone the repository:
 
 ```bash
-git clone https://github.com/your-org/opencode-kiro.git
-cd opencode-kiro
+git clone https://github.com/javargasm/opencode-kiro-auth.git
+cd opencode-kiro-auth
 ```
 
 2. Install dependencies and build:
@@ -73,7 +73,7 @@ bun run build
 {
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
-    "/absolute/path/to/opencode-kiro/dist/index.js"
+    "/absolute/path/to/opencode-kiro-auth/dist/index.js"
   ]
 }
 ```
