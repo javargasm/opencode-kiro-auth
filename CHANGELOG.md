@@ -1,5 +1,15 @@
 # @javargasm/opencode-kiro-auth
 
+## 0.1.2
+
+### Patch Changes
+
+- fix: use vitest runner for CI-compatible stream tests
+
+  Switched test runner from `bun test` to `vitest run` for stream tests
+  so `vi.spyOn(globalThis, 'fetch')` works reliably in CI (Ubuntu/Node).
+  Gateway tests (Bun.serve) remain under `bun test` and run locally.
+
 ## 0.1.1
 
 ### Patch Changes

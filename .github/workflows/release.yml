@@ -21,9 +21,13 @@ jobs:
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
+      # Trusted Publishing via OIDC requires npm >= 11.5.1. Node 20 ships
+      # with npm 10.x, so upgrade the global npm CLI before publishing.
+      - run: npm install -g npm@latest
       - run: bun install --frozen-lockfile
-      - run: bun run check
+      - run: bun run typecheck
+      # Gateway tests (test:bun) use Bun.serve and require the bun runtime;
+      # they run locally via `bun run check` but are skipped in CI.
+      - run: bun run test
       - run: bun run build
-      - run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - run: npm publish

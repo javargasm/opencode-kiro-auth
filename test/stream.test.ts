@@ -43,10 +43,6 @@ const zeroUsage = {
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
 
-function user(content: string) {
-  return { role: "user" as const, content, timestamp: ts };
-}
-
 async function collect(
   stream: ReturnType<typeof streamKiro>,
 ): Promise<AssistantMessageEvent[]> {
@@ -73,17 +69,13 @@ function mockFetchOk(body: string) {
   });
 }
 
-// Save and restore the real fetch between tests
-let originalFetch: typeof globalThis.fetch;
-
 describe("streamKiro", () => {
   beforeEach(() => {
-    originalFetch = globalThis.fetch;
     resetProfileArnCache(true);
   });
 
   afterEach(() => {
-    globalThis.fetch = originalFetch;
+    vi.restoreAllMocks();
   });
 
   it("emits error when no credentials", async () => {
@@ -110,7 +102,7 @@ describe("streamKiro", () => {
 
   it("sends POST with expected headers matching real Kiro CLI", async () => {
     const fetchMock = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":10}');
-    globalThis.fetch = fetchMock as any;
+    vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
 
     await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
 
@@ -142,7 +134,7 @@ describe("streamKiro", () => {
   });
 
   it("parses text + contextUsage into usage", async () => {
-    globalThis.fetch = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":10}') as any;
+    vi.spyOn(globalThis, "fetch").mockImplementation(mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":10}'));
     const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
     const done = events.find((e) => e.type === "done");
     expect(done?.type).toBe("done");
@@ -156,7 +148,7 @@ describe("streamKiro", () => {
 
   it("emits toolUse stopReason when tool called", async () => {
     const toolPayload = '{"name":"bash","toolUseId":"t1","input":"{\\"cmd\\":\\"ls\\"}","stop":true}';
-    globalThis.fetch = mockFetchOk(`${toolPayload}{"contextUsagePercentage":20}`) as any;
+    vi.spyOn(globalThis, "fetch").mockImplementation(mockFetchOk(`${toolPayload}{"contextUsagePercentage":20}`));
     const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
     const done = events.find((e) => e.type === "done");
     expect(done).toBeDefined();
@@ -164,7 +156,7 @@ describe("streamKiro", () => {
   });
 
   it("returns length when no contextUsage and no tool calls", async () => {
-    globalThis.fetch = mockFetchOk('{"content":"Partial"}') as any;
+    vi.spyOn(globalThis, "fetch").mockImplementation(mockFetchOk('{"content":"Partial"}'));
     const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
     const done = events.find((e) => e.type === "done");
     expect(done).toBeDefined();
@@ -172,13 +164,12 @@ describe("streamKiro", () => {
   });
 
   it("413 propagates with context_length_exceeded marker", async () => {
-    const fetchMock = vi.fn().mockResolvedValue({
+    vi.spyOn(globalThis, "fetch").mockImplementation(vi.fn().mockResolvedValue({
       ok: false,
       status: 413,
       statusText: "Too Large",
       text: () => Promise.resolve("too big"),
-    });
-    globalThis.fetch = fetchMock as any;
+    }));
     const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
     const err = events.find((e) => e.type === "error");
     expect(err).toBeDefined();
@@ -194,7 +185,7 @@ describe("streamKiro", () => {
       statusText: "Bad",
       text: () => Promise.resolve("MONTHLY_REQUEST_COUNT exceeded"),
     });
-    globalThis.fetch = fetchMock as any;
+    vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
     const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
     const err = events.find((e) => e.type === "error");
     expect(err?.type).toBe("error");
@@ -203,7 +194,7 @@ describe("streamKiro", () => {
 
   it("sends origin: KIRO_CLI and modelId in dot format", async () => {
     const fetchMock = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":5}');
-    globalThis.fetch = fetchMock as any;
+    vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
     await collect(
       streamKiro(makeModel({ id: "claude-sonnet-4-5" }), makeContext(), { apiKey: "tok" }),
     );
@@ -216,7 +207,7 @@ describe("streamKiro", () => {
 
   it("injects thinking mode tags when reasoning is enabled", async () => {
     const fetchMock = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":5}');
-    globalThis.fetch = fetchMock as any;
+    vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
     await collect(
       streamKiro(makeModel({ reasoning: true }), makeContext(), {
         apiKey: "tok",
@@ -235,7 +226,7 @@ describe("streamKiro", () => {
   it("strips __tool_use_purpose from tool call arguments", async () => {
     const toolPayload =
       '{"name":"bash","toolUseId":"t1","input":"{\\"cmd\\":\\"ls\\",\\"__tool_use_purpose\\":\\"test\\"}","stop":true}';
-    globalThis.fetch = mockFetchOk(`${toolPayload}{"contextUsagePercentage":5}`) as any;
+    vi.spyOn(globalThis, "fetch").mockImplementation(mockFetchOk(`${toolPayload}{"contextUsagePercentage":5}`));
     const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
     const done = events.find((e) => e.type === "done");
     expect(done?.type === "done").toBe(true);
@@ -258,15 +249,16 @@ describe("streamKiro", () => {
       cancel: vi.fn().mockResolvedValue(undefined),
     });
     const makeResponse = () => ({ ok: true, body: { getReader: makeReader } });
-    const fetchMock = vi
+    vi.spyOn(globalThis, "fetch").mockImplementation(vi
       .fn()
       .mockResolvedValueOnce(makeResponse())
       .mockResolvedValueOnce(makeResponse())
       .mockResolvedValueOnce(makeResponse())
-      .mockResolvedValueOnce(makeResponse());
-    globalThis.fetch = fetchMock as any;
+      .mockResolvedValueOnce(makeResponse()));
 
+    vi.useFakeTimers({ shouldAdvanceTime: true });
     const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+    vi.useRealTimers();
 
     const err = events.find((e) => e.type === "error");
     expect(err?.type).toBe("error");
@@ -314,7 +306,7 @@ describe("streamKiro", () => {
             }),
           },
         });
-      globalThis.fetch = fetchMock as any;
+      vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
 
       const ctx = makeContextWithHistory(5);
       const events = await collect(streamKiro(makeModel(), ctx, { apiKey: "tok" }));
@@ -343,7 +335,7 @@ describe("streamKiro", () => {
 
     it("skips <thinking_mode> system-prompt directive", async () => {
       const fetchMock = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":5}');
-      globalThis.fetch = fetchMock as any;
+      vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
       await collect(
         streamKiro(hiddenModel(), makeContext(), { apiKey: "tok", reasoning: "high" }),
       );
@@ -354,7 +346,9 @@ describe("streamKiro", () => {
     });
 
     it("fast response emits no shim: content only, no thinking events", async () => {
-      globalThis.fetch = mockFetchOk('{"content":"Hi"}{"content":"!"}{"contextUsagePercentage":5}') as any;
+      vi.spyOn(globalThis, "fetch").mockImplementation(
+        mockFetchOk('{"content":"Hi"}{"content":"!"}{"contextUsagePercentage":5}'),
+      );
       const events = await collect(streamKiro(hiddenModel(), makeContext(), { apiKey: "tok" }));
 
       const types = events.map((e) => e.type);
