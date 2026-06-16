@@ -21,10 +21,9 @@ jobs:
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
-      # Trusted Publishing via OIDC requires npm >= 11.5.1. Node 20 ships
-      # with npm 10.x, so upgrade the global npm CLI before publishing.
-      - run: npm install -g npm@latest
       - run: bun install --frozen-lockfile
       - run: bun run check
       - run: bun run build
-      - run: npm publish
+      - run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
