@@ -1,10 +1,10 @@
 import type { Server } from "bun";
 import type { Message, Model, Api, Context } from "./types";
-import { streamKiro, seedProfileArn } from "./stream";
+import { streamKiro } from "./stream";
 import { log } from "./debug";
-import { KIRO_MODEL_IDS, fetchAvailableModels, buildModelsFromApi, setCachedDynamicModels } from "./models";
+import { KIRO_MODEL_IDS, fetchAvailableModels, buildModelsFromApi, setCachedDynamicModels, seedProfileArn } from "./models";
 import { resolveKiroModel, resolveApiRegion } from "./models";
-import { refreshKiroToken } from "./oauth";
+import { refreshKiroToken, startSocialLogin, BUILDER_ID_REGION } from "./oauth";
 import { stats } from "./dashboard-stats";
 import { getDashboardHtml } from "./dashboard-ui";
 
@@ -18,7 +18,7 @@ interface GatewayCredentials {
   /** pipe-packed: refreshToken|clientId|clientSecret|authMethod */
   refreshPacked: string;
   region: string;
-  authMethod: "idc" | "desktop";
+  authMethod: "builder-id" | "idc" | "desktop" | "social";
   profileArn?: string;
   expiresAt: number;
 }
@@ -55,12 +55,36 @@ export async function initGatewayAuth(): Promise<void> {
 
     log.info(`[gateway-auth] Initialized (method=${imported.authMethod}, region=${imported.region})`);
 
+    let activeAccessToken = imported.accessToken;
+
+    if (imported.refreshToken) {
+      try {
+        log.info("[gateway-auth] Refreshing token at startup…");
+        const refreshed = await refreshKiroToken(
+          _creds.refreshPacked,
+          _creds.region,
+          _creds.authMethod as any
+        );
+        _creds.accessToken = refreshed.access;
+        _creds.refreshPacked = refreshed.refresh;
+        _creds.expiresAt = refreshed.expires;
+        activeAccessToken = refreshed.access;
+        log.info("[gateway-auth] Token refreshed on startup successfully");
+      } catch (err) {
+        log.warn("[gateway-auth] Startup token refresh failed, trying with existing token", err);
+      }
+    }
+
     // Fetch available models from the backend to ensure dynamic models are used
     try {
-      const apiModels = await fetchAvailableModels(imported.accessToken, imported.region, imported.profileArn);
-      const built = buildModelsFromApi(apiModels);
-      setCachedDynamicModels(built);
-      log.info(`[kiro-models.fetched] Found ${built.length} available models`);
+      if (imported.profileArn) {
+        const apiModels = await fetchAvailableModels(activeAccessToken, imported.region, imported.profileArn);
+        const built = buildModelsFromApi(apiModels);
+        setCachedDynamicModels(built);
+        log.info(`[kiro-models.fetched] Found ${built.length} available models`);
+      } else {
+        log.info(`[kiro-models.fetched] Skipping fetch, no profileArn available`);
+      }
     } catch (err) {
       log.warn("[gateway-auth] Failed to fetch dynamic models (will fallback to static list)", err);
     }
@@ -162,6 +186,48 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
           });
         }
 
+        // ── Social sign-in (Builder ID) via PKCE ────────────────────
+        // GET /auth/login → starts the PKCE flow, redirects to app.kiro.dev.
+        // The localhost:49153 callback server handles the OAuth redirect and
+        // exchanges the authorization code for tokens asynchronously.
+        if (url.pathname === "/auth/login" && req.method === "GET") {
+          try {
+            const { signInUrl, waitForCredentials } = await startSocialLogin();
+            log.info("[gateway] Social login initiated, redirecting to Kiro sign-in");
+
+            // Fire-and-forget: wait for the callback to complete in the background
+            // and update the credential store when it does.
+            waitForCredentials()
+              .then((creds) => {
+                _creds = {
+                  accessToken: creds.accessToken,
+                  refreshPacked: creds.refreshPacked,
+                  region: creds.region,
+                  authMethod: creds.authMethod,
+                  profileArn: creds.profileArn,
+                  expiresAt: creds.expiresAt,
+                };
+                if (creds.profileArn) {
+                  seedProfileArn(creds.profileArn);
+                }
+                log.info(`[gateway] Login completed (${creds.authMethod}) — credentials updated`);
+              })
+              .catch((err) => {
+                log.error("[gateway] Login failed:", err);
+              });
+
+            // Redirect the browser to the Kiro sign-in portal
+            return new Response(null, {
+              status: 302,
+              headers: { Location: signInUrl },
+            });
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            log.error("[gateway] Failed to start social login:", msg);
+            return anthropicError(500, "api_error", `Failed to start login: ${msg}`);
+          }
+        }
+
         // Anthropic Messages endpoint
         if ((url.pathname === "/v1/messages" || url.pathname === "/messages") && req.method === "POST") {
           // Gateway owns auth — get a fresh token from the credential store.
@@ -238,7 +304,7 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
 
             // Seed profileArn from the credential store (already imported at init)
             if (_creds!.profileArn) {
-              seedProfileArn(kiroEndpoint, _creds!.profileArn);
+              seedProfileArn(_creds!.profileArn);
             }
 
             const kiroStream = streamKiro(piModel, context, {

@@ -16,8 +16,8 @@
 import { startGatewayServer, _seedCredentials } from "../src/server";
 import { importFromKiroCli } from "../src/kiro-cli-sync";
 import { refreshKiroToken } from "../src/oauth";
-import { seedProfileArn } from "../src/stream";
-import { resolveApiRegion } from "../src/models";
+import { streamKiro, HIDDEN_REASONING_COUNTDOWN_MS } from "../src/stream";
+import { seedProfileArn, resolveApiRegion } from "../src/models";
 
 const PORT = 19876;
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -191,7 +191,7 @@ async function main() {
   const apiRegion = resolveApiRegion(imported.region);
   const runtimeUrl = `https://runtime.${apiRegion}.kiro.dev/`;
   if (imported.profileArn) {
-    seedProfileArn(runtimeUrl, imported.profileArn);
+    seedProfileArn(imported.profileArn);
     console.log("✓ ProfileArn seeded:", imported.profileArn.substring(0, 50) + "…");
   }
 

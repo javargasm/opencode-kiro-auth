@@ -7,7 +7,8 @@ import type {
   ToolResultMessage,
 } from "../src/types";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { resetProfileArnCache, streamKiro } from "../src/stream";
+import { streamKiro } from "../src/stream";
+import { resetProfileArnCache, seedProfileArn } from "../src/models";
 
 function makeModel(overrides?: Partial<Model<Api>>): Model<Api> {
   return {

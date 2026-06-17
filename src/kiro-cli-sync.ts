@@ -1,15 +1,47 @@
-// Kiro CLI/IDE credential sync — import tokens from local Kiro storage.
+// Kiro CLI credential sync — import tokens from local Kiro storage.
 //
-// Two sources, tried in order:
-//   1. kiro-cli SQLite DB (preferred: has OIDC clientId/clientSecret)
-//   2. Kiro IDE AWS SSO cache JSON (fallback: no OIDC creds, desktop refresh only)
+// Kiro has two products that store credentials locally, and they use
+// different formats:
 //
-// OpenCode runs on Bun, so bun:sqlite is always available.
+//   1. kiro-cli (Rust CLI). Credentials live in a SQLite database at
+//      `data.sqlite3` in the platform's standard data directory:
+//        - macOS:   ~/Library/Application Support/kiro-cli/data.sqlite3
+//        - Linux:   $XDG_DATA_HOME/kiro-cli/data.sqlite3
+//                   (or ~/.local/share/kiro-cli/data.sqlite3)
+//        - Windows: %APPDATA%/kiro-cli/data.sqlite3
+//      The `auth_kv` table holds token rows (keys: `kirocli:odic:token`,
+//      `kirocli:social:token`, etc.) and the device-registration row with
+//      OIDC clientId/clientSecret. The `state` table holds the active
+//      profile ARN under `api.codewhisperer.profile`.
+//
+//   2. Kiro IDE (VSCode-based GUI). The IDE does NOT use SQLite for
+//      auth tokens; it writes the standard AWS SSO OIDC cache JSON to
+//      `~/.aws/sso/cache/kiro-auth-token.json` on successful SSO login.
+//      This file holds bearer + refresh tokens, expiry, region, and
+//      `authMethod: "IdC"`, but NOT the OIDC clientId/secret — those
+//      live only in the kiro-cli SQLite DB.
+//
+// This module reads from the kiro-cli SQLite DB first (preferred: gives
+// full OIDC creds), then falls back to the Kiro IDE SSO cache JSON
+// (weaker: no OIDC creds, refresh must go through the desktop endpoint).
+// SQLite access uses bun:sqlite when available, optional better-sqlite3 when
+// installed, then the system sqlite3 CLI for Node-based pi runtimes. Both
+// paths are readonly on import. Refresh write-back is limited to credentials
+// that originated from the kiro-cli SQLite DB, and updates the exact token row
+// that was imported so desktop/IDE refresh tokens are never mixed into CLI
+// token storage.
+//
+// This enables zero-friction login: if the user has kiro-cli or Kiro
+// IDE installed and logged in, pi-kiro can import the credentials
+// without the device-code flow.
 
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { log } from "./debug";
+
+export type KiroCredentialSource = "kiro-cli-db" | "kiro-sso-cache";
 
 export interface KiroCliCredentials {
   accessToken: string;
@@ -17,13 +49,51 @@ export interface KiroCliCredentials {
   clientId?: string;
   clientSecret?: string;
   region: string;
-  authMethod: "idc" | "desktop";
-  email?: string;
   profileArn?: string;
+  authMethod: "idc" | "desktop" | "social" | "builder-id";
+  email?: string;
+  source?: KiroCredentialSource;
+  /** Exact `auth_kv.key` for the imported token row, present for DB imports. */
+  tokenKey?: string;
 }
 
-// ── Paths ────────────────────────────────────────────────────────────
+export interface AuthKvRow {
+  key: string;
+  value: string;
+}
 
+interface KiroDbSnapshot {
+  rows: AuthKvRow[];
+  activeProfileArn?: string;
+}
+
+interface SqliteStatement {
+  all(): unknown[];
+  get(...params: string[]): unknown;
+  run(...params: string[]): unknown;
+}
+
+interface SqliteDb {
+  prepare(sql: string): SqliteStatement;
+  run?(sql: string): unknown;
+  exec?(sql: string): unknown;
+  close(): void;
+}
+
+interface SqliteDatabaseConstructor {
+  new (path: string, options?: { readonly?: boolean }): SqliteDb;
+}
+
+const SQLITE_CLI_TIMEOUT_MS = 5000;
+
+/**
+ * Platform-specific path to kiro-cli's SQLite credential database
+ * (`data.sqlite3`). The Kiro IDE (GUI) does not use SQLite for auth
+ * tokens — it writes the AWS SSO cache JSON instead (see
+ * `getKiroSsoCachePath` below). Only kiro-cli (the Rust CLI) stores
+ * credentials in a SQLite DB at these locations, confirmed in
+ * kirodotdev/Kiro#4847 and the kiro-cli source.
+ */
 function getKiroDbPath(): string {
   const home = homedir();
 
@@ -39,6 +109,9 @@ function getKiroDbPath(): string {
     );
   }
 
+  // Linux and other Unix-likes: honor XDG_DATA_HOME per the XDG Base
+  // Directory spec; fall back to ~/.local/share which is kiro-cli's
+  // default when XDG_DATA_HOME is unset.
   const xdgData = process.env.XDG_DATA_HOME;
   if (xdgData && xdgData.length > 0) {
     return join(xdgData, "kiro-cli", "data.sqlite3");
@@ -46,19 +119,29 @@ function getKiroDbPath(): string {
   return join(home, ".local", "share", "kiro-cli", "data.sqlite3");
 }
 
+/**
+ * Platform-specific path to Kiro IDE's AWS SSO OIDC cache JSON file.
+ * Kiro IDE (the GUI) does not use SQLite for auth tokens; it writes
+ * the standard AWS SSO OIDC cache JSON to this path on successful SSO
+ * login. Per the AWS SSO OIDC client spec the file lives at
+ * `~/.aws/sso/cache/kiro-auth-token.json` on macOS/Linux and
+ * `%USERPROFILE%\.aws\sso\cache\kiro-auth-token.json` on Windows.
+ */
 function getKiroSsoCachePath(): string {
   const home = homedir();
   if (process.platform === "win32") {
     return join(
       process.env.USERPROFILE || home,
-      ".aws", "sso", "cache", "kiro-auth-token.json",
+      ".aws",
+      "sso",
+      "cache",
+      "kiro-auth-token.json",
     );
   }
   return join(home, ".aws", "sso", "cache", "kiro-auth-token.json");
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────
-
+/** Safely parse JSON, returning null on failure. */
 function safeJsonParse(value: unknown): any {
   if (typeof value !== "string") return null;
   try {
@@ -68,6 +151,137 @@ function safeJsonParse(value: unknown): any {
   }
 }
 
+function sqliteQuote(value: string): string {
+  return `'${value.replaceAll("'", "''")}'`;
+}
+
+function runSqliteCli(
+  dbPath: string,
+  sql: string,
+  options: { readonly: boolean; json: boolean },
+): Promise<string | null> {
+  return new Promise((resolve) => {
+    const args = [
+      ...(options.readonly ? ["-readonly"] : []),
+      "-cmd",
+      `.timeout ${SQLITE_CLI_TIMEOUT_MS}`,
+      ...(options.json ? ["-json"] : []),
+      dbPath,
+    ];
+    const child = spawn("sqlite3", args, { stdio: "pipe" });
+    let stdout = "";
+    let settled = false;
+
+    const finish = (result: string | null): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      resolve(result);
+    };
+
+    const timeout = setTimeout(() => {
+      child.kill();
+      log.debug("sqlite3 CLI timed out while reading Kiro DB");
+      finish(null);
+    }, SQLITE_CLI_TIMEOUT_MS);
+
+    child.stdout?.setEncoding("utf8");
+    child.stdout?.on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    child.on("error", () => {
+      log.debug("sqlite3 CLI unavailable for Kiro DB access");
+      finish(null);
+    });
+    child.on("close", (code) => {
+      if (code === 0) finish(stdout);
+      else {
+        log.debug("sqlite3 CLI failed while accessing Kiro DB");
+        finish(null);
+      }
+    });
+    child.stdin?.end(`${sql}\n`);
+  });
+}
+
+function parseAuthKvRows(value: unknown): AuthKvRow[] | null {
+  if (!Array.isArray(value)) return null;
+  const rows: AuthKvRow[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") continue;
+    const record = item as Record<string, unknown>;
+    if (typeof record.key === "string" && typeof record.value === "string") {
+      rows.push({ key: record.key, value: record.value });
+    }
+  }
+  return rows;
+}
+
+function extractActiveProfileArnFromStateRows(value: unknown): string | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const first = value[0];
+  if (!first || typeof first !== "object") return undefined;
+  const record = first as Record<string, unknown>;
+  const parsed = safeJsonParse(record.value);
+  const arn = parsed?.arn || parsed?.profileArn || parsed?.profile_arn;
+  return typeof arn === "string" && arn.trim() ? arn.trim() : undefined;
+}
+
+function parseSqliteChanges(value: unknown): number {
+  if (!Array.isArray(value)) return 0;
+  const first = value[0];
+  if (!first || typeof first !== "object") return 0;
+  const changes = (first as Record<string, unknown>).changes;
+  return typeof changes === "number" ? changes : 0;
+}
+
+async function readKiroAuthKvRowsWithSqliteCli(dbPath: string): Promise<AuthKvRow[] | null> {
+  const rowsRaw = await runSqliteCli(
+    dbPath,
+    "SELECT key, value FROM auth_kv",
+    { readonly: true, json: true },
+  );
+  if (!rowsRaw) return null;
+
+  return parseAuthKvRows(safeJsonParse(rowsRaw));
+}
+
+async function readKiroDbWithSqliteCli(dbPath: string): Promise<KiroDbSnapshot | null> {
+  const rows = await readKiroAuthKvRowsWithSqliteCli(dbPath);
+  if (!rows) return null;
+
+  const stateRaw = await runSqliteCli(
+    dbPath,
+    "SELECT value FROM state WHERE key = 'api.codewhisperer.profile'",
+    { readonly: true, json: true },
+  );
+  const activeProfileArn = stateRaw
+    ? extractActiveProfileArnFromStateRows(safeJsonParse(stateRaw))
+    : undefined;
+  return { rows, activeProfileArn };
+}
+
+async function writeKiroDbWithSqliteCli(
+  dbPath: string,
+  tokenKey: string,
+  updatedValue: string,
+): Promise<boolean> {
+  const resultRaw = await runSqliteCli(
+    dbPath,
+    `UPDATE auth_kv SET value = ${sqliteQuote(updatedValue)} WHERE key = ${sqliteQuote(tokenKey)}; ` +
+      "SELECT changes() AS changes",
+    { readonly: false, json: true },
+  );
+  return parseSqliteChanges(safeJsonParse(resultRaw)) > 0;
+}
+
+/**
+ * Recursively search a nested object for the OIDC clientId + clientSecret.
+ * kiro-cli writes these as `client_id` / `client_secret` (snake_case) in
+ * its device-registration blob; some legacy codewhisperer / Kiro IDE
+ * blobs use camelCase (`clientId` / `clientSecret`). Accept either
+ * casing, nested at any depth.
+ */
 function findClientCreds(obj: any): { clientId?: string; clientSecret?: string } {
   if (!obj || typeof obj !== "object") return {};
   const id = obj.clientId ?? obj.client_id;
@@ -83,9 +297,48 @@ function findClientCreds(obj: any): { clientId?: string; clientSecret?: string }
 }
 
 function isIdcTokenKey(key: string): boolean {
+  // kiro-cli uses the literal substring "odic" in its key names
+  // (e.g. `kirocli:odic:token`, `kirocli:odic:device-registration`).
+  // Some legacy codewhisperer / Kiro IDE blobs use "oidc" (with an
+  // extra 'o') or "idc" — accept all three to avoid defaulting real
+  // IdC tokens to `desktop`.
   return key.includes("odic") || key.includes("oidc") || key.includes("idc");
 }
 
+function isTokenRow(row: AuthKvRow): boolean {
+  return row.key.includes(":token");
+}
+
+function tokenReadRank(row: AuthKvRow): number {
+  return isIdcTokenKey(row.key) ? 0 : 1;
+}
+
+export function selectKiroTokenRowForWrite(
+  rows: AuthKvRow[],
+  creds: Pick<KiroCliCredentials, "authMethod" | "tokenKey">,
+): AuthKvRow | undefined {
+  const tokenRows = rows.filter(isTokenRow);
+  if (!creds.tokenKey) return undefined;
+  return tokenRows.find((row) => row.key === creds.tokenKey);
+}
+
+export function sameKiroCliCredential(
+  left: KiroCliCredentials | null,
+  right: KiroCliCredentials | null,
+): boolean {
+  if (!left || !right) return false;
+  return left.source === right.source &&
+    left.tokenKey === right.tokenKey &&
+    left.accessToken === right.accessToken &&
+    left.refreshToken === right.refreshToken &&
+    left.region === right.region &&
+    left.authMethod === right.authMethod;
+}
+
+/**
+ * Extract region from an ARN string (e.g. arn:aws:codewhisperer:us-east-1:...).
+ * Returns undefined if the ARN is malformed.
+ */
 function extractRegionFromArn(arn: string | undefined): string | undefined {
   if (!arn) return undefined;
   const parts = arn.split(":");
@@ -94,8 +347,16 @@ function extractRegionFromArn(arn: string | undefined): string | undefined {
   return region && region.length > 0 ? region : undefined;
 }
 
-// ── SQLite import (bun:sqlite) ───────────────────────────────────────
-
+/**
+ * Attempt to read credentials from Kiro IDE's local database.
+ *
+ * Returns the first valid credential set found, or null if:
+ * - Kiro IDE is not installed
+ * - The database is unreadable
+ * - No valid tokens are stored
+ *
+ * This function never throws — all errors are caught and logged.
+ */
 async function importFromKiroDb(): Promise<KiroCliCredentials | null> {
   const dbPath = getKiroDbPath();
   if (!existsSync(dbPath)) {
@@ -104,49 +365,79 @@ async function importFromKiroDb(): Promise<KiroCliCredentials | null> {
   }
 
   try {
-    const { Database } = await import("bun:sqlite");
-    const db = new Database(dbPath, { readonly: true });
+    let rows: AuthKvRow[];
+    let activeProfileArn: string | undefined;
 
+    // Dynamic import: try bun:sqlite first, fallback to better-sqlite3, then
+    // sqlite3 CLI. Pi usually runs extensions on Node, so bun:sqlite is not
+    // available there; the CLI fallback keeps DB import dependency-free.
+    let Database: SqliteDatabaseConstructor | null = null;
     try {
-      db.exec("PRAGMA busy_timeout = 5000");
-    } catch { /* ignore */ }
-
-    let rows: Array<{ key: string; value: string }>;
-    try {
-      rows = db.prepare("SELECT key, value FROM auth_kv").all() as Array<{ key: string; value: string }>;
+      Database = (await import("bun:sqlite")).Database as SqliteDatabaseConstructor;
     } catch {
-      log.debug("Failed to read auth_kv table from Kiro DB");
-      try { db.close(); } catch { /* ignore */ }
-      return null;
+      try {
+        // @ts-expect-error - better-sqlite3 is an optional peer dependency
+        Database = (await import("better-sqlite3")).default as SqliteDatabaseConstructor;
+      } catch {
+        log.debug("No SQLite driver available (need bun:sqlite or better-sqlite3); trying sqlite3 CLI");
+      }
     }
 
-    // Try to read active profile ARN
-    let activeProfileArn: string | undefined;
-    try {
-      const stateRow = db.prepare("SELECT value FROM state WHERE key = ?")
-        .get("api.codewhisperer.profile") as { value?: string } | undefined;
-      const parsed = safeJsonParse(stateRow?.value);
-      const arn = parsed?.arn || parsed?.profileArn || parsed?.profile_arn;
-      if (typeof arn === "string" && arn.trim()) {
-        activeProfileArn = arn.trim();
+    if (Database) {
+      const db = new Database(dbPath, { readonly: true });
+
+      // Set busy timeout to avoid SQLITE_BUSY if Kiro IDE has the DB open.
+      try {
+        db.run?.("PRAGMA busy_timeout = 5000") ?? db.exec?.("PRAGMA busy_timeout = 5000");
+      } catch {
+        // Some SQLite drivers use exec instead of run
       }
-    } catch { /* state table might not exist */ }
 
-    try { db.close(); } catch { /* ignore */ }
+      // Read auth_kv table
+      try {
+        const stmt = db.prepare("SELECT key, value FROM auth_kv");
+        rows = stmt.all() as AuthKvRow[];
+      } catch {
+        log.debug("Failed to read auth_kv table from Kiro DB");
+        try { db.close(); } catch { /* ignore */ }
+        return null;
+      }
 
-    // Extract device registration credentials
+      // Try to read active profile ARN from state table
+      try {
+        const stateStmt = db.prepare("SELECT value FROM state WHERE key = ?");
+        const stateRow = stateStmt.get("api.codewhisperer.profile") as
+          | { value?: unknown }
+          | undefined;
+        const parsed = safeJsonParse(stateRow?.value);
+        const arn = parsed?.arn || parsed?.profileArn || parsed?.profile_arn;
+        if (typeof arn === "string" && arn.trim()) {
+          activeProfileArn = arn.trim();
+        }
+      } catch {
+        // State table might not exist — that's fine, tokens still work.
+      }
+
+      try { db.close(); } catch { /* ignore */ }
+    } else {
+      const snapshot = await readKiroDbWithSqliteCli(dbPath);
+      if (!snapshot) return null;
+      rows = snapshot.rows;
+      activeProfileArn = snapshot.activeProfileArn;
+    }
+
+    // Extract device registration credentials (clientId/clientSecret)
     const deviceRegRow = rows.find(
       (r) => typeof r?.key === "string" && r.key.includes("device-registration"),
     );
     const deviceReg = safeJsonParse(deviceRegRow?.value);
     const regCreds = deviceReg ? findClientCreds(deviceReg) : {};
 
-    // Find token entries, prefer IdC over social/desktop
-    const tokenRows = rows
-      .filter((r) => r.key.includes(":token"))
-      .sort((a, b) => (isIdcTokenKey(a.key) ? 0 : 1) - (isIdcTokenKey(b.key) ? 0 : 1));
-
+    // Find token entries. Prefer IdC/OIDC CLI rows over social/desktop rows
+    // when multiple token families are present.
+    const tokenRows = rows.filter(isTokenRow).sort((a, b) => tokenReadRank(a) - tokenReadRank(b));
     for (const row of tokenRows) {
+
       const data = safeJsonParse(row.value);
       if (!data) continue;
 
@@ -155,11 +446,13 @@ async function importFromKiroDb(): Promise<KiroCliCredentials | null> {
       if (!accessToken && !refreshToken) continue;
 
       const isIdc = isIdcTokenKey(row.key);
-      const authMethod: "idc" | "desktop" = isIdc ? "idc" : "desktop";
+      const authMethod = isIdc ? "idc" : "desktop";
 
       const oidcRegion = data.region || "us-east-1";
       let profileArn: string | undefined = data.profile_arn || data.profileArn;
-      if (!profileArn) profileArn = activeProfileArn;
+      if (!profileArn && isIdc) {
+        profileArn = activeProfileArn;
+      }
       const serviceRegion = extractRegionFromArn(profileArn) || oidcRegion;
 
       const result: KiroCliCredentials = {
@@ -167,10 +460,13 @@ async function importFromKiroDb(): Promise<KiroCliCredentials | null> {
         refreshToken: refreshToken || "",
         region: serviceRegion,
         authMethod,
+        profileArn,
         email: data.email || data.emailAddress,
-        profileArn: profileArn,
+        source: "kiro-cli-db",
+        tokenKey: row.key,
       };
 
+      // For IdC accounts, attach clientId/clientSecret from device registration
       if (isIdc && regCreds.clientId) {
         result.clientId = regCreds.clientId;
         result.clientSecret = regCreds.clientSecret;
@@ -180,6 +476,7 @@ async function importFromKiroDb(): Promise<KiroCliCredentials | null> {
         `Imported Kiro CLI credentials (method=${authMethod}, region=${serviceRegion}` +
         `${result.email ? `, email=${result.email}` : ""})`,
       );
+
       return result;
     }
 
@@ -191,49 +488,230 @@ async function importFromKiroDb(): Promise<KiroCliCredentials | null> {
   }
 }
 
-// ── SSO cache import ─────────────────────────────────────────────────
+/** Subset of the AWS SSO OIDC cache entry shape that Kiro IDE writes. */
+interface KiroSsoCacheToken {
+  accessToken?: unknown;
+  refreshToken?: unknown;
+  expiresAt?: unknown;
+  clientIdHash?: unknown;
+  authMethod?: unknown;
+  provider?: unknown;
+  region?: unknown;
+}
 
-async function importFromKiroSsoCache(): Promise<KiroCliCredentials | null> {
-  const cachePath = getKiroSsoCachePath();
-  if (!existsSync(cachePath)) {
-    log.debug(`Kiro SSO cache not found at ${cachePath}`);
+/**
+ * Map the SSO cache's `authMethod` string to our internal KiroCliCredentials
+ * shape. Kiro IDE writes `"IdC"` for IAM Identity Center logins. The cache
+ * does not record Builder ID — the AWS Builder ID path uses the standard
+ * `getCachedToken` and is not present in this file. Unknown / missing
+ * values default to `"idc"` because that's the only string observed in
+ * the wild.
+ */
+function mapSsoCacheAuthMethod(value: unknown): "idc" | "desktop" | "social" | "builder-id" {
+  if (typeof value !== "string") return "idc";
+  const v = value.toLowerCase();
+  if (v === "builderid" || v === "builder-id") return "desktop";
+  return "idc";
+}
+
+/**
+ * Import credentials from Kiro IDE's AWS SSO OIDC cache file.
+ *
+ * Path: `~/.aws/sso/cache/kiro-auth-token.json` (per the AWS SSO OIDC
+ * client spec; AWS CLI and Kiro IDE both write here on successful SSO login).
+ *
+ * The file contains the bearer access token, refresh token, expiry, region,
+ * and the SSO auth method ("IdC", etc.). It does NOT contain the OIDC
+ * clientId/clientSecret — those are stored in Kiro IDE's SQLite DB.
+ *
+ * This is a fallback for when the SQLite read fails (locked, missing,
+ * unreadable) or yields no tokens. Without OIDC client creds, refresh must
+ * go through the desktop endpoint; we set `authMethod: "desktop"` for that
+ * path. The original SSO identity (IdC) is preserved by leaving
+ * `region` and the token values intact.
+ *
+ * Returns null if the file doesn't exist, is unreadable, isn't valid JSON,
+ * or has no token fields. Never throws.
+ */
+export async function importFromKiroSsoCache(): Promise<KiroCliCredentials | null> {
+  const path = getKiroSsoCachePath();
+  if (!existsSync(path)) {
+    log.debug(`Kiro SSO cache not found at ${path}`);
     return null;
   }
 
   let raw: string;
   try {
-    raw = readFileSync(cachePath, "utf8");
+    raw = readFileSync(path, "utf8");
   } catch (err) {
-    log.warn(`Failed to read Kiro SSO cache at ${cachePath}: ${err}`);
+    log.warn(`Failed to read Kiro SSO cache at ${path}: ${err}`);
     return null;
   }
 
-  const token = safeJsonParse(raw);
-  if (!token || typeof token !== "object") return null;
+  const token = safeJsonParse(raw) as KiroSsoCacheToken | null;
+  if (!token || typeof token !== "object") {
+    log.debug(`Kiro SSO cache at ${path} is not valid JSON`);
+    return null;
+  }
 
   const accessToken = typeof token.accessToken === "string" ? token.accessToken : "";
   const refreshToken = typeof token.refreshToken === "string" ? token.refreshToken : "";
-  if (!accessToken && !refreshToken) return null;
+  if (!accessToken && !refreshToken) {
+    log.debug(`Kiro SSO cache at ${path} has no tokens`);
+    return null;
+  }
 
-  const region = typeof token.region === "string" && token.region.length > 0
-    ? token.region : "us-east-1";
+  const region =
+    typeof token.region === "string" && token.region.length > 0 ? token.region : "us-east-1";
+  const authMethod = mapSsoCacheAuthMethod(token.authMethod);
 
-  // SSO cache doesn't have OIDC creds, must use desktop refresh
-  const authMethod: "idc" | "desktop" = "desktop";
+  log.info(
+    `Imported Kiro SSO cache credentials (method=${authMethod}, region=${region})`,
+  );
 
-  log.info(`Imported Kiro SSO cache credentials (region=${region})`);
-
-  return { accessToken, refreshToken, region, authMethod };
+  return {
+    accessToken,
+    refreshToken,
+    region,
+    authMethod,
+    source: "kiro-sso-cache",
+  };
 }
 
-// ── Public API ───────────────────────────────────────────────────────
-
 /**
- * Import credentials from Kiro CLI DB first, then SSO cache fallback.
- * Returns null if neither source yields valid credentials. Never throws.
+ * Top-level import: try the Kiro IDE SQLite DB first, then fall back to
+ * the AWS SSO cache JSON. The cache is a strictly weaker source (no
+ * OIDC clientId/clientSecret) so the SQLite read is preferred.
+ *
+ * Returns null only when neither path yields valid credentials.
+ * Never throws.
  */
 export async function importFromKiroCli(): Promise<KiroCliCredentials | null> {
   const dbResult = await importFromKiroDb();
   if (dbResult) return dbResult;
   return importFromKiroSsoCache();
+}
+
+/**
+ * Attempt to read credentials from Kiro IDE's local database WITHOUT checking
+ * token expiry. This is the last-resort fallback: the access token is probably
+ * stale, but the refresh token might still be valid for one more exchange.
+ *
+ * Returns null if the DB doesn't exist, is unreadable, or has no tokens at all.
+ * Never throws.
+ */
+export async function getKiroCliCredentialsAllowExpired(
+  exclude?: KiroCliCredentials | null,
+): Promise<KiroCliCredentials | null> {
+  // Delegate to the same DB reader — importFromKiroCli already returns
+  // whatever token is stored without validating expiry timestamps.
+  // This separate export exists so callers express intent ("I know the token
+  // may be expired, give it to me anyway") and future refactors can add
+  // expiry-gating to importFromKiroCli without breaking the fallback path.
+  const imported = await importFromKiroCli();
+  return sameKiroCliCredential(imported, exclude ?? null) ? null : imported;
+}
+
+/**
+ * Write refreshed credentials back to Kiro CLI's local SQLite database.
+ *
+ * This enables bidirectional sync for credentials originally imported from the
+ * DB. The credential must carry `source: "kiro-cli-db"` and the exact imported
+ * `auth_kv` token key; unrelated token families are never overwritten.
+ *
+ * Never throws — all errors are caught and logged. A failed write-back is
+ * non-fatal; the refreshed token is still valid in memory.
+ */
+export async function saveKiroCliCredentials(creds: KiroCliCredentials): Promise<boolean> {
+  if (creds.source !== "kiro-cli-db" || !creds.tokenKey) {
+    log.debug("Credential write-back skipped: credential did not originate from kiro-cli DB");
+    return false;
+  }
+
+  const dbPath = getKiroDbPath();
+  if (!existsSync(dbPath)) {
+    log.debug(`Kiro CLI DB not found at ${dbPath} — cannot save credentials`);
+    return false;
+  }
+
+  try {
+    let Database: SqliteDatabaseConstructor | null = null;
+    try {
+      Database = (await import("bun:sqlite")).Database as SqliteDatabaseConstructor;
+    } catch {
+      try {
+        // @ts-expect-error - better-sqlite3 is an optional peer dependency
+        Database = (await import("better-sqlite3")).default as SqliteDatabaseConstructor;
+      } catch {
+        log.debug("No SQLite driver available for credential write-back; trying sqlite3 CLI");
+      }
+    }
+
+    let rows: AuthKvRow[];
+    let db: SqliteDb | null = null;
+
+    if (Database) {
+      // Open in read-write mode (no `readonly` flag).
+      db = new Database(dbPath);
+
+      try {
+        db.run?.("PRAGMA busy_timeout = 5000") ?? db.exec?.("PRAGMA busy_timeout = 5000");
+      } catch {
+        // Some SQLite drivers use exec instead of run
+      }
+
+      try {
+        const stmt = db.prepare("SELECT key, value FROM auth_kv");
+        rows = stmt.all() as AuthKvRow[];
+      } catch {
+        log.debug("Failed to read auth_kv table for credential write-back");
+        try { db.close(); } catch { /* ignore */ }
+        return false;
+      }
+    } else {
+      const cliRows = await readKiroAuthKvRowsWithSqliteCli(dbPath);
+      if (!cliRows) return false;
+      rows = cliRows;
+    }
+
+    const tokenRow = selectKiroTokenRowForWrite(rows, creds);
+    if (!tokenRow) {
+      log.debug("No matching token entry found in auth_kv — cannot write back");
+      try { db?.close(); } catch { /* ignore */ }
+      return false;
+    }
+
+    // Parse existing value, merge updated fields, write back.
+    const existing = safeJsonParse(tokenRow.value) ?? {};
+    const updated = {
+      ...existing,
+      accessToken: creds.accessToken,
+      access_token: creds.accessToken,
+      refreshToken: creds.refreshToken,
+      refresh_token: creds.refreshToken,
+    };
+    const updatedValue = JSON.stringify(updated);
+
+    if (db) {
+      try {
+        const updateStmt = db.prepare("UPDATE auth_kv SET value = ? WHERE key = ?");
+        updateStmt.run(updatedValue, tokenRow.key);
+      } catch (err) {
+        log.warn(`Failed to write credentials back to Kiro CLI DB: ${err}`);
+        try { db.close(); } catch { /* ignore */ }
+        return false;
+      }
+
+      try { db.close(); } catch { /* ignore */ }
+    } else {
+      const wrote = await writeKiroDbWithSqliteCli(dbPath, tokenRow.key, updatedValue);
+      if (!wrote) return false;
+    }
+
+    log.info("Wrote refreshed credentials back to Kiro CLI DB");
+    return true;
+  } catch (err) {
+    log.warn(`Failed to save credentials to Kiro CLI: ${err}`);
+    return false;
+  }
 }

@@ -19,7 +19,7 @@ import { log, previewChunk } from "./debug";
 import { parseKiroEvents } from "./event-parser";
 import { isPermanentError } from "./health";
 import type { KiroModel } from "./models";
-import { kiroModels, resolveKiroModel, getCachedDynamicModels } from "./models";
+import { kiroModels, resolveKiroModel, getCachedDynamicModels, resolveProfileArn, resetProfileArnCache, seedProfileArn } from "./models";
 import { ThinkingTagParser } from "./thinking-parser";
 import { countTokens } from "./tokenizer";
 import { abortableDelay } from "./oauth";
@@ -154,77 +154,7 @@ function emitHiddenReasoningLate(
 	});
 }
 
-// ---- profileArn cache --------------------------------------------------
-
-const profileArnCache = new Map<string, string>();
-/**
- * When true, `resolveProfileArn` is a no-op. Tests that don't mock the
- * ListAvailableProfiles endpoint flip this on to avoid firing a real request.
- */
-let profileArnSkipResolution = false;
-
-/**
- * Reset cache state. Pass `skipResolution: true` to disable profileArn lookup
- * entirely (useful for tests that don't mock ListAvailableProfiles).
- * Production code should never pass true — cache is reset on logout/refresh
- * without disabling resolution.
- */
-export function resetProfileArnCache(skipResolution = false): void {
-  profileArnCache.clear();
-  profileArnSkipResolution = skipResolution;
-}
-
-/**
- * Pre-seed the profileArn cache for a given endpoint. When set,
- * `resolveProfileArn` returns the seeded value without hitting the
- * management endpoint. Use this to inject a known profileArn from
- * external sources (e.g. Kiro CLI auth.json) as a fallback when the
- * management API returns 400.
- */
-export function seedProfileArn(endpoint: string, arn: string): void {
-  profileArnCache.set(endpoint, arn);
-}
-
-export async function resolveProfileArn(accessToken: string, endpoint: string): Promise<string | undefined> {
-  if (profileArnSkipResolution) return undefined;
-  const cached = profileArnCache.get(endpoint);
-  if (cached !== undefined) return cached;
-
-  try {
-    // Kiro CLI 2.5+ migrated profile resolution to the management endpoint.
-    // runtime.us-east-1.kiro.dev → management.us-east-1.kiro.dev
-    const ep = new URL(endpoint);
-    ep.hostname = ep.hostname.replace("runtime.", "management.");
-    ep.pathname = "/";
-    ep.search = "";
-    ep.hash = "";
-
-    const resp = await fetch(ep.toString(), {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-amz-json-1.0",
-        Authorization: `Bearer ${accessToken}`,
-        "X-Amz-Target": "AmazonCodeWhispererService.ListAvailableProfiles",
-      },
-      body: "{}",
-    });
-    if (!resp.ok) {
-      log.debug(`profileArn resolution failed: ${resp.status} ${resp.statusText}`);
-      return undefined;
-    }
-    const j = (await resp.json()) as { profiles?: Array<{ arn?: string }> };
-    const arn = j.profiles?.find((p) => p.arn)?.arn;
-    if (!arn) {
-      log.debug("profileArn resolution returned no profile ARN");
-      return undefined;
-    }
-    profileArnCache.set(endpoint, arn);
-    return arn;
-  } catch (error) {
-    log.debug(`profileArn resolution threw: ${error instanceof Error ? error.message : String(error)}`);
-    return undefined;
-  }
-}
+// ---- profileArn cache moved to models.ts -------------------------------
 
 // ---- Request body shape ------------------------------------------------
 
@@ -722,7 +652,7 @@ export function streamKiro(
           if (response.status === 401) {
             const permanent = isPermanentError(errText);
             if (permanent) {
-              profileArnCache.delete(endpoint);
+              resetProfileArnCache();
               throw new Error(
                 `Kiro API error: credentials permanently invalid — run /login kiro to re-authenticate. ${errText}`,
               );
@@ -734,7 +664,7 @@ export function streamKiro(
             // now rejected — drift, revocation, or server-side invalidation.
             // Bust the profileArn cache so the next attempt re-resolves with
             // a fresh token, and surface a clear re-login hint.
-            profileArnCache.delete(endpoint);
+            resetProfileArnCache();
             throw new Error(
               `Kiro API error: access token rejected (403) — run /login kiro to re-authenticate. ${errText}`,
             );

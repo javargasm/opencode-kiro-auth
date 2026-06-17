@@ -1,4 +1,3 @@
-import { resolveProfileArn } from "./stream";
 
 // Kiro model catalog + ID conversion + region mapping.
 //
@@ -377,6 +376,56 @@ export interface KiroApiModel {
   };
 }
 
+let cachedProfileArn: string | null = null;
+let profileArnSkipResolution = false;
+
+export function resetProfileArnCache(skipResolution = false): void {
+  cachedProfileArn = null;
+  profileArnSkipResolution = skipResolution;
+}
+
+export function seedProfileArn(arn: string): void {
+  cachedProfileArn = arn;
+}
+
+/**
+ * Resolve the Kiro profile ARN by calling ListAvailableProfiles.
+ * Builder ID device-code login doesn't receive a profileArn, so we
+ * discover it here. Returns null on failure (graceful fallback).
+ */
+export async function resolveProfileArn(
+  accessToken: string,
+  apiRegion: string,
+): Promise<string | null> {
+  if (profileArnSkipResolution) return null;
+  if (cachedProfileArn !== null) return cachedProfileArn;
+
+  const endpoint = `https://management.${apiRegion}.kiro.dev/`;
+  const resp = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/x-amz-json-1.0",
+      "X-Amz-Target": "AmazonCodeWhispererService.ListAvailableProfiles",
+      "user-agent": "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererruntime/0.1.16551 os/macos lang/rust/1.92.0 md/appVersion-2.7.1 app/AmazonQ-For-CLI",
+    },
+    body: "{}",
+  });
+  if (!resp || !resp.ok) return null;
+
+  const data = (await resp.json()) as {
+    profiles?: { arn?: string; profileType?: string; status?: string }[];
+  };
+  const profiles = data.profiles ?? [];
+  const kiroProfile = profiles.find((p) => p.profileType === "KIRO" && p.status === "ACTIVE");
+  const arn = kiroProfile?.arn ?? profiles[0]?.arn ?? null;
+  
+  if (arn) {
+    cachedProfileArn = arn;
+  }
+  return arn;
+}
+
 /**
  * Fetch the list of models actually available for this account from Kiro.
  * Filters out "auto" — it appears in ListAvailableModels but is rejected
@@ -385,27 +434,18 @@ export interface KiroApiModel {
 export async function fetchAvailableModels(
   accessToken: string,
   apiRegion: string,
-  fallbackProfileArn?: string,
+  profileArn: string,
 ): Promise<KiroApiModel[]> {
-  const runtimeUrl = `https://runtime.${apiRegion}.kiro.dev/`;
-  let profileArn = await resolveProfileArn(accessToken, runtimeUrl);
-  
-  if (!profileArn && fallbackProfileArn) {
-    profileArn = fallbackProfileArn;
-  }
-
-  if (!profileArn) {
-    throw new Error("Missing profileArn: cannot fetch available models.");
-  }
-
-  const url = `https://management.${apiRegion}.kiro.dev/ListAvailableModels?origin=KIRO_CLI&profileArn=${encodeURIComponent(profileArn)}`;
+  const url = `https://management.${apiRegion}.kiro.dev/?origin=KIRO_CLI&profileArn=${encodeURIComponent(profileArn)}`;
   const resp = await fetch(url, {
-    method: "GET",
+    method: "POST",
     headers: {
       Authorization: `Bearer ${accessToken}`,
-      Accept: "application/json",
-      "User-Agent": "opencode-kiro",
+      "Content-Type": "application/x-amz-json-1.0",
+      "X-Amz-Target": "AmazonCodeWhispererService.ListAvailableModels",
+      "user-agent": "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererruntime/0.1.16551 os/macos lang/rust/1.92.0 md/appVersion-2.7.1 app/AmazonQ-For-CLI",
     },
+    body: "{}",
   });
   if (!resp.ok) {
     throw new Error(`ListAvailableModels failed: HTTP ${resp.status}`);

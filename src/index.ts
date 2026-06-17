@@ -12,11 +12,17 @@ import {
   EXPIRES_BUFFER_MS,
   tryRegisterAndAuthorize, 
   pollForToken, 
-  refreshKiroToken 
+  refreshKiroToken,
+  startSocialLogin,
 } from "./oauth";
 import {
   kiroModels, 
-  getCachedDynamicModels
+  getCachedDynamicModels,
+  fetchAvailableModels,
+  resolveProfileArn,
+  buildModelsFromApi,
+  resolveApiRegion,
+  setCachedDynamicModels
 } from "./models";
 
 // Global server instance to manage lifecycle across reloads
@@ -74,44 +80,36 @@ export const KiroPlugin: Plugin = async (input) => {
         return {};
       },
       methods: [
-        // ── 1. AWS Builder ID ──────────────────────────────────────
+        // ── 1. AWS Builder ID (Social PKCE) ────────────────────────
         {
           type: "oauth",
           label: "AWS Builder ID (personal account)",
           prompts: [],
           authorize: async () => {
-            const result = await tryRegisterAndAuthorize(BUILDER_ID_START_URL, BUILDER_ID_REGION);
-            if (!result) {
-              throw new Error("Could not authorize with AWS Builder ID.");
-            }
+            const { signInUrl, waitForCredentials } = await startSocialLogin();
 
             return {
-              url: result.devAuth.verificationUriComplete,
-              instructions: `AWS Verification Code: ${result.devAuth.userCode}\nComplete authorization in your browser, then OpenCode will continue automatically.`,
+              url: signInUrl,
+              instructions: "Complete sign-in in your browser. OpenCode will continue automatically.",
               method: "auto",
               callback: async () => {
-                const tok = await pollForToken(
-                  result.oidcEndpoint,
-                  result.clientId,
-                  result.clientSecret,
-                  result.devAuth,
-                  undefined
-                );
+                try {
+                  const creds = await waitForCredentials();
 
-                if (!tok.accessToken || !tok.refreshToken) {
-                  return { type: "failed" };
+                  return {
+                    type: "success" as const,
+                    access: creds.accessToken,
+                    refresh: creds.refreshPacked,
+                    expires: creds.expiresAt,
+                    metadata: {
+                      region: creds.region,
+                      authMethod: creds.authMethod,
+                      profileArn: creds.profileArn
+                    }
+                  };
+                } catch {
+                  return { type: "failed" as const };
                 }
-
-                return {
-                  type: "success",
-                  access: tok.accessToken,
-                  refresh: `${tok.refreshToken}|${result.clientId}|${result.clientSecret}|builder-id`,
-                  expires: Date.now() + (tok.expiresIn ?? 3600) * 1000 - EXPIRES_BUFFER_MS,
-                  metadata: {
-                    region: BUILDER_ID_REGION,
-                    authMethod: "builder-id"
-                  }
-                };
               }
             };
           }
@@ -174,14 +172,24 @@ export const KiroPlugin: Plugin = async (input) => {
                   return { type: "failed" };
                 }
 
+                const apiRegion = resolveApiRegion(detectedRegion);
+                const arn = await resolveProfileArn(tok.accessToken, apiRegion);
+                if (arn) {
+                  try {
+                    const models = await fetchAvailableModels(tok.accessToken, apiRegion, arn);
+                    setCachedDynamicModels(buildModelsFromApi(models));
+                  } catch (e) { log.warn("Failed to precache models", e); }
+                }
+
                 return {
                   type: "success",
                   access: tok.accessToken,
-                  refresh: `${tok.refreshToken}|${result.clientId}|${result.clientSecret}|idc`,
+                  refresh: `${tok.refreshToken}|${result.clientId}|${result.clientSecret}|idc||`,
                   expires: Date.now() + (tok.expiresIn ?? 3600) * 1000 - EXPIRES_BUFFER_MS,
                   metadata: {
                     region: detectedRegion,
-                    authMethod: "idc"
+                    authMethod: "idc",
+                    profileArn: arn
                   }
                 };
               }
@@ -211,6 +219,8 @@ export const KiroPlugin: Plugin = async (input) => {
               imported.clientId || "",
               imported.clientSecret || "",
               authMethod,
+              imported.source || "",
+              imported.tokenKey || "",
             ];
 
             return {
@@ -275,7 +285,7 @@ export const KiroPlugin: Plugin = async (input) => {
             }
 
             const region = inputs.region?.trim() || "us-east-1";
-            const packed = `${refreshToken}|||desktop`;
+            const packed = `${refreshToken}|||desktop||`;
 
             return {
               url: "",
@@ -309,7 +319,7 @@ export const KiroPlugin: Plugin = async (input) => {
       cfg.provider = cfg.provider ?? {};
       cfg.provider.kiro = cfg.provider.kiro ?? {};
       const kiro = cfg.provider.kiro;
-      kiro.name = kiro.name ?? "Kiro";
+      kiro.name = kiro.name ?? "Kiro AWS";
       kiro.npm = kiro.npm ?? "@ai-sdk/anthropic";
       kiro.api = kiro.api ?? `http://127.0.0.1:${localPort}/v1`;
       kiro.models = kiro.models ?? {};
