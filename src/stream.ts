@@ -23,6 +23,7 @@ import { kiroModels, resolveKiroModel, getCachedDynamicModels, resolveProfileArn
 import { ThinkingTagParser } from "./thinking-parser";
 import { countTokens } from "./tokenizer";
 import { abortableDelay } from "./oauth";
+import { logRequest, logResponseEvent, logResponseDone, logHttpError, logStreamError, logCaughtError } from "./file-logger";
 
 import {
   buildHistory,
@@ -311,11 +312,16 @@ export function streamKiro(
         if (options?.signal?.aborted) throw options.signal.reason;
 
         const normalized = normalizeMessages(context.messages);
+        // NOTE: systemPrompt is NOT passed to buildHistory. It contains the
+        // <thinking_mode>enabled</thinking_mode> directive which, when replayed
+        // in history, causes Bedrock to expect a reasoningContent.signature on
+        // the following assistant response — triggering THINKING_SIGNATURE_INVALID.
+        // The thinking directive only belongs in the current message (or seed).
         const {
           history,
-          systemPrepended,
+          systemPrepended: _systemPrepended,
           currentMsgStartIdx,
-        } = buildHistory(normalized, kiroModelId, systemPrompt);
+        } = buildHistory(normalized, kiroModelId);
 
         // Inject the synthetic system seed pair at the start of history.
         // The real Kiro CLI always sends this as the first history entries.
@@ -361,7 +367,7 @@ export function streamKiro(
           const hasReasoning = armReasoningText.length > 0;
           if (armContent || armToolUses.length > 0 || hasReasoning) {
             const last = history[history.length - 1];
-            const reasoningContent = hasReasoning
+            const reasoningContent = hasReasoning && armReasoningSignature
               ? { reasoningText: { text: armReasoningText, signature: armReasoningSignature } }
               : undefined;
             if (last && !last.userInputMessage && last.assistantResponseMessage) {
@@ -434,7 +440,7 @@ export function streamKiro(
           currentContent = "Tool results provided.";
         } else if (firstMsg?.role === "user") {
           currentContent = typeof firstMsg.content === "string" ? firstMsg.content : getContentText(firstMsg);
-          if (systemPrompt && !systemPrepended) {
+          if (systemPrompt) {
             currentContent = `${systemPrompt}\n\n${currentContent}`;
           }
         }
@@ -567,6 +573,16 @@ export function streamKiro(
             try { require("fs").writeFileSync("/tmp/kiro-last-request.json", requestBody); } catch {}
           }
 
+          // File-based request logging (KIRO_FILE_LOG=1)
+          logRequest({
+            endpoint,
+            model: model.id,
+            historyLength: history.length,
+            requestBodyChars: requestBody.length,
+            attempt: retryCount,
+            conversationId,
+          }, requestBody);
+
           response = await fetch(endpoint, {
             method: "POST",
             headers: {
@@ -598,7 +614,17 @@ export function streamKiro(
           log.debug("response.error", {
             status: response.status,
             body: errText,
+          });
 
+          // File-based error logging (KIRO_FILE_LOG=1)
+          logHttpError({
+            status: response.status,
+            statusText: response.statusText,
+            body: errText,
+            endpoint,
+            model: model.id,
+            attempt: retryCount,
+            historyLength: history.length,
           });
 
           if (isCapacityError(errText) && capacityRetryCount < CAPACITY_MAX_RETRIES) {
@@ -805,6 +831,11 @@ export function streamKiro(
             }
           }
 
+          // File-based response event logging (KIRO_FILE_LOG=1)
+          for (const ev of events) {
+            logResponseEvent({ type: ev.type, data: ev.data, eventSeq });
+          }
+
           for (const event of events) {
             switch (event.type) {
               case "contextUsage": {
@@ -904,6 +935,12 @@ export function streamKiro(
                 streamError = event.data.message
                   ? `${event.data.error}: ${event.data.message}`
                   : event.data.error;
+                logStreamError({
+                  error: streamError,
+                  context: "stream_event",
+                  model: model.id,
+                  attempt: retryCount,
+                });
                 void reader.cancel().catch(() => {});
                 break;
               }
@@ -918,8 +955,15 @@ export function streamKiro(
           if (retryCount < MAX_RETRIES) {
             retryCount++;
             const delayMs = exponentialBackoff(retryCount - 1, 1000, MAX_RETRY_DELAY_MS);
+            const streamErrDesc = firstTokenTimedOut ? "first-token timed out" : idleCancelled ? "idle timed out" : `error: ${streamError}`;
+            logStreamError({
+              error: streamErrDesc,
+              context: "retry",
+              model: model.id,
+              attempt: retryCount,
+            });
             log.info(
-              `stream ${firstTokenTimedOut ? "first-token timed out" : idleCancelled ? "idle timed out" : `error: ${streamError}`} — retrying (${retryCount}/${MAX_RETRIES})`,
+              `stream ${streamErrDesc} — retrying (${retryCount}/${MAX_RETRIES})`,
             );
             // Cancel the pending shim BEFORE the backoff delay so
             // the timer can't fire mid-wait (exponential backoff
@@ -1025,6 +1069,16 @@ export function streamKiro(
           sawAnyToolCalls,
           usage: output.usage,
         });
+
+        // File-based response done logging (KIRO_FILE_LOG=1)
+        logResponseDone({
+          stopReason: output.stopReason,
+          emittedToolCalls,
+          usage: output.usage,
+          contentBlocks: output.content.length,
+          model: model.id,
+        });
+
         stream.end();
         return;
       }
@@ -1032,6 +1086,13 @@ export function streamKiro(
       output.stopReason = options?.signal?.aborted ? "aborted" : "error";
       output.errorMessage = error instanceof Error ? error.message : String(error);
       log.debug("response.caught", { stopReason: output.stopReason, error: output.errorMessage });
+
+      // File-based caught error logging (KIRO_FILE_LOG=1)
+      logCaughtError({
+        stopReason: output.stopReason,
+        errorMessage: output.errorMessage,
+        model: model.id,
+      });
       // Cancel the pending shim timer so no stray shim fires after
       // the error event. Nothing to close — the shim is self-
       // contained when it fires, and if the timer is still armed
