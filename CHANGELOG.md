@@ -1,5 +1,18 @@
 # @javargasm/opencode-kiro-auth
 
+## 0.3.0
+
+### Minor Changes
+
+- Tool-call reliability fixes, dashboard cost telemetry, and dependency cleanup.
+
+  - fix(transform): preserve tool parameter names during schema sanitization. Keys under `properties` are parameter names (query, command, filePath), not JSON Schema keywords, so they must not be filtered against the allowlist. The previous behavior dropped every parameter while `required` still referenced them, causing MCP tools to fail with "query must be a non-empty string".
+  - fix(stream): inject a placeholder toolConfig when replayed history contains toolUse/toolResult blocks but the current turn supplies no tools. Prevents Bedrock TOOL_CONFIG_MISSING 400 loops on auxiliary turns (title generation, summarization, compaction).
+  - fix(stream): stop leaking the internal `__tool_use_purpose` field in `toolcall_delta` — emit cleaned args so delta and toolcall_end agree.
+  - fix(event-parser): don't emit a bogus usage event for metering frames (`{"unit":"credit","usage":<number>}`); accept capitalized `Usage`/`Error` keys from the Kiro stream.
+  - feat(dashboard): add USD cost estimation (official Anthropic per-MTok rates) and per-request reasoning-effort telemetry, with a credits/USD toggle.
+  - chore: drop stale static model ids now resolved dynamically; gitignore npm's package-lock.json (project uses bun); bump vitest to ^4.
+
 ## 0.2.2
 
 ### Patch Changes
