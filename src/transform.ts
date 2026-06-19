@@ -184,6 +184,20 @@ function sanitizeSchema(obj: unknown): unknown {
     if ((key === "minimum" || key === "maximum") && typeof value === "number") {
       if (Math.abs(value) > 1_000_000_000) continue; // drop extreme bounds
     }
+    // Under `properties`, the keys are arbitrary PARAMETER NAMES (query,
+    // command, filePath…), not JSON Schema keywords — they must NOT be
+    // filtered against ALLOWED_SCHEMA_KEYS. Preserve each name and sanitize
+    // only its sub-schema value. Without this, every parameter is dropped
+    // while `required` still references it, so the model receives a tool
+    // whose declared params don't exist and omits them at call time.
+    if (key === "properties" && value && typeof value === "object" && !Array.isArray(value)) {
+      const props: Record<string, unknown> = {};
+      for (const [propName, propSchema] of Object.entries(value as Record<string, unknown>)) {
+        props[propName] = sanitizeSchema(propSchema);
+      }
+      result[key] = props;
+      continue;
+    }
     result[key] = sanitizeSchema(value);
   }
   return result;

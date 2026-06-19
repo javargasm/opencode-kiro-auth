@@ -8,6 +8,8 @@ import type {
 } from "../src/types";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { streamKiro } from "../src/stream";
+import { convertToolsToKiro } from "../src/transform";
+import type { Tool } from "../src/types";
 import { resetProfileArnCache, seedProfileArn } from "../src/models";
 
 function makeModel(overrides?: Partial<Model<Api>>): Model<Api> {
@@ -608,5 +610,137 @@ describe("streamKiro", () => {
       const { errors } = validateBedrockInvariants(body);
       expect(errors).toEqual([]);
     });
+  });
+});
+
+describe("convertToolsToKiro schema sanitization", () => {
+  function getJson(tool: Tool) {
+    return convertToolsToKiro([tool])[0]!.toolSpecification.inputSchema.json as Record<string, any>;
+  }
+
+  it("preserves parameter names under `properties` (regression: params were stripped)", () => {
+    const tool: Tool = {
+      name: "codegraph_search",
+      description: "Quick symbol search by name.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "the symbol to search" },
+        },
+        required: ["query"],
+        additionalProperties: false,
+      },
+    };
+
+    const json = getJson(tool);
+    // The real parameter MUST survive — before the fix only __tool_use_purpose remained.
+    expect(json.properties).toHaveProperty("query");
+    expect(json.properties.query).toEqual({ type: "string", description: "the symbol to search" });
+    // The injected purpose field is still added.
+    expect(json.properties).toHaveProperty("__tool_use_purpose");
+    // `required` still references a param that now actually exists.
+    expect(json.required).toEqual(["query"]);
+  });
+
+  it("preserves multiple params and keeps `required` consistent", () => {
+    const tool: Tool = {
+      name: "edit",
+      description: "edit a file",
+      parameters: {
+        type: "object",
+        properties: {
+          filePath: { type: "string" },
+          oldString: { type: "string" },
+          newString: { type: "string" },
+          replaceAll: { type: "boolean" },
+        },
+        required: ["filePath", "oldString", "newString"],
+      },
+    };
+
+    const json = getJson(tool);
+    expect(Object.keys(json.properties).sort()).toEqual(
+      ["__tool_use_purpose", "filePath", "newString", "oldString", "replaceAll"].sort(),
+    );
+    expect(json.required).toEqual(["filePath", "oldString", "newString"]);
+  });
+
+  it("recurses into nested object properties without stripping inner param names", () => {
+    const tool: Tool = {
+      name: "complex",
+      description: "nested params",
+      parameters: {
+        type: "object",
+        properties: {
+          filter: {
+            type: "object",
+            properties: {
+              status: { type: "string", enum: ["open", "closed"] },
+              limit: { type: "number" },
+            },
+            required: ["status"],
+          },
+        },
+        required: ["filter"],
+      },
+    };
+
+    const json = getJson(tool);
+    expect(json.properties).toHaveProperty("filter");
+    expect(json.properties.filter.properties).toHaveProperty("status");
+    expect(json.properties.filter.properties).toHaveProperty("limit");
+    expect(json.properties.filter.properties.status.enum).toEqual(["open", "closed"]);
+    expect(json.properties.filter.required).toEqual(["status"]);
+  });
+
+  it("preserves array item param names via `items`", () => {
+    const tool: Tool = {
+      name: "batch",
+      description: "array of objects",
+      parameters: {
+        type: "object",
+        properties: {
+          items: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                id: { type: "string" },
+                value: { type: "number" },
+              },
+            },
+          },
+        },
+        required: ["items"],
+      },
+    };
+
+    const json = getJson(tool);
+    const itemSchema = json.properties.items.items;
+    expect(itemSchema.properties).toHaveProperty("id");
+    expect(itemSchema.properties).toHaveProperty("value");
+  });
+
+  it("still strips disallowed JSON Schema keywords (e.g. $schema, exclusiveMinimum)", () => {
+    const tool: Tool = {
+      name: "zodish",
+      description: "zod-emitted schema",
+      parameters: {
+        $schema: "http://json-schema.org/draft-07/schema#",
+        type: "object",
+        properties: {
+          count: { type: "number", exclusiveMinimum: 0, description: "a count" },
+        },
+        required: ["count"],
+      },
+    };
+
+    const json = getJson(tool);
+    expect(json).not.toHaveProperty("$schema");
+    expect(json.properties).toHaveProperty("count");
+    // disallowed keyword removed from the sub-schema, allowed ones kept
+    expect(json.properties.count).not.toHaveProperty("exclusiveMinimum");
+    expect(json.properties.count.type).toBe("number");
+    expect(json.properties.count.description).toBe("a count");
   });
 });
