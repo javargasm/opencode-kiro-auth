@@ -1,5 +1,13 @@
 # @javargasm/opencode-kiro-auth
 
+## 0.3.1
+
+### Patch Changes
+
+- fix(server): strip wrapping markdown from generated session titles.
+
+  Kiro models return titles wrapped in bold (`**Title**`), quotes, backticks, or with a leading heading/list marker, despite OpenCode's title prompt asking for plain text. The gateway now detects the title-generation turn and strips the wrapping, so titles like `**Debugging CodeGraph Configuration**` render as plain text. Normal chat responses keep their markdown intact.
+
 ## 0.3.0
 
 ### Minor Changes
