@@ -504,6 +504,16 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
                       effort: reasoningEffort,
                     });
 
+                    // NOTE (protocol deviation, kept on purpose) — Anthropic
+                    // normally reports input_tokens in message_start. Kiro can't:
+                    // it only reveals input-token usage at end-of-stream (via
+                    // contextUsage/metering frames), so message_start above
+                    // necessarily sent input_tokens: 0 and we report the real
+                    // input_tokens here in message_delta. Anthropic clients read
+                    // final cumulative usage from message_delta, so this is safe.
+                    // Do NOT "fix" this by moving it back to message_start — the
+                    // count isn't known yet there. Left documented in case a
+                    // strict client ever expects input_tokens up front.
                     controller.enqueue(
                       "event: message_delta\ndata: " +
                       JSON.stringify({
