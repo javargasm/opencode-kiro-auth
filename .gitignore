@@ -1,6 +1,9 @@
 # dependencies
 node_modules/
 
+# npm lockfile — this project uses bun (bun.lock); reject npm's lockfile
+package-lock.json
+
 # output
 dist/
 *.tgz
