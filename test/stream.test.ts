@@ -231,6 +231,14 @@ describe("streamKiro", () => {
       '{"name":"bash","toolUseId":"t1","input":"{\\"cmd\\":\\"ls\\",\\"__tool_use_purpose\\":\\"test\\"}","stop":true}';
     vi.spyOn(globalThis, "fetch").mockImplementation(mockFetchOk(`${toolPayload}{"contextUsagePercentage":5}`));
     const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+    
+    const deltaEvent = events.find((e) => e.type === "toolcall_delta");
+    expect(deltaEvent).toBeDefined();
+    if (deltaEvent?.type === "toolcall_delta") {
+      expect(deltaEvent.delta).not.toContain("__tool_use_purpose");
+      expect(JSON.parse(deltaEvent.delta)).toEqual({ cmd: "ls" });
+    }
+
     const done = events.find((e) => e.type === "done");
     expect(done?.type === "done").toBe(true);
     if (done?.type === "done") {

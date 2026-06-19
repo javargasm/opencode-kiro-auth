@@ -207,7 +207,7 @@ function emitToolCall(
   const toolCall: ToolCall = { type: "toolCall", id: state.toolUseId, name: state.name, arguments: args };
   output.content.push(toolCall);
   stream.push({ type: "toolcall_start", contentIndex, partial: output });
-  stream.push({ type: "toolcall_delta", contentIndex, delta: state.input, partial: output });
+  stream.push({ type: "toolcall_delta", contentIndex, delta: JSON.stringify(args), partial: output });
   stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });
   return true;
 }
@@ -862,6 +862,7 @@ export function streamKiro(
                 const tc = output.content[contentIndex] as ThinkingContent;
                 if (event.data.text) {
                   tc.thinking += event.data.text;
+                  totalContent += event.data.text;
                   stream.push({ type: "thinking_delta", contentIndex, delta: event.data.text, partial: output });
                 }
                 if (event.data.signature) {
