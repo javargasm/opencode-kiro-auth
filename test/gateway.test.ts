@@ -144,6 +144,7 @@ describe("Local HTTP Gateway Server (Anthropic Protocol)", () => {
     const messageDeltaPayload = JSON.parse(blocks[deltaIndex]!.split("data: ")[1]!);
     expect(messageDeltaPayload.type).toBe("message_delta");
     expect(messageDeltaPayload.delta.stop_reason).toBe("end_turn");
+    expect(messageDeltaPayload.usage.input_tokens).toBe(10);
     expect(messageDeltaPayload.usage.output_tokens).toBe(15);
 
     // 9. Last block: event: message_stop
@@ -212,5 +213,63 @@ describe("Local HTTP Gateway Server (Anthropic Protocol)", () => {
     expect(body.usage.output_tokens).toBe(20);
 
     await server.stop(true);
+  });
+
+  it("should record effort level and support lifetime metrics past MAX_HISTORY", async () => {
+    const { stats } = await import("../src/dashboard-stats");
+    
+    // Clear stats requests for isolation
+    (stats as any).requests = [];
+    (stats as any).totalRequests = 0;
+    (stats as any).totalTokens = 0;
+    (stats as any).totalCredits = 0;
+    (stats as any).totalUsd = 0;
+
+    // Record a mock request with effort
+    stats.recordRequest({
+      id: "msg_test_effort",
+      model: "claude-sonnet-4-6",
+      inputTokens: 10,
+      outputTokens: 20,
+      credits: 0.0015,
+      stream: false,
+      effort: "high",
+    });
+
+    const currentStats = stats.getStats();
+    expect(currentStats.totalRequests).toBe(1);
+    expect(currentStats.totalTokens).toBe(30);
+    expect(currentStats.totalCredits).toBe(0.0015);
+    expect(currentStats.totalUsd).toBeCloseTo(0.00033, 6);
+    expect(currentStats.requests[0]?.effort).toBe("high");
+    expect(currentStats.requests[0]?.usd).toBeCloseTo(0.00033, 6);
+
+    // Record more than 100 requests to check lifetime totals
+    for (let i = 0; i < 105; i++) {
+      stats.recordRequest({
+        id: `msg_test_${i}`,
+        model: "claude-sonnet-4-6",
+        inputTokens: 1,
+        outputTokens: 1,
+        credits: 0.0001,
+        stream: false,
+      });
+    }
+
+    const afterStats = stats.getStats();
+    expect(afterStats.totalRequests).toBe(106); // 1 original + 105 new
+    expect(afterStats.requests.length).toBe(100); // capped at MAX_HISTORY = 100
+  });
+
+  it("should resolve pricing for newer Claude models correctly", async () => {
+    const { getModelPricing } = await import("../src/dashboard-stats");
+    
+    expect(getModelPricing("claude-opus-4-8")).toEqual({ input: 5.00, output: 25.00 });
+    expect(getModelPricing("claude-sonnet-4-6")).toEqual({ input: 3.00, output: 15.00 });
+    expect(getModelPricing("claude-sonnet-4")).toEqual({ input: 3.00, output: 15.00 });
+    expect(getModelPricing("claude-haiku-4-5")).toEqual({ input: 1.00, output: 5.00 });
+    
+    // Partial matches
+    expect(getModelPricing("claude-opus-4-6-temp")).toEqual({ input: 5.00, output: 25.00 });
   });
 });

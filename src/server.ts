@@ -500,7 +500,8 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
                       inputTokens,
                       outputTokens,
                       credits,
-                      stream: true
+                      stream: true,
+                      effort: reasoningEffort,
                     });
 
                     controller.enqueue(
@@ -512,6 +513,7 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
                           stop_sequence: null
                         },
                         usage: {
+                          input_tokens: inputTokens,
                           output_tokens: outputTokens
                         }
                       }) + "\n\n"
@@ -586,7 +588,8 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
                 inputTokens,
                 outputTokens,
                 credits,
-                stream: false
+                stream: false,
+                effort: reasoningEffort,
               });
 
               const responseBody = {

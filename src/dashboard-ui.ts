@@ -80,6 +80,16 @@ export function getDashboardHtml(): string {
       gap: 8px;
     }
 
+    button.status-badge {
+      color: var(--primary);
+      transition: all 0.2s ease;
+    }
+
+    button.status-badge:hover {
+      background: rgba(0, 255, 65, 0.25);
+      box-shadow: 0 0 10px rgba(0, 255, 65, 0.4);
+    }
+
     .pulse {
       width: 8px;
       height: 8px;
@@ -216,9 +226,14 @@ export function getDashboardHtml(): string {
       <h1>KIRO_GATEWAY</h1>
       <div style="font-size: 0.8rem; color: var(--text); margin-top: 5px;">LOCAL PROXY // TELEMETRY NODE</div>
     </div>
-    <div class="status-badge">
-      <div class="pulse"></div>
-      SYS.ONLINE
+    <div style="display: flex; align-items: center; gap: 15px;">
+      <button id="toggle-currency" class="status-badge" style="cursor: pointer; font-family: var(--font-mono); outline: none;" onclick="toggleCurrency()">
+        SHOW USD
+      </button>
+      <div class="status-badge">
+        <div class="pulse"></div>
+        SYS.ONLINE
+      </div>
     </div>
   </header>
 
@@ -232,8 +247,8 @@ export function getDashboardHtml(): string {
       <div class="metric-value" id="val-tokens">0</div>
     </div>
     <div class="metric-card">
-      <div class="metric-label">EST.CREDITS</div>
-      <div class="metric-value" id="val-credits">0.000</div>
+      <div class="metric-label" id="label-credits">EST.CREDITS</div>
+      <div class="metric-value" id="val-credits">0.0</div>
     </div>
   </div>
 
@@ -245,9 +260,10 @@ export function getDashboardHtml(): string {
           <th>ID</th>
           <th>MODEL</th>
           <th>TYPE</th>
+          <th>EFFORT</th>
           <th>IN.TOKENS</th>
           <th>OUT.TOKENS</th>
-          <th>CREDITS</th>
+          <th id="header-credits">CREDITS</th>
         </tr>
       </thead>
       <tbody id="table-body">
@@ -264,6 +280,22 @@ export function getDashboardHtml(): string {
       return d.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' }) + '.' + d.getMilliseconds().toString().padStart(3, '0');
     }
 
+    let showUsd = false;
+
+    function toggleCurrency() {
+      showUsd = !showUsd;
+      const btn = document.getElementById('toggle-currency');
+      btn.innerText = showUsd ? 'SHOW CREDITS' : 'SHOW USD';
+      
+      const labelCard = document.getElementById('label-credits');
+      labelCard.innerText = showUsd ? 'EST.COST (USD)' : 'EST.CREDITS';
+      
+      const headerTable = document.getElementById('header-credits');
+      headerTable.innerText = showUsd ? 'COST (USD)' : 'CREDITS';
+      
+      fetchStats();
+    }
+
     async function fetchStats() {
       try {
         const res = await fetch('/dashboard/api/stats');
@@ -271,7 +303,12 @@ export function getDashboardHtml(): string {
         
         document.getElementById('val-requests').innerText = data.totalRequests;
         document.getElementById('val-tokens').innerText = data.totalTokens.toLocaleString();
-        document.getElementById('val-credits').innerText = data.totalCredits.toFixed(4);
+        
+        if (showUsd) {
+          document.getElementById('val-credits').innerText = '$' + data.totalUsd.toFixed(1);
+        } else {
+          document.getElementById('val-credits').innerText = data.totalCredits.toFixed(1);
+        }
 
         const tbody = document.getElementById('table-body');
         
@@ -283,15 +320,24 @@ export function getDashboardHtml(): string {
           currentIds.add(req.id);
           const isNew = !lastRenderedIds.has(req.id) && lastRenderedIds.size > 0;
           
+          const effortTag = req.effort
+            ? '<span class="tag" style="border-color: rgba(0, 255, 255, 0.3); color: var(--secondary); background: rgba(0, 255, 255, 0.05);">' + req.effort.toUpperCase() + '</span>'
+            : '<span style="opacity: 0.3">-</span>';
+
+          const costDisplay = showUsd
+            ? '$' + (req.usd ?? 0).toFixed(4)
+            : req.credits.toFixed(5);
+
           html += \`
             <tr class="\${isNew ? 'new-row' : ''}">
               <td style="color: var(--secondary)">\${formatTime(req.timestamp)}</td>
               <td><span style="opacity: 0.5">msg_</span>\${req.id.split('_').pop().substring(0,8)}</td>
               <td class="model-name">\${req.model}</td>
               <td><span class="tag">\${req.stream ? 'STREAM' : 'SYNC'}</span></td>
+              <td>\${effortTag}</td>
               <td>\${req.inputTokens.toLocaleString()}</td>
               <td>\${req.outputTokens.toLocaleString()}</td>
-              <td>\${req.credits.toFixed(5)}</td>
+              <td>\${costDisplay}</td>
             </tr>
           \`;
         });
