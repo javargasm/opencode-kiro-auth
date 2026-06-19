@@ -143,13 +143,13 @@ export function parseKiroEventMulti(parsed: Record<string, unknown>): KiroStream
     });
   }
 
-  if (parsed.usage !== undefined) {
-    const u = parsed.usage as Record<string, unknown>;
+  const usageBlock = (parsed.usage || parsed.Usage) as Record<string, unknown> | undefined;
+  if (usageBlock !== undefined) {
     events.push({
       type: "usage",
       data: {
-        inputTokens: u.inputTokens as number | undefined,
-        outputTokens: u.outputTokens as number | undefined,
+        inputTokens: (usageBlock.inputTokens ?? usageBlock.InputTokens) as number | undefined,
+        outputTokens: (usageBlock.outputTokens ?? usageBlock.OutputTokens) as number | undefined,
       },
     });
   }
@@ -202,6 +202,7 @@ const EVENT_PATTERNS = [
   '{"contextUsagePercentage":',
   '{"followupPrompt":',
   '{"usage":',
+  '{"Usage":',
   '{"toolUseId":',
   '{"unit":',
   '{"error":',
