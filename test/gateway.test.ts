@@ -272,4 +272,27 @@ describe("Local HTTP Gateway Server (Anthropic Protocol)", () => {
     // Partial matches
     expect(getModelPricing("claude-opus-4-6-temp")).toEqual({ input: 5.00, output: 25.00 });
   });
+
+  it("stripTitleMarkdown removes wrapping markdown from generated titles", async () => {
+    const { stripTitleMarkdown } = await import("../src/server");
+
+    // The reported bug: bold-wrapped title.
+    expect(stripTitleMarkdown("**Debugging CodeGraph Configuration**")).toBe(
+      "Debugging CodeGraph Configuration",
+    );
+    // Other wrappers.
+    expect(stripTitleMarkdown('"Quoted Title"')).toBe("Quoted Title");
+    expect(stripTitleMarkdown("`code title`")).toBe("code title");
+    expect(stripTitleMarkdown("_italic title_")).toBe("italic title");
+    expect(stripTitleMarkdown("# Heading Title")).toBe("Heading Title");
+    expect(stripTitleMarkdown("- Bullet Title")).toBe("Bullet Title");
+    // Nested wrapping (bold + quotes) is peeled fully.
+    expect(stripTitleMarkdown('**"Wrapped Twice"**')).toBe("Wrapped Twice");
+    // Whitespace trimmed.
+    expect(stripTitleMarkdown("  **Padded**  ")).toBe("Padded");
+    // Plain title is left untouched.
+    expect(stripTitleMarkdown("Already Clean Title")).toBe("Already Clean Title");
+    // Inline (non-wrapping) emphasis must NOT be stripped.
+    expect(stripTitleMarkdown("Fix **bold** in middle")).toBe("Fix **bold** in middle");
+  });
 });

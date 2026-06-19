@@ -146,6 +146,54 @@ function anthropicError(
   );
 }
 
+/**
+ * Detect OpenCode's title-generation turn. OpenCode prepends a user message
+ * that begins with "Generate a title for this conversation" (see opencode
+ * src/session/prompt.ts). Keying off this marker means we strip wrapping
+ * markdown ONLY for titles — never for normal chat, which legitimately uses
+ * **bold**, `code`, and quotes.
+ */
+function isTitleGenerationRequest(messages: any[]): boolean {
+  for (const m of messages) {
+    if (m?.role !== "user") continue;
+    const text =
+      typeof m.content === "string"
+        ? m.content
+        : Array.isArray(m.content)
+          ? m.content.map((b: any) => (typeof b === "string" ? b : b?.text || "")).join(" ")
+          : "";
+    if (/generate a title for this conversation/i.test(text)) return true;
+  }
+  return false;
+}
+
+/**
+ * Strip wrapping markdown/quotes from a generated title. Kiro models often
+ * return titles wrapped in bold (`**Title**`), quotes, backticks, or with a
+ * leading heading/list marker, despite OpenCode's title prompt asking for
+ * plain text. OpenCode's own cleanup only strips <think> tags and takes the
+ * first non-empty line, so the wrapping survives into the session title.
+ *
+ * Applied ONLY to title-generation turns (see isTitleGenerationRequest), so
+ * normal assistant responses keep their markdown intact.
+ */
+export function stripTitleMarkdown(text: string): string {
+  let t = text.trim();
+  let prev: string;
+  do {
+    prev = t;
+    t = t.replace(/^\*\*([\s\S]+?)\*\*$/, "$1").trim(); // **bold**
+    t = t.replace(/^\*([\s\S]+?)\*$/, "$1").trim(); // *italic*
+    t = t.replace(/^__([\s\S]+?)__$/, "$1").trim(); // __bold__
+    t = t.replace(/^_([\s\S]+?)_$/, "$1").trim(); // _italic_
+    t = t.replace(/^`([\s\S]+?)`$/, "$1").trim(); // `code`
+    t = t.replace(/^["'“”]([\s\S]+?)["'“”]$/, "$1").trim(); // "quoted"
+    t = t.replace(/^#{1,6}\s+/, "").trim(); // # heading
+    t = t.replace(/^[-*]\s+/, "").trim(); // - bullet
+  } while (t !== prev && t.length > 0);
+  return t;
+}
+
 export function startGatewayServer(port: number = 0): Promise<Server<any>> {
   return new Promise((resolve) => {
     const server = Bun.serve({
@@ -300,6 +348,10 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
               ?? body.reasoning_effort
               ?? undefined;
 
+            // Title-generation turns need wrapping markdown stripped from the
+            // model's output (Kiro models return "**Title**" despite the prompt).
+            const isTitleTurn = isTitleGenerationRequest(anthropicMessages);
+
             log.info(`[gateway] → ${kiroEndpoint} model=${anthropicModelId} region=${apiRegion} stream=${streamRequested}`);
 
             // Seed profileArn from the credential store (already imported at init)
@@ -378,6 +430,10 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
 
                     let contentBlockIndex = 0;
                     let activeBlockType: "thinking" | "text" | "tool_use" | null = null;
+                    // For title turns we buffer text deltas and emit the
+                    // markdown-stripped title once at the end, since wrapping
+                    // like **Title** can't be detected from a single delta.
+                    let titleTextBuffer = "";
 
                     const closeActiveBlock = () => {
                       if (activeBlockType !== null) {
@@ -427,6 +483,13 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
                         );
                       } else if (event.type === "text_delta") {
                         ensureBlockStarted("text");
+                        if (isTitleTurn) {
+                          // Buffer instead of streaming: we can only strip
+                          // wrapping markdown (**Title**) once we have the
+                          // whole title. Flushed in finalizeTitleBlock().
+                          titleTextBuffer += event.delta;
+                          return;
+                        }
                         controller.enqueue(
                           "event: content_block_delta\ndata: " +
                           JSON.stringify({
@@ -481,6 +544,21 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
                     // Continue with remaining events
                     for await (const event of { [Symbol.asyncIterator]: () => iter }) {
                       processEvent(event);
+                    }
+
+                    // Flush the buffered title (markdown-stripped) as a single
+                    // text delta before closing the block. Only set on title
+                    // turns; normal chat streamed its deltas live above.
+                    if (isTitleTurn && titleTextBuffer.length > 0) {
+                      const cleanTitle = stripTitleMarkdown(titleTextBuffer);
+                      controller.enqueue(
+                        "event: content_block_delta\ndata: " +
+                        JSON.stringify({
+                          type: "content_block_delta",
+                          index: contentBlockIndex - 1,
+                          delta: { type: "text_delta", text: cleanTitle }
+                        }) + "\n\n"
+                      );
                     }
 
                     closeActiveBlock();
@@ -565,7 +643,9 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
                 if (part.type === "text") {
                   anthropicContent.push({
                     type: "text",
-                    text: part.text,
+                    // Title turns: strip wrapping markdown (**Title**) the
+                    // model adds despite the plain-text prompt.
+                    text: isTitleTurn ? stripTitleMarkdown(part.text) : part.text,
                   });
                 } else if (part.type === "thinking") {
                   anthropicContent.push({
