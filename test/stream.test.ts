@@ -618,6 +618,65 @@ describe("streamKiro", () => {
       const { errors } = validateBedrockInvariants(body);
       expect(errors).toEqual([]);
     });
+
+    it("e2e: tools-less request with tool blocks in history injects a placeholder toolConfig (no TOOL_CONFIG_MISSING)", async () => {
+      // Reproduces the TOOL_CONFIG_MISSING 400 loop: opencode sends an
+      // auxiliary turn (title gen / summarization / compaction) with NO tools,
+      // but the replayed history still carries toolUse/toolResult blocks from
+      // earlier turns. Bedrock rejects that unless a toolConfig is present.
+      const fetchMock = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":5}');
+      vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
+
+      const context: Context = {
+        systemPrompt: "Summarize this conversation",
+        messages: [
+          user("do a thing"),
+          {
+            role: "assistant",
+            content: [
+              { type: "toolCall", id: "tooluse_AAAA", name: "bash", arguments: { cmd: "ls" } },
+            ],
+            api: "kiro-api",
+            provider: "kiro",
+            model: "test",
+            usage: zeroUsage,
+            stopReason: "toolUse",
+            timestamp: ts,
+          },
+          toolResult("tooluse_AAAA", "file1.ts"),
+          user("now summarize"),
+        ],
+        // No tools on this turn — the trigger for the bug.
+        tools: [],
+      };
+
+      await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+      const body = JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string);
+      const tools =
+        body.conversationState.currentMessage.userInputMessage.userInputMessageContext?.tools;
+      expect(Array.isArray(tools)).toBe(true);
+      expect(tools.length).toBeGreaterThan(0);
+      expect(tools[0].toolSpecification.name).toBe("noop");
+    });
+
+    it("e2e: tools-less request with NO tool blocks in history sends no toolConfig", async () => {
+      const fetchMock = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":5}');
+      vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
+
+      const context: Context = {
+        systemPrompt: "You are helpful",
+        messages: [user("just chatting, no tools ever")],
+        tools: [],
+      };
+
+      await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+      const body = JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string);
+      const tools =
+        body.conversationState.currentMessage.userInputMessage.userInputMessageContext?.tools;
+      expect(tools).toBeUndefined();
+    });
   });
 });
 

@@ -59,6 +59,36 @@ export interface KiroEnvState {
   currentWorkingDirectory: string;
 }
 
+/**
+ * Minimal placeholder tool injected when the conversation history contains
+ * toolUse/toolResult blocks but the current request supplies no tools.
+ * Bedrock returns TOOL_CONFIG_MISSING if toolUse/toolResult blocks appear
+ * without a toolConfig; this placeholder makes toolConfig non-empty without
+ * inviting the model to call anything meaningful on auxiliary turns (title
+ * generation, summarization, compaction) that legitimately omit tools.
+ */
+export const KIRO_PLACEHOLDER_TOOL: KiroToolSpec = {
+  toolSpecification: {
+    name: "noop",
+    description:
+      "Placeholder tool. Do not call it. Present only to satisfy the toolConfig requirement when replayed history contains tool blocks.",
+    inputSchema: { json: { type: "object", properties: {} } },
+  },
+};
+
+/**
+ * True when any history entry carries assistant toolUses or user toolResults.
+ * Used to decide whether a tools-less request still needs a toolConfig to
+ * avoid Bedrock's TOOL_CONFIG_MISSING validation error.
+ */
+export function historyHasToolBlocks(history: KiroHistoryEntry[]): boolean {
+  for (const entry of history) {
+    if (entry.assistantResponseMessage?.toolUses?.length) return true;
+    if (entry.userInputMessage?.userInputMessageContext?.toolResults?.length) return true;
+  }
+  return false;
+}
+
 export interface KiroUserInputMessage {
   content: string;
   modelId?: string;
