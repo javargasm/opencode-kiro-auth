@@ -132,6 +132,13 @@ export interface SimpleStreamOptions {
   signal?: AbortSignal;
   apiKey?: string;
   sessionId?: string;
+  /**
+   * Stable identifier used to group all file-log entries (requests,
+   * responses, errors) for one session into a single
+   * `/tmp/kiro-logs/session-{id}.log` file. Does NOT affect the Kiro API
+   * request. Falls back to `sessionId` when omitted.
+   */
+  logSessionId?: string;
   reasoning?: ThinkingLevel;
   headers?: Record<string, string>;
 }
@@ -160,21 +167,29 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
   private done = false;
   private finalResultPromise: Promise<R>;
   private resolveFinalResult!: (result: R) => void;
+  private rejectFinalResult!: (reason?: unknown) => void;
+  private resultSettled = false;
   private isComplete: (event: T) => boolean;
   private extractResult: (event: T) => R;
 
   constructor(isComplete: (event: T) => boolean, extractResult: (event: T) => R) {
     this.isComplete = isComplete;
     this.extractResult = extractResult;
-    this.finalResultPromise = new Promise<R>((resolve) => {
+    this.finalResultPromise = new Promise<R>((resolve, reject) => {
       this.resolveFinalResult = resolve;
+      this.rejectFinalResult = reject;
     });
+    // end() may settle this promise (rejecting) before any caller awaits it.
+    // Attach a no-op catch so an unobserved rejection never escalates to an
+    // unhandledRejection; real awaiters of result() still observe it.
+    this.finalResultPromise.catch(() => {});
   }
 
   push(event: T): void {
     if (this.done) return;
     if (this.isComplete(event)) {
       this.done = true;
+      this.resultSettled = true;
       this.resolveFinalResult(this.extractResult(event));
     }
     const waiter = this.waiting.shift();
@@ -188,7 +203,14 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
   end(result?: R): void {
     this.done = true;
     if (result !== undefined) {
+      this.resultSettled = true;
       this.resolveFinalResult(result);
+    } else if (!this.resultSettled) {
+      // Stream ended without ever producing a terminal (done/error) event.
+      // Reject so callers awaiting result() fail fast instead of hanging
+      // forever (e.g. the gateway's `await kiroStream.result()`).
+      this.resultSettled = true;
+      this.rejectFinalResult(new Error("Stream ended before producing a final result"));
     }
     while (this.waiting.length > 0) {
       const waiter = this.waiting.shift();

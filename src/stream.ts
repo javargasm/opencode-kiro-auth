@@ -19,11 +19,12 @@ import { log, previewChunk } from "./debug";
 import { parseKiroEvents } from "./event-parser";
 import { isPermanentError } from "./health";
 import type { KiroModel } from "./models";
+import { createHash } from "node:crypto";
 import { kiroModels, resolveKiroModel, getCachedDynamicModels, resolveProfileArn, resetProfileArnCache, seedProfileArn } from "./models";
 import { ThinkingTagParser } from "./thinking-parser";
 import { countTokens } from "./tokenizer";
 import { abortableDelay } from "./oauth";
-import { logRequest, logResponseEvent, logResponseDone, logHttpError, logStreamError, logCaughtError } from "./file-logger";
+import { createSessionLogger, ensureLogDir, LOG_DIR } from "./file-logger";
 
 import {
   buildHistory,
@@ -94,9 +95,44 @@ function isTransientError(status: number): boolean {
   return status === 429 || status >= 500;
 }
 
-function firstTokenTimeoutForModel(modelId: string): number {
-  const m = kiroModels.find((x) => x.id === modelId) as KiroModel | undefined;
+export function firstTokenTimeoutForModel(modelId: string): number {
+  const m =
+    (kiroModels.find((x) => x.id === modelId) as KiroModel | undefined) ??
+    getCachedDynamicModels()?.find((x) => x.id === modelId);
   return m?.firstTokenTimeout ?? FIRST_TOKEN_TIMEOUT_DEFAULT_MS;
+}
+
+/**
+ * Extract the Kiro API region from a runtime/management base URL such as
+ * `https://runtime.us-east-1.kiro.dev`. resolveProfileArn() expects a region
+ * (e.g. "us-east-1"), NOT a full URL — passing the URL would build a malformed
+ * `https://management.https://…kiro.dev/` endpoint. Falls back to us-east-1.
+ */
+export function regionFromEndpoint(endpoint: string): string {
+  const m = endpoint.match(/(?:runtime|management)\.([a-z0-9-]+)\.kiro\.dev/i);
+  return m?.[1] ?? "us-east-1";
+}
+
+/**
+ * Map Kiro's authoritative metadataEvent stopReason (real wire values:
+ * TOOL_USE / END_TURN / MAX_TOKENS, occasionally STOP_SEQUENCE) onto the
+ * internal stop reason. Returns null for unknown/absent values so the caller
+ * can fall back to heuristics.
+ */
+export function mapKiroStopReason(raw: string | null | undefined): "stop" | "length" | "toolUse" | null {
+  switch (raw?.toUpperCase()) {
+    case "TOOL_USE":
+      return "toolUse";
+    case "MAX_TOKENS":
+      return "length";
+    case "END_TURN":
+    case "STOP_SEQUENCE":
+    case "COMPLETE":
+    case "FINISHED":
+      return "stop";
+    default:
+      return null;
+  }
 }
 
 /**
@@ -214,6 +250,44 @@ function emitToolCall(
   return true;
 }
 
+// ---- conversationId stability -----------------------------------------
+
+/**
+ * The real Kiro CLI keeps ONE `conversationId` for an entire session — every
+ * turn of a conversation reuses the same id, and it stays the same even after
+ * the CLI is restarted and the session is resumed.
+ *
+ * We reproduce both properties by deriving the conversationId DETERMINISTICALLY
+ * from the gateway's stable per-conversation session key (see
+ * `deriveLogSessionId` — first-message fingerprint / session header / user id,
+ * all of which survive a restart because OpenCode re-sends the full history).
+ * A random UUID + in-memory cache would reset every time the gateway process
+ * restarts (e.g. closing OpenCode and reopening with `opencode -s <id>`),
+ * minting a brand-new conversationId mid-conversation — the bug this fixes.
+ *
+ * The value is a v5-style (name-based) UUID: pure function of the key, so the
+ * same conversation always maps to the same id across process restarts, with
+ * no shared mutable state. Requests with no session key fall back to a random
+ * one-off UUID.
+ */
+const CONVERSATION_ID_NAMESPACE = "opencode-kiro/conversation";
+
+function deterministicConversationId(key: string): string {
+  // SHA-1 over namespace + key, first 16 bytes, with RFC-4122 version (5) and
+  // variant bits set — a valid, stable name-based UUID.
+  const digest = createHash("sha1").update(`${CONVERSATION_ID_NAMESPACE}\u0000${key}`).digest();
+  const b = Buffer.from(digest.subarray(0, 16));
+  b[6] = (b[6]! & 0x0f) | 0x50; // version 5
+  b[8] = (b[8]! & 0x3f) | 0x80; // RFC-4122 variant
+  const hex = b.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
+
+export function resolveConversationId(sessionId: string | undefined): string {
+  if (!sessionId) return crypto.randomUUID();
+  return deterministicConversationId(sessionId);
+}
+
 // ---- Main entry --------------------------------------------------------
 
 export function streamKiro(
@@ -222,6 +296,9 @@ export function streamKiro(
   options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
   const stream = new AssistantMessageEventStream();
+  // One log file per session — groups every turn (request/response/error)
+  // regardless of which client (OpenCode, Claude Code, …) drove it.
+  const fileLog = createSessionLogger(options?.logSessionId ?? options?.sessionId);
   (async () => {
     const output: AssistantMessage = {
       role: "assistant",
@@ -257,7 +334,7 @@ export function streamKiro(
       }
 
       const endpoint = model.baseUrl || "https://runtime.us-east-1.kiro.dev";
-      const profileArn = await resolveProfileArn(accessToken, endpoint);
+      const profileArn = await resolveProfileArn(accessToken, regionFromEndpoint(endpoint));
       const kiroModelId = resolveKiroModel(model.id);
       const thinkingEnabled = !!options?.reasoning || model.reasoning;
       // Kiro models where upstream hides reasoning entirely (no `<thinking>`
@@ -307,7 +384,11 @@ export function streamKiro(
         currentWorkingDirectory: process.cwd(),
       };
 
-      const conversationId = options?.sessionId ?? crypto.randomUUID();
+      // Stable per-session conversationId (matches Kiro CLI: one id for the
+      // whole session). Falls back to a fresh UUID only when no sessionId is
+      // available. Computed ONCE here so retries of this turn — and every
+      // later turn of the same conversation — reuse the same id.
+      const conversationId = resolveConversationId(options?.sessionId);
       let retryCount = 0;
 
       while (retryCount <= MAX_RETRIES) {
@@ -533,6 +614,22 @@ export function streamKiro(
           }
         }
 
+        // Forward max_tokens, but ONLY for models that advertise a thinking
+        // config schema — those are the same models whose
+        // additionalModelRequestFieldsSchema includes a `max_tokens` field, so
+        // they accept the object. Sending it to models without that schema
+        // risks an "Improperly formed request". Clamp to the schema bounds
+        // (min 1024) and the model's own output window.
+        if (supportsThinkingConfig && typeof options?.maxTokens === "number" && options.maxTokens > 0) {
+          const capped = Math.min(
+            Math.max(Math.floor(options.maxTokens), 1024),
+            model.maxTokens || 64_000,
+          );
+          request.additionalModelRequestFields = request.additionalModelRequestFields || {};
+          request.additionalModelRequestFields.max_tokens = capped;
+          log.debug("maxTokens.set", { maxTokens: capped, model: model.id });
+        }
+
         // NOTE: Do NOT set additionalModelRequestFields.thinking here.
         // The real Kiro CLI never sends a thinking config — reasoning is
         // enabled by default when output_config.effort is present.
@@ -564,7 +661,7 @@ export function streamKiro(
         let contextTruncationAttempt = 0;
         while (true) {
           const osName = resolveOS();
-          const ua = `aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.16551 os/${osName} lang/rust/1.92.0 md/appVersion-2.7.1 app/AmazonQ-For-CLI`;
+          const ua = `aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.16551 os/${osName} lang/rust/1.92.0 md/appVersion-2.8.1 app/AmazonQ-For-CLI`;
           const xAmzUa = `aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.16551 os/${osName} lang/rust/1.92.0 m/F app/AmazonQ-For-CLI`;
           const requestBody = JSON.stringify(request);
 
@@ -579,14 +676,19 @@ export function streamKiro(
             requestJsonChars: requestBody.length,
           });
 
-          // Dump request body for debugging (debug level, file always written)
+          // Dump request body for debugging (debug level, file always written).
+          // Per-session filename so it carries the session id like the .log file
+          // and never clobbers another session's dump.
           log.debug(`[stream] req=${requestBody.length}c hist=${history.length} content=${currentContent.length}c profileArn=${!!profileArn}`);
           if (log.isDebug()) {
-            try { require("fs").writeFileSync("/tmp/kiro-last-request.json", requestBody); } catch {}
+            try {
+              ensureLogDir();
+              require("fs").writeFileSync(`${LOG_DIR}/session-${fileLog.sessionId}.last-request.json`, requestBody);
+            } catch {}
           }
 
           // File-based request logging (KIRO_FILE_LOG=1)
-          logRequest({
+          fileLog.logRequest({
             endpoint,
             model: model.id,
             historyLength: history.length,
@@ -629,7 +731,7 @@ export function streamKiro(
           });
 
           // File-based error logging (KIRO_FILE_LOG=1)
-          logHttpError({
+          fileLog.logHttpError({
             status: response.status,
             statusText: response.statusText,
             body: errText,
@@ -727,10 +829,10 @@ export function streamKiro(
         const decoder = new TextDecoder();
         let buffer = "";
         let totalContent = "";
-        let lastContentData = "";
         let usageEvent: { inputTokens?: number; outputTokens?: number } | null = null;
         let meteringCredits: number | undefined;
         let receivedContextUsage = false;
+        let serverStopReason: string | null = null;
         let chunkSeq = 0;
         let eventSeq = 0;
 
@@ -845,7 +947,7 @@ export function streamKiro(
 
           // File-based response event logging (KIRO_FILE_LOG=1)
           for (const ev of events) {
-            logResponseEvent({ type: ev.type, data: ev.data, eventSeq });
+            fileLog.logResponseEvent({ type: ev.type, data: ev.data, eventSeq });
           }
 
           for (const event of events) {
@@ -866,7 +968,14 @@ export function streamKiro(
                 // Native reasoning event from Kiro (Opus 4.7+).
                 // Accumulate chunks into a single Pi thinking block.
                 cancelHiddenShim();
-                if (output.content.length === 0 || output.content[output.content.length - 1]?.type !== "thinking") {
+                const lastIsThinking =
+                  output.content.length > 0 &&
+                  output.content[output.content.length - 1]?.type === "thinking";
+                // A signature-only frame (no reasoning text) with no open
+                // thinking block has nothing to attach to — skip it instead of
+                // emitting a stray empty thinking block.
+                if (!event.data.text && !lastIsThinking) break;
+                if (!lastIsThinking) {
                   output.content.push({ type: "thinking", thinking: "" });
                   stream.push({ type: "thinking_start", contentIndex: output.content.length - 1, partial: output });
                 }
@@ -880,13 +989,16 @@ export function streamKiro(
                 if (event.data.signature) {
                   tc.thinkingSignature = event.data.signature;
                   // Signature indicates the end of the reasoning block.
-                  // Pi engine automatically handles the final state, but we could emit thinking_end here if needed.
+                  // Pi engine automatically handles the final state.
                 }
                 break;
               }
               case "content": {
-                if (event.data === lastContentData) continue;
-                lastContentData = event.data;
+                // NOTE: do NOT dedup identical consecutive content frames.
+                // The event parser consumes the buffer without re-emitting, so
+                // identical back-to-back chunks ("\n\n", repeated indentation,
+                // repeated tokens in generated code) are legitimate model
+                // output and must be preserved, not silently dropped.
                 totalContent += event.data;
                 // Cancel the deferred shim — real content arrived in
                 // time, no breadcrumb needed.
@@ -944,11 +1056,16 @@ export function streamKiro(
                 meteringCredits = event.data.usage;
                 break;
               }
+              case "metadata": {
+                // Authoritative stop reason from Kiro's metadataEvent.
+                if (event.data.stopReason) serverStopReason = event.data.stopReason;
+                break;
+              }
               case "error": {
                 streamError = event.data.message
                   ? `${event.data.error}: ${event.data.message}`
                   : event.data.error;
-                logStreamError({
+                fileLog.logStreamError({
                   error: streamError,
                   context: "stream_event",
                   model: model.id,
@@ -965,11 +1082,16 @@ export function streamKiro(
         if (idleTimer) clearTimeout(idleTimer);
 
         if (firstTokenTimedOut || idleCancelled || streamError) {
-          if (retryCount < MAX_RETRIES) {
+          // Once any output reached the consumer, a reset-and-retry would
+          // DUPLICATE it: SSE deltas already sent can't be retracted. Only a
+          // first-token timeout is guaranteed to have produced nothing, so it's
+          // the only case where reset+retry is always safe.
+          const alreadyStreamed = totalContent.length > 0 || emittedToolCalls > 0;
+          if (!alreadyStreamed && retryCount < MAX_RETRIES) {
             retryCount++;
             const delayMs = exponentialBackoff(retryCount - 1, 1000, MAX_RETRY_DELAY_MS);
             const streamErrDesc = firstTokenTimedOut ? "first-token timed out" : idleCancelled ? "idle timed out" : `error: ${streamError}`;
-            logStreamError({
+            fileLog.logStreamError({
               error: streamErrDesc,
               context: "retry",
               model: model.id,
@@ -985,17 +1107,30 @@ export function streamKiro(
             // fresh timer on the next `start`.
             cancelHiddenShim();
             await abortableDelay(delayMs, options?.signal);
-            // Reset output content. Consumer-side `partial.content[contentIndex]`
-            // (see pi-agent-core proxy.js) uses indexed assignment, so when the
-            // retry re-emits `text_start` at contentIndex 0 it overwrites the
-            // stale block — consumer state stays in sync with ours.
+            // Safe to reset — nothing was emitted to the consumer yet.
             output.content = [];
             textBlockIndex = null;
             continue;
           }
-          if (streamError) throw new Error(`Kiro API stream error after max retries: ${streamError}`);
-          throw new Error(
-            `Kiro API error: ${firstTokenTimedOut ? "first token" : "idle"} timeout after max retries`,
+          // Either we already streamed partial output (can't retract) or we're
+          // out of retries.
+          if (streamError) {
+            // Surface the error. With partial content already streamed, the
+            // consumer sees the partial output followed by the error — better
+            // than silently truncating or duplicating.
+            throw new Error(
+              `Kiro API stream error${alreadyStreamed ? " after partial output" : " after max retries"}: ${streamError}`,
+            );
+          }
+          if (!alreadyStreamed) {
+            throw new Error(
+              `Kiro API error: ${firstTokenTimedOut ? "first token" : "idle"} timeout after max retries`,
+            );
+          }
+          // Timeout AFTER partial output: finalize gracefully with what we have
+          // instead of duplicating via a reset+retry. Fall through to finalize.
+          log.info(
+            `stream ${firstTokenTimedOut ? "first-token" : "idle"} timeout after partial output — finalizing with partial content`,
           );
         }
 
@@ -1061,11 +1196,20 @@ export function streamKiro(
           cancelHiddenShim();
         }
 
-        // Stop reason classification per doc/conformance.md §35–37:
-        // toolUse when tools were called; length when no contextUsage event
-        // was received AND no tool calls (treated as truncation signal); stop
-        // otherwise.
-        if (!receivedContextUsage && emittedToolCalls === 0) {
+        // Stop reason classification.
+        // Prefer Kiro's authoritative metadataEvent — the real wire format
+        // sends {"stopReason":"TOOL_USE"|"END_TURN"|"MAX_TOKENS"} as its own
+        // event-stream frame (confirmed from a captured CLI response) — and
+        // only fall back to heuristics when the server didn't send one.
+        // Heuristic fallback (audit #10): toolUse when tools were called;
+        // "length" when no contextUsage event arrived AND no tool calls
+        // (treated as a truncation signal); "stop" otherwise. The Anthropic
+        // gateway recomputes finishReason from message content anyway, so the
+        // heuristic "length" never reaches end users.
+        const mappedServerStop = mapKiroStopReason(serverStopReason);
+        if (mappedServerStop) {
+          output.stopReason = mappedServerStop;
+        } else if (!receivedContextUsage && emittedToolCalls === 0) {
           output.stopReason = "length";
         } else {
           output.stopReason = emittedToolCalls > 0 ? "toolUse" : "stop";
@@ -1084,7 +1228,7 @@ export function streamKiro(
         });
 
         // File-based response done logging (KIRO_FILE_LOG=1)
-        logResponseDone({
+        fileLog.logResponseDone({
           stopReason: output.stopReason,
           emittedToolCalls,
           usage: output.usage,
@@ -1101,11 +1245,11 @@ export function streamKiro(
       log.debug("response.caught", { stopReason: output.stopReason, error: output.errorMessage });
 
       // File-based caught error logging (KIRO_FILE_LOG=1)
-      logCaughtError({
+      fileLog.logCaughtError({
         stopReason: output.stopReason,
         errorMessage: output.errorMessage,
         model: model.id,
-      });
+      }, error);
       // Cancel the pending shim timer so no stray shim fires after
       // the error event. Nothing to close — the shim is self-
       // contained when it fires, and if the timer is still armed

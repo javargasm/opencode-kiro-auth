@@ -1,6 +1,10 @@
-// Route ALL logs to a file — keeps OpenCode status bar clean
+// Route ALL logs to a file — keeps OpenCode status bar clean.
+// Every Kiro file log lives under /tmp/kiro-logs/ and carries a session id in
+// its name. Per-request logs route to session-{id}.log (via AsyncLocalStorage,
+// see file-logger.ts); logs with no request context (startup, auth refresh)
+// fall back here, to the "gateway" pseudo-session.
 process.env.KIRO_LOG = process.env.KIRO_LOG || "debug";
-process.env.KIRO_LOG_FILE = process.env.KIRO_LOG_FILE || "/tmp/opencode-kiro.log";
+process.env.KIRO_LOG_FILE = process.env.KIRO_LOG_FILE || "/tmp/kiro-logs/session-gateway.log";
 
 import type { Plugin, Hooks, PluginModule } from "@opencode-ai/plugin";
 import { startGatewayServer, initGatewayAuth, getAuthRegion } from "./server";

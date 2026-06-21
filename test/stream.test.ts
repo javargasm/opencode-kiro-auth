@@ -7,10 +7,13 @@ import type {
   ToolResultMessage,
 } from "../src/types";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { streamKiro } from "../src/stream";
+import { streamKiro, firstTokenTimeoutForModel, regionFromEndpoint, resolveConversationId } from "../src/stream";
 import { convertToolsToKiro } from "../src/transform";
 import type { Tool } from "../src/types";
-import { resetProfileArnCache, seedProfileArn } from "../src/models";
+import { AssistantMessageEventStream } from "../src/types";
+import { resetProfileArnCache, seedProfileArn, setCachedDynamicModels } from "../src/models";
+import type { KiroModel } from "../src/models";
+import { ThinkingTagParser } from "../src/thinking-parser";
 
 function makeModel(overrides?: Partial<Model<Api>>): Model<Api> {
   return {
@@ -127,7 +130,7 @@ describe("streamKiro", () => {
 
     // user-agent and x-amz-user-agent must differ (m/F vs md/appVersion)
     expect(opts.headers["user-agent"]).toContain("aws-sdk-rust/1.3.15");
-    expect(opts.headers["user-agent"]).toContain("md/appVersion-2.7.1");
+    expect(opts.headers["user-agent"]).toContain("md/appVersion-2.8.1");
     expect(opts.headers["x-amz-user-agent"]).toContain("aws-sdk-rust/1.3.15");
     expect(opts.headers["x-amz-user-agent"]).toContain("m/F");
     expect(opts.headers["x-amz-user-agent"]).not.toContain("md/appVersion");
@@ -809,5 +812,408 @@ describe("convertToolsToKiro schema sanitization", () => {
     expect(json.properties.count).not.toHaveProperty("exclusiveMinimum");
     expect(json.properties.count.type).toBe("number");
     expect(json.properties.count.description).toBe("a count");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Regression tests for audited bugs (#1, #2, #4, #5, #9, #11, #12, #16)
+// ─────────────────────────────────────────────────────────────────────────
+
+describe("regionFromEndpoint (#1)", () => {
+  it("extracts the region from runtime/management URLs", () => {
+    expect(regionFromEndpoint("https://runtime.us-east-1.kiro.dev")).toBe("us-east-1");
+    expect(regionFromEndpoint("https://runtime.eu-central-1.kiro.dev")).toBe("eu-central-1");
+    expect(regionFromEndpoint("https://management.us-east-1.kiro.dev/")).toBe("us-east-1");
+  });
+  it("falls back to us-east-1 for unrecognized URLs", () => {
+    expect(regionFromEndpoint("https://q.amazonaws.com/x")).toBe("us-east-1");
+    expect(regionFromEndpoint("")).toBe("us-east-1");
+  });
+});
+
+describe("firstTokenTimeoutForModel (#9 — consults dynamic models)", () => {
+  afterEach(() => setCachedDynamicModels(null));
+
+  it("falls back to the default for unknown models", () => {
+    expect(firstTokenTimeoutForModel("totally-unknown")).toBe(90_000);
+  });
+
+  it("uses a static model's firstTokenTimeout", () => {
+    expect(firstTokenTimeoutForModel("claude-opus-4-8")).toBe(180_000);
+  });
+
+  it("uses a dynamic-only model's firstTokenTimeout", () => {
+    setCachedDynamicModels([
+      {
+        id: "dyn-opus",
+        name: "Dyn",
+        api: "kiro-api",
+        provider: "kiro",
+        baseUrl: "x",
+        reasoning: true,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 1,
+        maxTokens: 1,
+        firstTokenTimeout: 180_000,
+      } as KiroModel,
+    ]);
+    expect(firstTokenTimeoutForModel("dyn-opus")).toBe(180_000);
+  });
+});
+
+function mockFetchReader(body: string) {
+  return {
+    ok: true,
+    body: {
+      getReader: () => ({
+        read: vi
+          .fn()
+          .mockResolvedValueOnce({ done: false, value: new TextEncoder().encode(body) })
+          .mockResolvedValueOnce({ done: true, value: undefined }),
+        cancel: vi.fn().mockResolvedValue(undefined),
+      }),
+    },
+  };
+}
+
+describe("streamKiro bug fixes", () => {
+  beforeEach(() => {
+    resetProfileArnCache(true);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    setCachedDynamicModels(null);
+    resetProfileArnCache(true);
+  });
+
+  it("#1: resolveProfileArn is called with the region, not the base URL", async () => {
+    resetProfileArnCache(false); // allow dynamic ARN resolution
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            profiles: [
+              { arn: "arn:aws:codewhisperer:us-east-1:1:profile/X", profileType: "KIRO", status: "ACTIVE" },
+            ],
+          }),
+      })
+      .mockResolvedValueOnce(mockFetchReader('{"content":"Hi"}{"contextUsagePercentage":5}'));
+    vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
+
+    await collect(
+      streamKiro(makeModel({ baseUrl: "https://runtime.us-east-1.kiro.dev" }), makeContext(), { apiKey: "tok" }),
+    );
+
+    const profileUrl = fetchMock.mock.calls[0]?.[0] as string;
+    expect(profileUrl).toBe("https://management.us-east-1.kiro.dev/");
+    expect(profileUrl).not.toContain("management.https://");
+  });
+
+  it("#5: preserves identical consecutive content chunks (no blind dedup)", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      mockFetchOk('{"content":"a"}{"content":"a"}{"content":"b"}{"contextUsagePercentage":5}'),
+    );
+    const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+    const done = events.find((e) => e.type === "done");
+    expect(done?.type).toBe("done");
+    if (done?.type === "done") {
+      const text = done.message.content.find((b) => b.type === "text");
+      expect(text?.type).toBe("text");
+      if (text?.type === "text") expect(text.text).toBe("aab"); // both "a" survive
+    }
+  });
+
+  it("#4/#2: a stream error after partial content does NOT retry and surfaces the error", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(mockFetchReader('{"content":"Hello"}{"error":"ThrottlingException","message":"rate"}'));
+    vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
+
+    const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+
+    // No reset-and-retry once content was streamed → exactly one HTTP call.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const err = events.find((e) => e.type === "error");
+    expect(err?.type).toBe("error");
+    if (err?.type === "error") {
+      expect(err.error.errorMessage).toMatch(/after partial output/);
+      // Partial content is preserved, not discarded.
+      expect(err.error.content.some((b) => b.type === "text")).toBe(true);
+    }
+  });
+
+  it("#16: a signature-only reasoning frame creates no empty thinking block", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      mockFetchOk('{"signature":"sig-only"}{"content":"Hi"}{"contextUsagePercentage":5}'),
+    );
+    const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+    expect(events.filter((e) => e.type === "thinking_start")).toHaveLength(0);
+    const done = events.find((e) => e.type === "done");
+    if (done?.type === "done") {
+      expect(done.message.content.every((b) => b.type !== "thinking")).toBe(true);
+      const text = done.message.content.find((b) => b.type === "text");
+      if (text?.type === "text") expect(text.text).toBe("Hi");
+    }
+  });
+
+  it("#11: forwards clamped max_tokens for thinking-config models", async () => {
+    const fetchMock = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":5}');
+    vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
+    await collect(
+      streamKiro(makeModel({ id: "claude-opus-4-8", maxTokens: 128000 }), makeContext(), {
+        apiKey: "tok",
+        maxTokens: 50000,
+      }),
+    );
+    const body = JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string);
+    expect(body.additionalModelRequestFields?.max_tokens).toBe(50000);
+  });
+
+  it("#11: clamps max_tokens to the model output window", async () => {
+    const fetchMock = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":5}');
+    vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
+    await collect(
+      streamKiro(makeModel({ id: "claude-opus-4-8", maxTokens: 64000 }), makeContext(), {
+        apiKey: "tok",
+        maxTokens: 999999,
+      }),
+    );
+    const body = JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string);
+    expect(body.additionalModelRequestFields?.max_tokens).toBe(64000);
+  });
+
+  it("#11: omits max_tokens for models without thinking config", async () => {
+    const fetchMock = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":5}');
+    vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
+    await collect(
+      streamKiro(makeModel({ id: "claude-sonnet-4-5" }), makeContext(), { apiKey: "tok", maxTokens: 50000 }),
+    );
+    const body = JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string);
+    expect(body.additionalModelRequestFields?.max_tokens).toBeUndefined();
+  });
+});
+
+describe("ThinkingTagParser ordering (#12 — no index-corrupting splice)", () => {
+  function setup() {
+    const output = {
+      role: "assistant" as const,
+      content: [] as any[],
+      api: "kiro-api",
+      provider: "kiro",
+      model: "m",
+      usage: zeroUsage,
+      stopReason: "stop" as const,
+      timestamp: 0,
+    };
+    const stream = new AssistantMessageEventStream();
+    const pushed: any[] = [];
+    vi.spyOn(stream, "push").mockImplementation((e: any) => {
+      pushed.push(e);
+    });
+    return { output, pushed, parser: new ThinkingTagParser(output as any, stream) };
+  }
+
+  afterEach(() => vi.restoreAllMocks());
+
+  it("text-before-thinking does not splice/renumber the already-emitted text block", () => {
+    const { output, pushed, parser } = setup();
+    parser.processChunk("Hello ");
+    const textStart = pushed.find((e) => e.type === "text_start");
+    expect(textStart?.contentIndex).toBe(0);
+
+    parser.processChunk("<thinking>reasoning</thinking>");
+    parser.finalize();
+
+    // Thinking is APPENDED at index 1; the text block stays at index 0.
+    const thinkingStart = pushed.find((e) => e.type === "thinking_start");
+    expect(thinkingStart?.contentIndex).toBe(1);
+    expect(output.content[0]?.type).toBe("text");
+    expect(output.content[1]?.type).toBe("thinking");
+    // Every emitted text_delta still references index 0 (no splice corruption).
+    const textDeltas = pushed.filter((e) => e.type === "text_delta");
+    expect(textDeltas.length).toBeGreaterThan(0);
+    expect(textDeltas.every((e) => e.contentIndex === 0)).toBe(true);
+  });
+
+  it("normal case (thinking before text) keeps thinking → text order", () => {
+    const { output, parser } = setup();
+    parser.processChunk("<thinking>plan</thinking>answer");
+    parser.finalize();
+    expect(output.content[0]?.type).toBe("thinking");
+    expect(output.content[1]?.type).toBe("text");
+  });
+});
+
+describe("metadataEvent stopReason (real wire format, authoritative)", () => {
+  beforeEach(() => resetProfileArnCache(true));
+  afterEach(() => {
+    vi.restoreAllMocks();
+    setCachedDynamicModels(null);
+    resetProfileArnCache(true);
+  });
+
+  it("prefers END_TURN over the no-contextUsage length heuristic", async () => {
+    // No contextUsage + no tools → the #10 heuristic would say "length";
+    // the server's metadataEvent says END_TURN, which must win → "stop".
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      mockFetchOk('{"content":"Done"}{"stopReason":"END_TURN"}'),
+    );
+    const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+    const done = events.find((e) => e.type === "done");
+    expect(done?.type).toBe("done");
+    if (done?.type === "done") expect(done.reason).toBe("stop");
+  });
+
+  it("maps MAX_TOKENS to length even when contextUsage was received", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      mockFetchOk('{"content":"Cut off"}{"contextUsagePercentage":5}{"stopReason":"MAX_TOKENS"}'),
+    );
+    const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+    const done = events.find((e) => e.type === "done");
+    if (done?.type === "done") expect(done.reason).toBe("length");
+  });
+
+  it("maps TOOL_USE to toolUse", async () => {
+    const tool = '{"name":"grep","toolUseId":"t1","stop":true}';
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      mockFetchOk(`${tool}{"stopReason":"TOOL_USE"}{"contextUsagePercentage":5}`),
+    );
+    const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+    const done = events.find((e) => e.type === "done");
+    if (done?.type === "done") expect(done.reason).toBe("toolUse");
+  });
+
+  it("falls back to the heuristic when no metadataEvent arrives", async () => {
+    // Unchanged #10 behavior: no contextUsage, no tools, no stopReason → length.
+    vi.spyOn(globalThis, "fetch").mockImplementation(mockFetchOk('{"content":"Partial"}'));
+    const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+    const done = events.find((e) => e.type === "done");
+    if (done?.type === "done") expect(done.reason).toBe("length");
+  });
+});
+
+describe("text-only END_TURN stream (real capture #2, no metadataEvent)", () => {
+  beforeEach(() => resetProfileArnCache(true));
+  afterEach(() => {
+    vi.restoreAllMocks();
+    setCachedDynamicModels(null);
+    resetProfileArnCache(true);
+  });
+
+  it("resolves stopReason via the contextUsage heuristic and assembles text with newlines", async () => {
+    // Mirrors the real capture: reasoning + signature, then content, then
+    // contextUsage + metering, with NO metadataEvent. Heuristic → "stop".
+    const body =
+      '{"text":"Pensando"}{"signature":"SIG=="}' +
+      '{"content":"Listo. ","modelId":"claude-opus-4.8"}' +
+      '{"content":"Todo ok.\\n\\nFin","modelId":"claude-opus-4.8"}' +
+      '{"contextUsagePercentage":9.30090045928955}' +
+      '{"unit":"credit","unitPlural":"credits","usage":0.4933805256384743}';
+    vi.spyOn(globalThis, "fetch").mockImplementation(mockFetchOk(body));
+    const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+    const done = events.find((e) => e.type === "done");
+    expect(done?.type).toBe("done");
+    if (done?.type === "done") {
+      expect(done.reason).toBe("stop");
+      const text = done.message.content.find((b) => b.type === "text");
+      expect(text?.type).toBe("text");
+      if (text?.type === "text") {
+        expect(text.text).toBe("Listo. Todo ok.\n\nFin");
+      }
+      // metering credit propagated as cost.total
+      expect(done.message.usage.cost?.total).toBeCloseTo(0.4933805256384743, 10);
+    }
+  });
+});
+
+describe("conversationId stability (#17 — one deterministic id per session)", () => {
+  const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  const UUID_V5 = /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+  beforeEach(() => {
+    resetProfileArnCache(true);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  // A fetch mock that yields a FRESH reader on every call, so a single mock can
+  // back several streamKiro invocations (the once-style helper is consumed).
+  function mockFetchOkRepeating(body: string) {
+    return vi.fn().mockImplementation(() =>
+      Promise.resolve({
+        ok: true,
+        body: {
+          getReader: () => {
+            const chunks = [
+              { done: false, value: new TextEncoder().encode(body) },
+              { done: true, value: undefined },
+            ];
+            let i = 0;
+            return {
+              read: () => Promise.resolve(chunks[i++] ?? { done: true, value: undefined }),
+              cancel: () => Promise.resolve(undefined),
+            };
+          },
+        },
+      }),
+    );
+  }
+
+  it("resolveConversationId is a deterministic v5 UUID — same id for one sessionId across calls", () => {
+    const a = resolveConversationId("sess-1");
+    const b = resolveConversationId("sess-1");
+    expect(a).toBe(b);
+    expect(a).toMatch(UUID_V5);
+  });
+
+  it("resolveConversationId survives a process restart (pure function of the key)", () => {
+    // There is NO module-level cache: the id is derived purely from the session
+    // key, so the SAME key yields the SAME id even after the gateway process
+    // restarts (e.g. closing OpenCode and reopening with `opencode -s <id>`).
+    // Pin the exact value so the mapping for existing conversations can never
+    // silently drift if the derivation algorithm is changed.
+    expect(resolveConversationId("c-deadbeefcafe")).toBe("4dbaa3ae-9fea-59f2-b4a2-0026ad22bb9d");
+  });
+
+  it("resolveConversationId returns DIFFERENT ids for different sessions", () => {
+    expect(resolveConversationId("sess-1")).not.toBe(resolveConversationId("sess-2"));
+  });
+
+  it("resolveConversationId mints a fresh, random (v4) id when sessionId is undefined", () => {
+    const a = resolveConversationId(undefined);
+    const b = resolveConversationId(undefined);
+    expect(a).not.toBe(b);
+    expect(a).toMatch(UUID_V4);
+    expect(b).toMatch(UUID_V4);
+  });
+
+  it("reuses ONE conversationId across multiple turns of the same session", async () => {
+    const fetchMock = mockFetchOkRepeating('{"content":"Hi"}{"contextUsagePercentage":5}');
+    vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
+
+    await collect(streamKiro(makeModel(), makeContext("turn 1"), { apiKey: "tok", sessionId: "c-abc" }));
+    await collect(streamKiro(makeModel(), makeContext("turn 2"), { apiKey: "tok", sessionId: "c-abc" }));
+
+    const id0 = JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string).conversationState.conversationId;
+    const id1 = JSON.parse(fetchMock.mock.calls[1]?.[1]?.body as string).conversationState.conversationId;
+    expect(id0).toMatch(UUID_V5);
+    expect(id0).toBe(id1);
+  });
+
+  it("uses DIFFERENT conversationIds for different sessions", async () => {
+    const fetchMock = mockFetchOkRepeating('{"content":"Hi"}{"contextUsagePercentage":5}');
+    vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
+
+    await collect(streamKiro(makeModel(), makeContext("a"), { apiKey: "tok", sessionId: "c-aaa" }));
+    await collect(streamKiro(makeModel(), makeContext("b"), { apiKey: "tok", sessionId: "c-bbb" }));
+
+    const id0 = JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string).conversationState.conversationId;
+    const id1 = JSON.parse(fetchMock.mock.calls[1]?.[1]?.body as string).conversationState.conversationId;
+    expect(id0).not.toBe(id1);
   });
 });

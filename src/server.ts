@@ -1,7 +1,9 @@
 import type { Server } from "bun";
+import { createHash } from "node:crypto";
 import type { Message, Model, Api, Context } from "./types";
 import { streamKiro } from "./stream";
 import { log } from "./debug";
+import { enterSessionLog } from "./file-logger";
 import { KIRO_MODEL_IDS, fetchAvailableModels, buildModelsFromApi, setCachedDynamicModels, seedProfileArn } from "./models";
 import { resolveKiroModel, resolveApiRegion } from "./models";
 import { refreshKiroToken, startSocialLogin, BUILDER_ID_REGION } from "./oauth";
@@ -25,6 +27,12 @@ interface GatewayCredentials {
 
 let _creds: GatewayCredentials | null = null;
 
+// Single-flight guard: concurrent requests that all observe an expired token
+// must share ONE refresh, not fire N parallel refreshes. With rotating refresh
+// tokens (the desktop endpoint), parallel refreshes invalidate each other and
+// cause intermittent auth failures.
+let _refreshInFlight: Promise<void> | null = null;
+
 export function getAuthRegion(): string { return _creds?.region ?? "us-east-1"; }
 
 /** Called once at plugin startup from index.ts */
@@ -42,6 +50,8 @@ export async function initGatewayAuth(): Promise<void> {
       imported.clientId || "",
       imported.clientSecret || "",
       imported.authMethod,
+      imported.source || "",
+      imported.tokenKey || "",
     ];
 
     _creds = {
@@ -93,35 +103,68 @@ export async function initGatewayAuth(): Promise<void> {
   }
 }
 
-/** Get a fresh access token, refreshing if expired. */
+/** Get a fresh access token, refreshing if expired (single-flight). */
 async function getAccessToken(): Promise<string> {
   if (!_creds) throw new Error("Kiro credentials not initialized — run /login kiro");
 
   if (Date.now() >= _creds.expiresAt) {
-    log.info("[gateway-auth] Token expired, refreshing...");
-    const refreshed = await refreshKiroToken(
-      _creds.refreshPacked,
-      _creds.region,
-      _creds.authMethod,
-    );
-    _creds.accessToken = refreshed.access;
-    _creds.refreshPacked = refreshed.refresh;
-    _creds.expiresAt = refreshed.expires;
-    log.info("[gateway-auth] Token refreshed successfully");
+    // Coalesce concurrent refreshes into one in-flight promise so parallel
+    // requests don't each rotate (and invalidate) the refresh token.
+    if (!_refreshInFlight) {
+      const creds = _creds;
+      _refreshInFlight = (async () => {
+        log.info("[gateway-auth] Token expired, refreshing...");
+        const refreshed = await refreshKiroToken(
+          creds.refreshPacked,
+          creds.region,
+          creds.authMethod,
+        );
+        creds.accessToken = refreshed.access;
+        creds.refreshPacked = refreshed.refresh;
+        creds.expiresAt = refreshed.expires;
+        log.info("[gateway-auth] Token refreshed successfully");
+      })().finally(() => {
+        _refreshInFlight = null;
+      });
+    }
+    await _refreshInFlight;
   }
 
   return _creds.accessToken;
 }
 
 /** @internal — test helper to inject credentials without Kiro CLI */
-export function _seedCredentials(token: string, region = "us-east-1") {
+export function _seedCredentials(token: string, region = "us-east-1", expiresAt = Date.now() + 3600_000) {
   _creds = {
     accessToken: token,
     refreshPacked: "",
     region,
     authMethod: "idc",
-    expiresAt: Date.now() + 3600_000,
+    expiresAt,
   };
+}
+
+/**
+ * Origin allow-list for the local gateway. Server-side callers (OpenCode,
+ * curl) send NO Origin header and are always allowed. Browsers always send
+ * Origin; only localhost origins are permitted, which blocks drive-by requests
+ * from arbitrary websites to 127.0.0.1:7438 — the gateway proxies the user's
+ * Kiro credentials, so an open CORS surface means credential/quota abuse.
+ */
+function isLocalhostOrigin(origin: string): boolean {
+  try {
+    const host = new URL(origin).hostname;
+    return host === "127.0.0.1" || host === "localhost" || host === "::1" || host === "[::1]";
+  } catch {
+    return false;
+  }
+}
+
+/** True for a browser cross-origin request that must be rejected. */
+function isDisallowedBrowserRequest(req: Request): boolean {
+  const origin = req.headers.get("origin");
+  if (!origin) return false; // non-browser caller (no Origin header) — allow
+  return !isLocalhostOrigin(origin);
 }
 
 /**
@@ -167,6 +210,101 @@ function isTitleGenerationRequest(messages: any[]): boolean {
   return false;
 }
 
+/** Short, stable, filesystem-safe hash for grouping log files. */
+function shortHash(input: string): string {
+  return createHash("sha256").update(input).digest("hex").slice(0, 12);
+}
+
+/** Plain text of the first user message — stable across every turn of a
+ *  conversation (history grows, but the first message never changes). */
+function firstUserMessageText(messages: any[]): string {
+  for (const m of messages) {
+    if (m?.role !== "user") continue;
+    if (typeof m.content === "string") return m.content;
+    if (Array.isArray(m.content)) {
+      const text = m.content
+        .map((b: any) => (typeof b === "string" ? b : b?.text || ""))
+        .join(" ")
+        .trim();
+      if (text) return text;
+    }
+  }
+  return "";
+}
+
+/**
+ * A stable-ish seed string identifying one conversation. Prefers the first
+ * user message's TEXT (human-meaningful, fixed across turns). When that is
+ * empty — e.g. the client compacted history and dropped the original prompt,
+ * or the first message is image/tool-result only — it falls back to a
+ * fingerprint of the first message's full structure so unrelated
+ * conversations never share a seed.
+ */
+function conversationSeed(messages: any[]): string {
+  const text = firstUserMessageText(messages);
+  if (text) return text;
+  if (messages.length > 0) {
+    try {
+      return "msg0:" + JSON.stringify(messages[0]);
+    } catch {
+      // fall through
+    }
+  }
+  return "";
+}
+
+/**
+ * Derive a stable per-session id so all turns of one conversation land in the
+ * same /tmp/kiro-logs/session-{id}.log file, regardless of client.
+ *
+ * Priority (first match wins):
+ *  1. Explicit session header (`x-session-id` / `x-kiro-session-id` /
+ *     `anthropic-session-id`) — most stable, survives history compaction.
+ *  2. Anthropic `metadata.user_id` — Claude Code embeds a stable id here.
+ *  3. Title-generation turns get their own bucket (keyed on the seed).
+ *  4. Content fingerprint — first user text, else first-message structure.
+ *  5. Degenerate request (no messages): hash of the whole body.
+ *
+ * There is intentionally NO shared "default" bucket: every request resolves to
+ * a hashed id so unrelated conversations are never mixed into one file. This id
+ * is also reused as the source key for the Kiro API `conversationId` (see
+ * `resolveConversationId` in stream.ts), so all turns of one conversation share
+ * a single upstream conversationId — matching the Kiro CLI.
+ */
+function deriveLogSessionId(body: any, messages: any[], headers?: Headers): string {
+  const headerId =
+    headers?.get("x-session-id") ||
+    headers?.get("x-kiro-session-id") ||
+    headers?.get("anthropic-session-id");
+  if (headerId && headerId.trim().length > 0) {
+    return `s-${shortHash(headerId.trim())}`;
+  }
+
+  const userId = body?.metadata?.user_id;
+  if (typeof userId === "string" && userId.trim().length > 0) {
+    return `u-${shortHash(userId.trim())}`;
+  }
+
+  const seed = conversationSeed(messages);
+
+  if (isTitleGenerationRequest(messages)) {
+    return `title-${shortHash(seed || "untitled")}`;
+  }
+
+  if (seed) {
+    return `c-${shortHash(seed)}`;
+  }
+
+  // No messages at all — hash the body so this still gets a unique file
+  // rather than collapsing into a shared bucket.
+  try {
+    return `c-${shortHash(JSON.stringify(body))}`;
+  } catch {
+    return `c-${shortHash(String(Date.now()))}`;
+  }
+}
+
+
 /**
  * Strip wrapping markdown/quotes from a generated title. Kiro models often
  * return titles wrapped in bold (`**Title**`), quotes, backticks, or with a
@@ -202,15 +340,20 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
       // while thinking. Bun's default 10s idle timeout is far too short.
       idleTimeout: 255,
       async fetch(req) {
-        // Handle CORS preflight
+        // Handle CORS preflight. Reflect the Origin only for localhost so a
+        // remote website's preflight fails and the browser never sends the
+        // real cross-origin request. Non-browser callers don't preflight.
         if (req.method === "OPTIONS") {
-          return new Response(null, {
-            headers: {
-              "Access-Control-Allow-Origin": "*",
-              "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
-              "Access-Control-Allow-Headers": "Content-Type, Authorization",
-            },
-          });
+          const origin = req.headers.get("origin");
+          const headers: Record<string, string> = {
+            "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization",
+          };
+          if (origin && isLocalhostOrigin(origin)) {
+            headers["Access-Control-Allow-Origin"] = origin;
+            headers["Vary"] = "Origin";
+          }
+          return new Response(null, { headers });
         }
 
         const url = new URL(req.url);
@@ -278,6 +421,11 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
 
         // Anthropic Messages endpoint
         if ((url.pathname === "/v1/messages" || url.pathname === "/messages") && req.method === "POST") {
+          // Reject cross-origin browser requests: the gateway proxies the
+          // user's Kiro credentials and must not be drivable from a web page.
+          if (isDisallowedBrowserRequest(req)) {
+            return anthropicError(403, "invalid_request_error", "Cross-origin requests are not allowed");
+          }
           // Gateway owns auth — get a fresh token from the credential store.
           // OpenCode still sends a token in headers (for its own bookkeeping)
           // but we ignore it and use our own.
@@ -307,7 +455,20 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
               .join("\n");
           }
           const streamRequested = !!body.stream;
+          // Kiro/CodeWhisperer exposes no temperature knob — read for
+          // logging/parity only; intentionally NOT forwarded to the API.
           const temperature = body.temperature ?? 0.5;
+          // Anthropic requires max_tokens; forward it so streamKiro can pass it
+          // through additionalModelRequestFields on models that accept it.
+          const maxTokens = typeof body.max_tokens === "number" ? body.max_tokens : undefined;
+
+          // Bind this request to its own session log file. Derived once and
+          // reused for streamKiro below. From here on, every log.*() in this
+          // request (including the detached streamKiro IIFE and SSE stream,
+          // both created synchronously after this call) routes to
+          // session-{id}.log. Each request gets its own async context.
+          const logSessionId = deriveLogSessionId(body, anthropicMessages, req.headers);
+          enterSessionLog(logSessionId);
 
           log.debug(`[gateway] sys=${systemPrompt.length}c msgs=${anthropicMessages.length} tools=${body.tools?.length ?? 0}`);
 
@@ -363,6 +524,12 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
               apiKey: accessToken,
               reasoning: reasoningEffort,
               temperature,
+              maxTokens,
+              // The log session id is a stable per-conversation key (survives
+              // history growth). Reuse it as the Kiro `conversationId` source so
+              // every turn of one conversation shares a single id, like Kiro CLI.
+              sessionId: logSessionId,
+              logSessionId,
             });
 
             if (streamRequested) {
@@ -409,6 +576,34 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
 
               const streamResponse = new ReadableStream({
                 async start(controller) {
+                  // Heartbeat: streamKiro retries internally on idle / first-token
+                  // timeouts (idle 60s + backoff, up to ~4 min) without pushing any
+                  // events. With no traffic the SSE connection looks frozen to the
+                  // client. Emit periodic `ping` events (part of the Anthropic SSE
+                  // protocol — clients ignore them) during silence so the connection
+                  // stays visibly alive. Declared outside the try so `finally` can
+                  // always clear the timer.
+                  const PING_INTERVAL_MS = 15_000;
+                  let lastActivity = Date.now();
+                  let pingTimer: ReturnType<typeof setInterval> | null = null;
+                  const stopHeartbeat = () => {
+                    if (pingTimer) {
+                      clearInterval(pingTimer);
+                      pingTimer = null;
+                    }
+                  };
+                  const startHeartbeat = () => {
+                    pingTimer = setInterval(() => {
+                      // Only ping after a real gap — no noise during normal streaming.
+                      if (Date.now() - lastActivity < PING_INTERVAL_MS) return;
+                      try {
+                        controller.enqueue("event: ping\ndata: {\"type\":\"ping\"}\n\n");
+                      } catch {
+                        // Controller already closed — stop pinging.
+                        stopHeartbeat();
+                      }
+                    }, PING_INTERVAL_MS);
+                  };
                   try {
                     const msgId = `msg_${crypto.randomUUID()}`;
                     controller.enqueue(
@@ -427,6 +622,9 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
                         }
                       }) + "\n\n"
                     );
+
+                    // Stream is live — begin the keepalive heartbeat.
+                    startHeartbeat();
 
                     let contentBlockIndex = 0;
                     let activeBlockType: "thinking" | "text" | "tool_use" | null = null;
@@ -468,6 +666,8 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
 
                     // Process the buffered first event + remaining events
                     const processEvent = (event: any) => {
+                      // Real event arrived — reset the heartbeat idle window.
+                      lastActivity = Date.now();
                       if (event.type === "thinking_delta") {
                         ensureBlockStarted("thinking");
                         controller.enqueue(
@@ -563,8 +763,26 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
 
                     closeActiveBlock();
 
-                    let finishReason = "end_turn";
                     const finalMsg = await kiroStream.result();
+                    // Surface a stream-level error that occurred AFTER the
+                    // initial buffering (e.g. failure after MAX_RETRIES). Any
+                    // partial content was already streamed, so emit an Anthropic
+                    // `error` SSE event instead of a silent `end_turn`.
+                    if (finalMsg.stopReason === "error" || finalMsg.errorMessage) {
+                      controller.enqueue(
+                        "event: error\ndata: " +
+                        JSON.stringify({
+                          type: "error",
+                          error: {
+                            type: "api_error",
+                            message: finalMsg.errorMessage || "Kiro stream error",
+                          },
+                        }) + "\n\n",
+                      );
+                      controller.close();
+                      return;
+                    }
+                    let finishReason = "end_turn";
                     if (finalMsg.content.some((b: any) => b.type === "toolCall")) {
                       finishReason = "tool_use";
                     }
@@ -622,6 +840,10 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
                       }) + "\n\n"
                     );
                     controller.close();
+                  } finally {
+                    // Always tear down the heartbeat — on success, error, or
+                    // client disconnect — so the interval can't outlive the stream.
+                    stopHeartbeat();
                   }
                 }
               });
@@ -636,6 +858,11 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
               });
             } else {
               const finalMsg = await kiroStream.result();
+              // Surface stream-level errors instead of returning an empty,
+              // successful-looking message.
+              if (finalMsg.stopReason === "error" || finalMsg.errorMessage) {
+                return anthropicError(502, "api_error", `Kiro: ${finalMsg.errorMessage || "stream error"}`);
+              }
               const contentParts = finalMsg.content;
               const anthropicContent: any[] = [];
 
@@ -731,9 +958,24 @@ function translateAnthropicToPi(messages: any[]): Message[] {
           timestamp: Date.now(),
         });
       } else if (Array.isArray(msg.content)) {
-        const toolResultParts = msg.content.filter((part: any) => part.type === "tool_result");
-        if (toolResultParts.length > 0) {
-          for (const part of toolResultParts) {
+        // Preserve the original ordering of tool_result vs text/image parts.
+        // Anthropic normally puts tool_result first, but don't assume it —
+        // emitting pi messages in declaration order keeps a tool_result that
+        // follows text from being hoisted ahead of it.
+        let pendingUserParts: any[] = [];
+        const flushUserParts = () => {
+          if (pendingUserParts.length > 0) {
+            piMessages.push({
+              role: "user",
+              content: pendingUserParts as any,
+              timestamp: Date.now(),
+            });
+            pendingUserParts = [];
+          }
+        };
+        for (const part of msg.content) {
+          if (part.type === "tool_result") {
+            flushUserParts();
             piMessages.push({
               role: "toolResult",
               toolCallId: part.tool_use_id,
@@ -741,26 +983,13 @@ function translateAnthropicToPi(messages: any[]): Message[] {
               isError: part.is_error || false,
               timestamp: Date.now(),
             } as any);
+          } else if (part.type === "text") {
+            pendingUserParts.push({ type: "text", text: part.text });
+          } else if (part.type === "image" && part.source?.type === "base64") {
+            pendingUserParts.push({ type: "image", mimeType: part.source.media_type, data: part.source.data });
           }
         }
-
-        const otherParts = msg.content.map((part: any) => {
-          if (part.type === "text") {
-            return { type: "text", text: part.text };
-          }
-          if (part.type === "image" && part.source?.type === "base64") {
-            return { type: "image", mimeType: part.source.media_type, data: part.source.data };
-          }
-          return null;
-        }).filter(Boolean);
-
-        if (otherParts.length > 0) {
-          piMessages.push({
-            role: "user",
-            content: otherParts as any,
-            timestamp: Date.now(),
-          });
-        }
+        flushUserParts();
       }
     } else if (msg.role === "assistant") {
       const contentParts: any[] = [];

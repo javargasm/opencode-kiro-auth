@@ -9,6 +9,7 @@
 
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
+import { currentSessionLogFile } from "./file-logger";
 
 export type LogLevel = "error" | "warn" | "info" | "debug";
 
@@ -30,6 +31,11 @@ function enabled(level: LogLevel): boolean {
 }
 
 function currentFilePath(): string | null {
+  // During a request, route leveled logs into that request's session file so
+  // they sit alongside the structured entries. Outside any request (startup,
+  // auth refresh) fall back to the global KIRO_LOG_FILE.
+  const sessionFile = currentSessionLogFile();
+  if (sessionFile) return sessionFile;
   const raw = globalThis.process?.env?.KIRO_LOG_FILE;
   if (!raw) return null;
   return isAbsolute(raw) ? raw : resolve(process.cwd(), raw);

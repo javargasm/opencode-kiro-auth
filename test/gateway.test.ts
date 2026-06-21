@@ -6,6 +6,26 @@ vi.mock("../src/stream", () => ({
   streamKiro: (...args: any[]) => mockStreamKiro(...args),
 }));
 
+const mockRefresh = vi.fn();
+// bun's test runner doesn't support the factory's importOriginal arg, so mock
+// only the three exports server.ts imports from oauth.
+vi.mock("../src/oauth", () => ({
+  refreshKiroToken: (...args: any[]) => mockRefresh(...args),
+  startSocialLogin: () => Promise.reject(new Error("startSocialLogin not mocked in gateway tests")),
+  BUILDER_ID_REGION: "us-east-1",
+}));
+
+function okStream() {
+  return {
+    async *[Symbol.asyncIterator]() {
+      // no events
+    },
+    async result() {
+      return { role: "assistant", content: [], usage: { input: 0, output: 0 } };
+    },
+  };
+}
+
 describe("Local HTTP Gateway Server (Anthropic Protocol)", () => {
   beforeEach(() => {
     mockStreamKiro.mockReset();
@@ -160,6 +180,56 @@ describe("Local HTTP Gateway Server (Anthropic Protocol)", () => {
     await server.stop(true);
   });
 
+  it("passes a stable per-conversation sessionId to streamKiro (#17)", async () => {
+    const server = await startGatewayServer(0);
+
+    mockStreamKiro.mockImplementation(() => ({
+      async *[Symbol.asyncIterator]() {
+        // non-streaming path only awaits result()
+      },
+      async result() {
+        return {
+          role: "assistant",
+          content: [{ type: "text", text: "ok" }],
+          usage: { input: 1, output: 1 },
+        };
+      },
+    }));
+
+    async function send(messages: any[]) {
+      const resp = await fetch(`http://127.0.0.1:${server.port}/v1/messages`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer mock-token" },
+        body: JSON.stringify({ model: "claude-sonnet-4-6", messages }),
+      });
+      expect(resp.status).toBe(200);
+    }
+
+    // Turn 1 and turn 2 of the SAME conversation: history grows but the first
+    // user message (the seed) is unchanged → identical sessionId.
+    await send([{ role: "user", content: "Hello there, opening message" }]);
+    await send([
+      { role: "user", content: "Hello there, opening message" },
+      { role: "assistant", content: "Hi!" },
+      { role: "user", content: "A follow-up question" },
+    ]);
+
+    const sid0 = (mockStreamKiro.mock.calls[0] as any[])[2]?.sessionId;
+    const sid1 = (mockStreamKiro.mock.calls[1] as any[])[2]?.sessionId;
+    expect(sid0).toBeTruthy();
+    expect(sid0).toBe(sid1);
+    // logSessionId is still provided too (log grouping unchanged).
+    expect((mockStreamKiro.mock.calls[0] as any[])[2]?.logSessionId).toBe(sid0);
+
+    // A different conversation (different opening message) → different key.
+    await send([{ role: "user", content: "A completely unrelated first message" }]);
+    const sid2 = (mockStreamKiro.mock.calls[2] as any[])[2]?.sessionId;
+    expect(sid2).toBeTruthy();
+    expect(sid2).not.toBe(sid0);
+
+    await server.stop(true);
+  });
+
   it("should handle non-streaming messages correctly (Anthropic Protocol)", async () => {
     const server = await startGatewayServer(0);
 
@@ -294,5 +364,137 @@ describe("Local HTTP Gateway Server (Anthropic Protocol)", () => {
     expect(stripTitleMarkdown("Already Clean Title")).toBe("Already Clean Title");
     // Inline (non-wrapping) emphasis must NOT be stripped.
     expect(stripTitleMarkdown("Fix **bold** in middle")).toBe("Fix **bold** in middle");
+  });
+});
+
+describe("Gateway bug fixes (#2, #3, #7, #13)", () => {
+  beforeEach(() => {
+    mockStreamKiro.mockReset();
+    mockRefresh.mockReset();
+    _seedCredentials("test-token");
+  });
+
+  it("#2: non-streaming surfaces a stream-level error as HTTP 502", async () => {
+    mockStreamKiro.mockImplementation(() => ({
+      async *[Symbol.asyncIterator]() {},
+      async result() {
+        return {
+          role: "assistant",
+          content: [],
+          usage: { input: 0, output: 0 },
+          stopReason: "error",
+          errorMessage: "boom",
+        };
+      },
+    }));
+    const server = await startGatewayServer(0);
+    const resp = await fetch(`http://127.0.0.1:${server.port}/v1/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "claude-sonnet-4-6", messages: [{ role: "user", content: "hi" }], stream: false }),
+    });
+    expect(resp.status).toBe(502);
+    const body = (await resp.json()) as any;
+    expect(body.error.message).toMatch(/boom/);
+    await server.stop(true);
+  });
+
+  it("#2: streaming surfaces a post-buffering error as an SSE error event", async () => {
+    mockStreamKiro.mockImplementation(() => ({
+      async *[Symbol.asyncIterator]() {
+        yield { type: "text_delta", delta: "partial" };
+      },
+      async result() {
+        return {
+          role: "assistant",
+          content: [{ type: "text", text: "partial" }],
+          usage: { input: 0, output: 0 },
+          stopReason: "error",
+          errorMessage: "midstream boom",
+        };
+      },
+    }));
+    const server = await startGatewayServer(0);
+    const resp = await fetch(`http://127.0.0.1:${server.port}/v1/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "claude-sonnet-4-6", messages: [{ role: "user", content: "hi" }], stream: true }),
+    });
+    expect(resp.status).toBe(200);
+    const text = await resp.text();
+    expect(text).toContain("event: error");
+    expect(text).toContain("midstream boom");
+    await server.stop(true);
+  });
+
+  it("#7: rejects cross-origin browser requests with 403", async () => {
+    mockStreamKiro.mockImplementation(okStream);
+    const server = await startGatewayServer(0);
+    const resp = await fetch(`http://127.0.0.1:${server.port}/v1/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Origin": "https://evil.example" },
+      body: JSON.stringify({ model: "claude-sonnet-4-6", messages: [{ role: "user", content: "hi" }] }),
+    });
+    expect(resp.status).toBe(403);
+    expect(mockStreamKiro).not.toHaveBeenCalled();
+    await server.stop(true);
+  });
+
+  it("#7: allows localhost origin requests", async () => {
+    mockStreamKiro.mockImplementation(okStream);
+    const server = await startGatewayServer(0);
+    const resp = await fetch(`http://127.0.0.1:${server.port}/v1/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Origin": "http://localhost:3000" },
+      body: JSON.stringify({ model: "claude-sonnet-4-6", messages: [{ role: "user", content: "hi" }] }),
+    });
+    expect(resp.status).not.toBe(403);
+    await server.stop(true);
+  });
+
+  it("#13: preserves tool_result vs text ordering within a user message", async () => {
+    mockStreamKiro.mockImplementation(okStream);
+    const server = await startGatewayServer(0);
+    await fetch(`http://127.0.0.1:${server.port}/v1/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-6",
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "before tool" },
+              { type: "tool_result", tool_use_id: "t1", content: "result" },
+            ],
+          },
+        ],
+      }),
+    });
+    const [, contextArg] = mockStreamKiro.mock.calls[0] as [any, any];
+    expect(contextArg.messages[0].role).toBe("user");
+    expect(contextArg.messages[0].content[0].text).toBe("before tool");
+    expect(contextArg.messages[1].role).toBe("toolResult");
+    await server.stop(true);
+  });
+
+  it("#3: concurrent expired-token requests share a single token refresh", async () => {
+    _seedCredentials("expired-token", "us-east-1", Date.now() - 1000);
+    mockRefresh.mockImplementation(async () => {
+      await new Promise((r) => setTimeout(r, 30));
+      return { access: "refreshed-token", refresh: "rt2|||idc||", expires: Date.now() + 3600_000 };
+    });
+    mockStreamKiro.mockImplementation(okStream);
+    const server = await startGatewayServer(0);
+    const reqs = Array.from({ length: 5 }, () =>
+      fetch(`http://127.0.0.1:${server.port}/v1/messages`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "claude-sonnet-4-6", messages: [{ role: "user", content: "hi" }] }),
+      }),
+    );
+    await Promise.all(reqs);
+    expect(mockRefresh).toHaveBeenCalledTimes(1);
+    await server.stop(true);
   });
 });

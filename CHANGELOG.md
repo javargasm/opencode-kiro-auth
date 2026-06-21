@@ -1,5 +1,19 @@
 # @javargasm/opencode-kiro-auth
 
+## 0.4.0
+
+### Minor Changes
+
+- Stream reliability + gateway hardening from the audit pass:
+
+  - **event-parser**: surface AWS Event Stream exception frames (type lives in the `:exception-type` header, not the JSON payload) as `error` events instead of treating a truncated stream as a clean finish; emit a `metadata` event carrying Kiro's authoritative `stopReason`.
+  - **stream**: prefer Kiro's `metadataEvent` stopReason over heuristics; deterministic per-session `conversationId` (v5 UUID, stable across restarts) matching the Kiro CLI; forward clamped `max_tokens` for thinking-config models; stop blindly deduping identical content frames; skip signature-only reasoning frames that would emit an empty thinking block; never reset-and-retry after partial output reached the consumer (avoids duplicated SSE); resolve `firstTokenTimeout` from dynamic models; UA bump to appVersion 2.8.1.
+  - **server**: single-flight token refresh (parallel refreshes invalidate rotating tokens); reject cross-origin browser requests + localhost-only CORS; SSE keepalive heartbeat; surface stream-level errors as HTTP 502 / SSE `error`; preserve tool_result vs text ordering within a user message; per-session log routing.
+  - **transform**: normalize image MIME → Kiro format (`jpg`→`jpeg`), omit unsupported subtypes (e.g. `image/svg+xml`) instead of sending a bogus `format`.
+  - **thinking-parser**: append late thinking blocks instead of splicing (splice corrupted already-emitted content indices).
+  - **types**: `EventStream.result()` rejects instead of hanging when the stream ends with no terminal event.
+  - **models**: `max_tokens` normalized to 64000; Fable 5 marked disabled; Auto context window to 1M.
+
 ## 0.3.1
 
 ### Patch Changes
