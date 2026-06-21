@@ -146,6 +146,31 @@ bun test --watch
 bun run build
 ```
 
+### Debug logging
+
+Structured file logging is **opt-in** via the `KIRO_FILE_LOG` environment
+variable. When enabled, every turn of a conversation is written to
+`/tmp/kiro-logs/session-{id}.log` (full request/response bodies) plus a
+`session-{id}.last-request.json` dump of the most recent request. The id is
+derived from OpenCode's session id, so all turns of one conversation — including
+after a restart (`opencode -s <id>`) — share a single file.
+
+It is **off by default** because the logs are verbose and may contain sensitive
+prompt content. Enable it for the current shell:
+
+```bash
+export KIRO_FILE_LOG=1
+```
+
+To keep it always on, add it to your shell profile (macOS uses zsh):
+
+```bash
+echo 'export KIRO_FILE_LOG=1' >> ~/.zshrc && source ~/.zshrc
+```
+
+Accepted truthy values: `1`, `true`, `yes`, `on` (case-insensitive). Rebuild the
+plugin (`bun run build`) and restart OpenCode after changing it.
+
 ### Project Structure
 
 ```

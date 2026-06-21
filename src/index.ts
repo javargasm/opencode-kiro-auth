@@ -32,6 +32,26 @@ import {
 // Global server instance to manage lifecycle across reloads
 let gatewayServer: any = null;
 
+/**
+ * Headers injected into every model request so the gateway can tie the Kiro
+ * `conversationId` (and its log-file grouping) to OpenCode's STABLE session id.
+ *
+ * The gateway derives the conversationId from the `x-session-id` header (see
+ * `deriveLogSessionId` in server.ts). OpenCode's session id is stable for the
+ * life of a conversation AND survives a restart (`opencode -s <id>` resumes the
+ * same id), so the conversationId stays constant across turns and restarts —
+ * matching the real Kiro CLI. Without this the gateway fell back to an
+ * ephemeral header / first-message fingerprint, so the id changed on every
+ * restart and the logs scattered across files.
+ *
+ * Exported for testing. Returns `{}` when no session id is available.
+ */
+export function kiroSessionHeaders(sessionID: string | undefined): Record<string, string> {
+  return typeof sessionID === "string" && sessionID.trim().length > 0
+    ? { "x-session-id": sessionID.trim() }
+    : {};
+}
+
 export const KiroPlugin: Plugin = async (input) => {
   const client = input.client;
 
@@ -55,6 +75,16 @@ export const KiroPlugin: Plugin = async (input) => {
   const localPort = gatewayServer ? gatewayServer.port : GATEWAY_PORT;
 
   const hooks: Hooks = {
+    // Bind every model request to its OpenCode session id (as `x-session-id`).
+    // The gateway uses it to derive a stable Kiro conversationId — one per
+    // session, constant across turns and across restarts (`opencode -s <id>`).
+    "chat.headers": async (input, output) => {
+      const headers = kiroSessionHeaders(input?.sessionID);
+      if (output && output.headers) {
+        Object.assign(output.headers, headers);
+      }
+    },
+
     // Shutdown the server when plugin is disposed
     dispose: async () => {
       if (gatewayServer) {

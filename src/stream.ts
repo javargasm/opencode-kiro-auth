@@ -24,7 +24,7 @@ import { kiroModels, resolveKiroModel, getCachedDynamicModels, resolveProfileArn
 import { ThinkingTagParser } from "./thinking-parser";
 import { countTokens } from "./tokenizer";
 import { abortableDelay } from "./oauth";
-import { createSessionLogger, ensureLogDir, LOG_DIR } from "./file-logger";
+import { createSessionLogger, ensureLogDir, isFileLoggingEnabled, LOG_DIR } from "./file-logger";
 
 import {
   buildHistory,
@@ -680,7 +680,7 @@ export function streamKiro(
           // Per-session filename so it carries the session id like the .log file
           // and never clobbers another session's dump.
           log.debug(`[stream] req=${requestBody.length}c hist=${history.length} content=${currentContent.length}c profileArn=${!!profileArn}`);
-          if (log.isDebug()) {
+          if (isFileLoggingEnabled()) {
             try {
               ensureLogDir();
               require("fs").writeFileSync(`${LOG_DIR}/session-${fileLog.sessionId}.last-request.json`, requestBody);

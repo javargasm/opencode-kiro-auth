@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { startGatewayServer, _seedCredentials } from "../src/server";
+import { kiroSessionHeaders } from "../src/index";
 
 const mockStreamKiro = vi.fn();
 vi.mock("../src/stream", () => ({
@@ -225,6 +226,57 @@ describe("Local HTTP Gateway Server (Anthropic Protocol)", () => {
     await send([{ role: "user", content: "A completely unrelated first message" }]);
     const sid2 = (mockStreamKiro.mock.calls[2] as any[])[2]?.sessionId;
     expect(sid2).toBeTruthy();
+    expect(sid2).not.toBe(sid0);
+
+    await server.stop(true);
+  });
+
+  it("kiroSessionHeaders injects x-session-id from the OpenCode session id (#17)", () => {
+    expect(kiroSessionHeaders("ses_114b0808")).toEqual({ "x-session-id": "ses_114b0808" });
+    expect(kiroSessionHeaders("  ses_trim  ")).toEqual({ "x-session-id": "ses_trim" });
+    expect(kiroSessionHeaders(undefined)).toEqual({});
+    expect(kiroSessionHeaders("")).toEqual({});
+    expect(kiroSessionHeaders("   ")).toEqual({});
+  });
+
+  it("x-session-id header pins the sessionId regardless of message content — survives restart/compaction (#17)", async () => {
+    const server = await startGatewayServer(0);
+
+    mockStreamKiro.mockImplementation(() => ({
+      async *[Symbol.asyncIterator]() {},
+      async result() {
+        return { role: "assistant", content: [{ type: "text", text: "ok" }], usage: { input: 1, output: 1 } };
+      },
+    }));
+
+    async function send(sessionHeader: string, firstUserText: string) {
+      const resp = await fetch(`http://127.0.0.1:${server.port}/v1/messages`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer mock-token",
+          "x-session-id": sessionHeader,
+        },
+        body: JSON.stringify({ model: "claude-sonnet-4-6", messages: [{ role: "user", content: firstUserText }] }),
+      });
+      expect(resp.status).toBe(200);
+    }
+
+    // SAME session header but DIFFERENT opening message: simulates resuming a
+    // session (`opencode -s <id>`) after the first message changed / history was
+    // compacted. The session id must stay constant because the explicit
+    // x-session-id header wins over the content fingerprint.
+    await send("ses_resume_abc", "the very first message");
+    await send("ses_resume_abc", "a different message after restart");
+
+    const sid0 = (mockStreamKiro.mock.calls[0] as any[])[2]?.sessionId;
+    const sid1 = (mockStreamKiro.mock.calls[1] as any[])[2]?.sessionId;
+    expect(sid0).toBeTruthy();
+    expect(sid0).toBe(sid1);
+
+    // A different session id → different key.
+    await send("ses_other_xyz", "the very first message");
+    const sid2 = (mockStreamKiro.mock.calls[2] as any[])[2]?.sessionId;
     expect(sid2).not.toBe(sid0);
 
     await server.stop(true);

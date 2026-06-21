@@ -16,9 +16,21 @@ export const LOG_DIR = "/tmp/kiro-logs";
 
 let dirEnsured = false;
 
-// TODO: gate behind KIRO_FILE_LOG=1 env var once the thinking signature bug is resolved
-function isEnabled(): boolean {
-  return true;
+/**
+ * File logging (the structured `session-{id}.log` files under /tmp/kiro-logs,
+ * plus the `.last-request.json` dumps) is OPT-IN via the `KIRO_FILE_LOG` env
+ * var. It captures full request/response bodies — invaluable for debugging the
+ * Kiro wire protocol, but verbose and potentially containing sensitive prompt
+ * content — so it stays OFF unless explicitly enabled.
+ *
+ * Truthy values: `1`, `true`, `yes`, `on` (case-insensitive). Evaluated on
+ * every call so it can be toggled at runtime (and in tests).
+ */
+export function isFileLoggingEnabled(): boolean {
+  const v = process.env.KIRO_FILE_LOG;
+  if (!v) return false;
+  const s = v.trim().toLowerCase();
+  return s === "1" || s === "true" || s === "yes" || s === "on";
 }
 
 /** Ensure LOG_DIR exists. Best-effort and memoized; safe to call on every write. */
@@ -78,7 +90,7 @@ export function enterSessionLog(sessionId: string | undefined): string {
 }
 
 function writeLine(file: string, data: Record<string, unknown>): void {
-  if (!isEnabled()) return;
+  if (!isFileLoggingEnabled()) return;
   ensureLogDir();
   const entry = {
     ts: new Date().toISOString(),
