@@ -130,7 +130,7 @@ describe("streamKiro", () => {
 
     // user-agent and x-amz-user-agent must differ (m/F vs md/appVersion)
     expect(opts.headers["user-agent"]).toContain("aws-sdk-rust/1.3.15");
-    expect(opts.headers["user-agent"]).toContain("md/appVersion-2.8.1");
+    expect(opts.headers["user-agent"]).toContain("md/appVersion-2.9.0");
     expect(opts.headers["x-amz-user-agent"]).toContain("aws-sdk-rust/1.3.15");
     expect(opts.headers["x-amz-user-agent"]).toContain("m/F");
     expect(opts.headers["x-amz-user-agent"]).not.toContain("md/appVersion");

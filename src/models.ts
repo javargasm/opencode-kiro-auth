@@ -98,6 +98,8 @@ export interface KiroModel {
   maxTokens: number;
   /** Optional per-model override for the first-token timeout (ms). */
   firstTokenTimeout?: number;
+  /** Per-model idle timeout override (ms). */
+  idleTimeout?: number;
   /**
    * Upstream is expected to hide reasoning from clients — tags and
    * native reasoning events should be absent. When set:
@@ -143,6 +145,7 @@ export const kiroModels: KiroModel[] = [
     contextWindow: 1_000_000,
     maxTokens: 128_000,
     firstTokenTimeout: 180_000,
+    idleTimeout: 180_000,
     supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
     supportsThinkingConfig: true,
   },
@@ -155,6 +158,7 @@ export const kiroModels: KiroModel[] = [
     contextWindow: 1_000_000,
     maxTokens: 128_000,
     firstTokenTimeout: 180_000,
+    idleTimeout: 180_000,
     supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
     supportsThinkingConfig: true,
   },
@@ -167,6 +171,7 @@ export const kiroModels: KiroModel[] = [
     contextWindow: 1_000_000,
     maxTokens: 128_000,
     firstTokenTimeout: 180_000,
+    idleTimeout: 180_000,
     supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
     supportsThinkingConfig: true,
   },
@@ -313,7 +318,7 @@ export async function resolveProfileArn(
       Authorization: `Bearer ${accessToken}`,
       "Content-Type": "application/x-amz-json-1.0",
       "X-Amz-Target": "AmazonCodeWhispererService.ListAvailableProfiles",
-      "user-agent": "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererruntime/0.1.16551 os/macos lang/rust/1.92.0 md/appVersion-2.8.1 app/AmazonQ-For-CLI",
+      "user-agent": "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererruntime/0.1.16551 os/macos lang/rust/1.92.0 md/appVersion-2.9.0 app/AmazonQ-For-CLI",
     },
     body: "{}",
   });
@@ -349,7 +354,7 @@ export async function fetchAvailableModels(
       Authorization: `Bearer ${accessToken}`,
       "Content-Type": "application/x-amz-json-1.0",
       "X-Amz-Target": "AmazonCodeWhispererService.ListAvailableModels",
-      "user-agent": "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererruntime/0.1.16551 os/macos lang/rust/1.92.0 md/appVersion-2.8.1 app/AmazonQ-For-CLI",
+      "user-agent": "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererruntime/0.1.16551 os/macos lang/rust/1.92.0 md/appVersion-2.9.0 app/AmazonQ-For-CLI",
     },
     body: "{}",
   });
@@ -373,10 +378,10 @@ function isReasoningModel(dotId: string): boolean {
   return false;
 }
 
-/** First-token timeout for slow models (Claude Opus can take 2-3 minutes). */
-function firstTokenTimeout(dotId: string): number {
+/** Timeout for high-effort reasoning models (Opus/Fable: 180s). */
+function modelTimeout(dotId: string, defaultMs: number): number {
   if (dotId.startsWith("claude-fable") || dotId.startsWith("claude-opus")) return 180_000;
-  return 90_000;
+  return defaultMs;
 }
 
 /**
@@ -416,7 +421,8 @@ export function buildModelsFromApi(apiModels: KiroApiModel[]): KiroModel[] {
       input,
       contextWindow: m.tokenLimits?.maxInputTokens ?? 200_000,
       maxTokens: m.tokenLimits?.maxOutputTokens ?? 8_192,
-      firstTokenTimeout: firstTokenTimeout(m.modelId),
+      firstTokenTimeout: modelTimeout(m.modelId, 90_000),
+      idleTimeout: modelTimeout(m.modelId, 60_000),
       // Per-model overrides for known special cases
       ...(supportedEfforts ? { supportedEfforts } : {}),
       ...(supportsThinkingConfig ? { supportsThinkingConfig } : {}),
