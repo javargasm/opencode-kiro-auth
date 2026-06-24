@@ -120,6 +120,40 @@ Models that support adaptive thinking accept effort levels through OpenCode's re
 
 Not all models support every level — see the model table above for supported efforts per model.
 
+### Usage bar (TUI)
+
+The plugin ships a TUI component that displays your Kiro credit usage directly in the OpenCode prompt area. It only appears when a Kiro model is active.
+
+```
+Kiro Free C ████████░░ 78.00% ⟳ 12d (390/500)
+```
+
+**Setup** — OpenCode loads server plugins from `opencode.json` and TUI plugins from `tui.json`. The server plugin is already configured via the [Installation](#installation) section. To enable the usage bar, also add the plugin to your `tui.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/tui.json",
+  "plugin": [
+    "@javargasm/opencode-kiro-auth"
+  ]
+}
+```
+
+This file lives at `~/.config/opencode/tui.json` (global) or in your project root (project-scoped). You can also install via CLI:
+
+```bash
+opencode plugin @javargasm/opencode-kiro-auth
+```
+
+> The bar auto-detects the active Kiro provider and only renders when a Kiro model is selected.
+
+**How it works:**
+
+- The TUI runs in a **separate process** from the server plugin (they share no state)
+- Provider detection polls the session state every 2s and listens to `session.updated` / `message.updated` events
+- Usage data is fetched over HTTP from the local gateway at `http://127.0.0.1:7438/dashboard/api/usage` every 30s
+- Thresholds: green (< 70%), yellow (≥ 70%), red (≥ 90%)
+
 ## Development
 
 ### Prerequisites
@@ -187,9 +221,14 @@ src/
 ├── kiro-defaults.ts    # Static protocol constants (system seed, tool schemas)
 ├── health.ts           # Permanent error classification
 ├── tokenizer.ts        # Lightweight token estimation
-└── debug.ts            # Structured logging
+├── debug.ts            # Structured logging
+├── tui.tsx             # TUI usage bar component (OpenTUI / Solid)
+├── tui-detect.ts       # Provider detection helpers for the TUI bar
+└── session-probe.ts    # Session/message provider resolution
 test/
-└── gateway.test.ts     # Gateway integration tests (health, auth, streaming, non-streaming)
+├── stream.test.ts          # Stream orchestrator tests
+├── kiro-detector.test.ts   # Provider detection unit tests
+└── session-probe.test.ts   # Session probe unit tests
 ```
 
 ## Architecture

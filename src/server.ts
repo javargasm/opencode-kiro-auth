@@ -133,6 +133,128 @@ async function getAccessToken(): Promise<string> {
   return _creds.accessToken;
 }
 
+// ── Kiro account usage limits (credits) ──────────────────────────────
+// Mirrors pi-usage-bars fetchKiroUsage: calls AmazonCodeWhispererService
+// .GetUsageLimits and returns a percentage (used/limit) for the TUI bar.
+// Cached for 2 min to avoid hammering AWS from the TUI poll loop.
+
+export interface KiroUsageLimits {
+  percentage: number;
+  creditsUsed: number;
+  creditsTotal: number;
+  planTitle: string | null;
+  monthlyResetsIn: string | null;
+  error?: string;
+}
+
+let _usageCache: { data: KiroUsageLimits; at: number } | null = null;
+const USAGE_CACHE_MS = 120_000;
+
+function formatDuration(sec: number): string {
+  const d = Math.floor(sec / 86400);
+  if (d >= 1) return `${d}d`;
+  const h = Math.floor((sec % 86400) / 3600);
+  if (h >= 1) return `${h}h`;
+  const m = Math.floor((sec % 3600) / 60);
+  return m >= 1 ? `${m}m` : "<1m";
+}
+
+export async function fetchKiroUsageLimits(): Promise<KiroUsageLimits> {
+  if (_usageCache && Date.now() - _usageCache.at < USAGE_CACHE_MS) {
+    return _usageCache.data;
+  }
+
+  if (!_creds) {
+    return { percentage: 0, creditsUsed: 0, creditsTotal: 0, planTitle: null, monthlyResetsIn: null, error: "no credentials" };
+  }
+
+  try {
+    const accessToken = await getAccessToken();
+    const apiRegion = resolveApiRegion(_creds.region);
+
+    // Resolve profileArn if missing (Builder ID social login may not have it).
+    let profileArn = _creds.profileArn;
+    if (!profileArn) {
+      const { resolveProfileArn } = await import("./models");
+      profileArn = await resolveProfileArn(accessToken, apiRegion) ?? undefined;
+      if (profileArn) {
+        _creds.profileArn = profileArn;
+        seedProfileArn(profileArn);
+      }
+    }
+
+    const body: Record<string, unknown> = { isEmailRequired: true, origin: "AI_EDITOR" };
+    if (profileArn) body.profileArn = profileArn;
+
+    const res = await fetch(`https://q.${apiRegion}.amazonaws.com/`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-amz-json-1.0",
+        Accept: "application/json",
+        Authorization: `Bearer ${accessToken}`,
+        "X-Amz-Target": "AmazonCodeWhispererService.GetUsageLimits",
+        "x-amzn-codewhisperer-optout": "true",
+        "amz-sdk-invocation-id": crypto.randomUUID(),
+        "amz-sdk-request": "attempt=1; max=1",
+        "x-amzn-kiro-agent-mode": "vibe",
+        "User-Agent": "opencode-kiro",
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+      const out: KiroUsageLimits = { percentage: 0, creditsUsed: 0, creditsTotal: 0, planTitle: null, monthlyResetsIn: null, error: `HTTP ${res.status}` };
+      _usageCache = { data: out, at: Date.now() };
+      return out;
+    }
+
+    const data: any = await res.json();
+    let usedCount = 0;
+    let limitCount = 0;
+    let nextReset: number | null = null;
+
+    if (Array.isArray(data.usageBreakdownList)) {
+      for (const entry of data.usageBreakdownList) {
+        usedCount += entry.currentUsage ?? 0;
+        limitCount += entry.usageLimit ?? 0;
+        if (entry.freeTrialInfo) {
+          usedCount += entry.freeTrialInfo.currentUsage ?? 0;
+          limitCount += entry.freeTrialInfo.usageLimit ?? 0;
+        }
+        if (entry.nextDateReset) nextReset = entry.nextDateReset;
+      }
+    }
+
+    const percentage = limitCount > 0 ? Number(((usedCount / limitCount) * 100).toFixed(2)) : 0;
+    const out: KiroUsageLimits = {
+      percentage,
+      creditsUsed: usedCount,
+      creditsTotal: limitCount,
+      planTitle: null,
+      monthlyResetsIn: null,
+    };
+
+    if (nextReset) {
+      const diffSec = Math.max(0, (nextReset * 1000 - Date.now()) / 1000);
+      out.monthlyResetsIn = formatDuration(diffSec);
+    }
+
+    const subTitle: string | undefined = data.subscriptionInfo?.subscriptionTitle;
+    if (subTitle) {
+      out.planTitle = subTitle.replace(/^KIRO\s+/i, "").replace(/\w\S*/g, (w: string) =>
+        w.charAt(0).toUpperCase() + w.slice(1).toLowerCase(),
+      );
+    }
+
+    _usageCache = { data: out, at: Date.now() };
+    return out;
+  } catch (err) {
+    const out: KiroUsageLimits = { percentage: 0, creditsUsed: 0, creditsTotal: 0, planTitle: null, monthlyResetsIn: null, error: err instanceof Error ? err.message : String(err) };
+    _usageCache = { data: out, at: Date.now() };
+    return out;
+  }
+}
+
 /** @internal — test helper to inject credentials without Kiro CLI */
 export function _seedCredentials(token: string, region = "us-east-1", expiresAt = Date.now() + 3600_000) {
   _creds = {
@@ -366,6 +488,12 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
         }
         if (url.pathname === "/dashboard/api/stats") {
           return new Response(JSON.stringify(stats.getStats()), {
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        if (url.pathname === "/dashboard/api/usage") {
+          const usage = await fetchKiroUsageLimits();
+          return new Response(JSON.stringify(usage), {
             headers: { "Content-Type": "application/json" },
           });
         }

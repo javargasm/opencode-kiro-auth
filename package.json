@@ -28,13 +28,21 @@
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
+      "default": "./dist/index.js"
     },
     "./server": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
+      "default": "./dist/index.js"
+    },
+    "./tui": {
+      "types": "./dist/tui.d.ts",
+      "default": "./dist/tui.tsx"
     }
   },
+  "oc-plugin": [
+    "server",
+    "tui"
+  ],
   "files": [
     "dist",
     "README.md"
@@ -43,7 +51,7 @@
     "clean": "rm -rf dist",
     "build:js": "bun build src/index.ts --outdir dist --target node --format esm --external '@opencode-ai/*'",
     "build:types": "tsc -p tsconfig.build.json",
-    "build": "bun run clean && bun run build:js && bun run build:types",
+    "build": "bun run clean && bun run build:js && bun run build:types && cp src/tui.tsx dist/tui.tsx",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:bun": "bun test test/gateway.test.ts",
@@ -64,6 +72,12 @@
   },
   "peerDependencies": {
     "@opencode-ai/plugin": "*"
+  },
+  "dependencies": {
+    "@opentui/core": "^0.3.4",
+    "@opentui/keymap": "^0.3.4",
+    "@opentui/solid": "^0.3.4",
+    "solid-js": "1.9.12"
   },
   "publishConfig": {
     "access": "public",

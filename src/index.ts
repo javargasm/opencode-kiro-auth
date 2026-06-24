@@ -8,6 +8,8 @@ process.env.KIRO_LOG_FILE = process.env.KIRO_LOG_FILE || "/tmp/kiro-logs/session
 
 import type { Plugin, Hooks, PluginModule } from "@opencode-ai/plugin";
 import { startGatewayServer, initGatewayAuth, getAuthRegion } from "./server";
+import { providerIdFromEvent } from "./tui-detect";
+import { mostRecentSession, providerFromSession, providerFromMessages } from "./session-probe";
 import { log } from "./debug";
 import { 
   BUILDER_ID_START_URL, 
@@ -55,30 +57,102 @@ export function kiroSessionHeaders(sessionID: string | undefined): Record<string
 export const KiroPlugin: Plugin = async (input) => {
   const client = input.client;
 
-  // Start the gateway server on a fixed port
+  // Lazy gateway: NO arrancamos nada al cargar el plugin. El gateway + auth
+  // arrancan solo cuando llega el primer request al provider "kiro"
+  // (chat.headers). Así opencode-kiro es invisible hasta que se usa un modelo
+  // kiro. El TUI corre en OTRO proceso, por eso no compartimos estado con él:
+  // el TUI lee el usage por HTTP a /dashboard/api/usage.
   const GATEWAY_PORT = 7438;
-  try {
-    if (gatewayServer) {
-      log.info("[opencode-kiro] Stopping existing gateway server...");
-      await gatewayServer.stop(true);
-    }
-    gatewayServer = await startGatewayServer(GATEWAY_PORT);
-    log.info(`[opencode-kiro] Gateway server active on http://127.0.0.1:${gatewayServer.port}`);
-  } catch (err) {
-    log.error("[opencode-kiro] Failed to start local gateway server", err);
+  let gatewayStarting: Promise<void> | null = null;
+
+  async function ensureGateway(): Promise<void> {
+    if (gatewayServer) return;
+    if (gatewayStarting) return gatewayStarting;
+    gatewayStarting = (async () => {
+      try {
+        log.info("[opencode-kiro] Starting gateway (lazy — kiro provider in use)...");
+        gatewayServer = await startGatewayServer(GATEWAY_PORT);
+        log.info(`[opencode-kiro] Gateway server active on http://127.0.0.1:${gatewayServer.port}`);
+        await initGatewayAuth();
+        log.info("[opencode-kiro] Gateway auth initialized");
+      } catch (err) {
+        log.error("[opencode-kiro] Failed to start gateway", err);
+        gatewayServer = null;
+      } finally {
+        gatewayStarting = null;
+      }
+    })();
+    return gatewayStarting;
   }
 
-  // Initialize gateway auth — imports credentials from Kiro CLI and
-  // manages token refresh. Must run before any API requests.
-  await initGatewayAuth();
+  // Restore path: a server plugin receives NO event on session restore (the
+  // selected model is TUI-local state, and no message.updated fires until the
+  // user acts). The TUI bar detects kiro instantly because it actively queries
+  // session state — so the server must do the same. We poll session.list() a
+  // few times at startup (storage hydrates async) and warm the gateway if the
+  // most-recent session uses kiro.
+  async function probeAndWarm(): Promise<void> {
+    const RETRY_DELAYS_MS = [0, 500, 1500, 4000];
+    for (const delay of RETRY_DELAYS_MS) {
+      if (gatewayServer || gatewayStarting) return;
+      if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+      try {
+        const resp = await (client as any).session.list();
+        const sessions = (resp?.data ?? resp) as any[];
+        const recent = mostRecentSession(sessions);
+        if (!recent) continue;
 
-  const localPort = gatewayServer ? gatewayServer.port : GATEWAY_PORT;
+        let pid = providerFromSession(recent);
+        if (pid !== "kiro") {
+          try {
+            const msgsResp = await (client as any).session.messages({ path: { id: recent.id } });
+            const msgs = (msgsResp?.data ?? msgsResp) as any[];
+            pid = providerFromMessages(msgs) ?? pid;
+          } catch { /* messages probe is best-effort */ }
+        }
+
+        if (pid === "kiro") {
+          log.info("[opencode-kiro] Restored kiro session detected at startup — warming gateway");
+          await ensureGateway();
+          return;
+        }
+      } catch (err) {
+        log.warn("[opencode-kiro] probeAndWarm attempt failed", err);
+      }
+    }
+  }
+  void probeAndWarm();
 
   const hooks: Hooks = {
-    // Bind every model request to its OpenCode session id (as `x-session-id`).
-    // The gateway uses it to derive a stable Kiro conversationId — one per
-    // session, constant across turns and across restarts (`opencode -s <id>`).
+    // Warm the gateway on ANY kiro provider signal. OpenCode emits no dedicated
+    // "model selected" event (the selected model is TUI-local state — see
+    // packages/tui/src/context/local.tsx in the opencode source), so the
+    // earliest signal a server plugin gets is one of these events firing with a
+    // kiro provider: message.updated (info.providerID) or session.updated
+    // (info.model.providerID). This covers session restore once messages
+    // hydrate, without waiting for the next chat.headers.
+    event: async ({ event }) => {
+      if (gatewayServer || gatewayStarting) return;
+      if (providerIdFromEvent(event) === "kiro") {
+        await ensureGateway();
+      }
+    },
+
+    // chat.message fires when a message is composed with the currently
+    // selected model — the most direct "model selected" signal we get.
+    "chat.message": async (input) => {
+      if (input?.model?.providerID === "kiro") {
+        await ensureGateway();
+      }
+    },
+
+    // Bind every model request to its OpenCode session id (as `x-session-id`),
+    // and lazy-start the gateway when the request targets the kiro provider.
     "chat.headers": async (input, output) => {
+      const pid = (input?.provider as any)?.id;
+      if (pid === "kiro") {
+        await ensureGateway();
+      }
       const headers = kiroSessionHeaders(input?.sessionID);
       if (output && output.headers) {
         Object.assign(output.headers, headers);
@@ -97,12 +171,11 @@ export const KiroPlugin: Plugin = async (input) => {
     auth: {
       provider: "kiro",
       loader: async (getAuth, provider) => {
+        // El gateway arranca en chat.headers (no aquí — el auth.loader corre al
+        // startup para todos los providers).
         try {
           const auth = await getAuth() as any;
           if (auth && auth.type === "oauth" && auth.access) {
-            // The gateway handles actual Kiro auth (token refresh, region, etc).
-            // We return the stored token so OpenCode's SDK doesn't reject the request,
-            // but the gateway ignores it and uses its own credential store.
             return {
               headers: { Authorization: `Bearer ${auth.access}` },
               apiKey: auth.access,
@@ -355,7 +428,7 @@ export const KiroPlugin: Plugin = async (input) => {
       const kiro = cfg.provider.kiro;
       kiro.name = kiro.name ?? "Kiro AWS";
       kiro.npm = kiro.npm ?? "@ai-sdk/anthropic";
-      kiro.api = kiro.api ?? `http://127.0.0.1:${localPort}/v1`;
+      kiro.api = kiro.api ?? `http://127.0.0.1:${GATEWAY_PORT}/v1`;
       kiro.models = kiro.models ?? {};
 
       // Inject dynamic models if available, otherwise fallback to static models.
@@ -379,7 +452,7 @@ export const KiroPlugin: Plugin = async (input) => {
           release_date: "2026-06-15",
           provider: {
             npm: "@ai-sdk/anthropic",
-            api: `http://127.0.0.1:${localPort}/v1`,
+            api: `http://127.0.0.1:${GATEWAY_PORT}/v1`,
           },
         };
       }
