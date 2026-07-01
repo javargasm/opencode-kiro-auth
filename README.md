@@ -197,11 +197,11 @@ bun run build
 
 ### Release
 
-Patch/minor releases are tagged with `vX.Y.Z`. Pushing a tag triggers `.github/workflows/release.yaml`, which runs checks, builds the package, and publishes to npm with provenance.
+Patch/minor releases are tagged with `vX.Y.Z`. Pushing a tag triggers `.github/workflows/release.yaml`, which runs checks, builds the package, and publishes to npm with provenance through npm trusted publishing.
 
-Required repository secret:
+Required npm setup:
 
-- `NPM_TOKEN` — npm automation token with publish access to `@javargasm/opencode-kiro-auth`
+- Configure npm trusted publishing for `@javargasm/opencode-kiro-auth` and allow the GitHub workflow `.github/workflows/release.yaml`
 
 Release commands:
 
