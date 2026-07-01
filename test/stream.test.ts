@@ -198,6 +198,120 @@ describe("streamKiro", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it("retries fetch socket closures with exponential backoff before receiving a response", async () => {
+    const socketClosed = new TypeError(
+      "The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()",
+    );
+    const fetchMock = vi.fn()
+      .mockRejectedValueOnce(socketClosed)
+      .mockRejectedValueOnce(socketClosed)
+      .mockResolvedValueOnce({
+        ok: true,
+        body: {
+          getReader: () => ({
+            read: vi.fn()
+              .mockResolvedValueOnce({ done: false, value: new TextEncoder().encode('{"content":"Hi"}{"contextUsagePercentage":5}') })
+              .mockResolvedValueOnce({ done: true, value: undefined }),
+            cancel: vi.fn().mockResolvedValue(undefined),
+          }),
+        },
+    });
+    vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
+    vi.useFakeTimers();
+
+    const p = collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(999);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+
+    const events = await p;
+
+    vi.useRealTimers();
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(events.find((e) => e.type === "error")).toBeUndefined();
+    const done = events.find((e) => e.type === "done");
+    expect(done?.type).toBe("done");
+  }, 30000);
+
+  it("retries transport read errors before the first token", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        body: {
+          getReader: () => ({
+            read: vi.fn().mockRejectedValueOnce(new TypeError("socket connection closed")),
+            cancel: vi.fn().mockResolvedValue(undefined),
+          }),
+        },
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        body: {
+          getReader: () => ({
+            read: vi.fn()
+              .mockResolvedValueOnce({ done: false, value: new TextEncoder().encode('{"content":"Recovered"}{"contextUsagePercentage":5}') })
+              .mockResolvedValueOnce({ done: true, value: undefined }),
+            cancel: vi.fn().mockResolvedValue(undefined),
+          }),
+        },
+    });
+    vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
+    vi.useFakeTimers();
+
+    const p = collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(999);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    const events = await p;
+
+    vi.useRealTimers();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(events.find((e) => e.type === "error")).toBeUndefined();
+    const done = events.find((e) => e.type === "done");
+    expect(done?.type).toBe("done");
+  }, 30000);
+
+  it("does not retry transport read errors after partial output", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: vi.fn()
+            .mockResolvedValueOnce({ done: false, value: new TextEncoder().encode('{"content":"Partial"}') })
+            .mockRejectedValueOnce(new TypeError("socket connection closed")),
+          cancel: vi.fn().mockResolvedValue(undefined),
+        }),
+      },
+    });
+    vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
+
+    const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(events.some((e) => e.type === "text_delta" && e.delta === "Partial")).toBe(true);
+    const err = events.find((e) => e.type === "error");
+    expect(err?.type).toBe("error");
+    if (err?.type === "error") {
+      expect(err.error.errorMessage).toContain("after partial output");
+    }
+  });
+
   it("sends origin: KIRO_CLI and modelId in dot format", async () => {
     const fetchMock = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":5}');
     vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);

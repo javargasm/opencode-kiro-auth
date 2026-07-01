@@ -95,6 +95,10 @@ function isTransientError(status: number): boolean {
   return status === 429 || status >= 500;
 }
 
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 function findModel(modelId: string): KiroModel | undefined {
   return (
     (kiroModels.find((x) => x.id === modelId) as KiroModel | undefined) ??
@@ -705,25 +709,49 @@ export function streamKiro(
             conversationId,
           }, requestBody);
 
-          response = await fetch(endpoint, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/x-amz-json-1.0",
-              Accept: "*/*",
-              "Accept-Encoding": "gzip",
-              Authorization: `Bearer ${accessToken}`,
-              "X-Amz-Target": "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
-              "x-amzn-codewhisperer-optout": "true",
-              "amz-sdk-invocation-id": crypto.randomUUID(),
-              "amz-sdk-request": "attempt=1; max=3",
-              "user-agent": ua,
-              "x-amz-user-agent": xAmzUa,
-              Pragma: "no-cache",
-              "Cache-Control": "no-cache",
-            },
-            body: requestBody,
-            signal: options?.signal,
-          });
+          try {
+            response = await fetch(endpoint, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/x-amz-json-1.0",
+                Accept: "*/*",
+                "Accept-Encoding": "gzip",
+                Authorization: `Bearer ${accessToken}`,
+                "X-Amz-Target": "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+                "x-amzn-codewhisperer-optout": "true",
+                "amz-sdk-invocation-id": crypto.randomUUID(),
+                "amz-sdk-request": "attempt=1; max=3",
+                "user-agent": ua,
+                "x-amz-user-agent": xAmzUa,
+                Pragma: "no-cache",
+                "Cache-Control": "no-cache",
+              },
+              body: requestBody,
+              signal: options?.signal,
+            });
+          } catch (error) {
+            if (options?.signal?.aborted) throw options.signal.reason ?? error;
+
+            const message = errorMessage(error);
+            if (retryCount < MAX_RETRIES) {
+              retryCount++;
+              const delayMs = exponentialBackoff(retryCount - 1, 1000, MAX_RETRY_DELAY_MS);
+              fileLog.logStreamError({
+                error: message,
+                context: "fetch_retry",
+                model: model.id,
+                attempt: retryCount,
+              });
+              log.info(
+                `network error before response: ${message} — retrying in ${delayMs}ms ` +
+                `(${retryCount}/${MAX_RETRIES})`,
+              );
+              await abortableDelay(delayMs, options?.signal);
+              continue;
+            }
+
+            throw new Error(`Kiro API network error after max retries: ${message}`);
+          }
 
           if (response.ok) break;
 
@@ -890,39 +918,55 @@ export function streamKiro(
         let gotFirstToken = false;
         let firstTokenTimedOut = false;
         let streamError: string | null = null;
+        let transportError: string | null = null;
         const FIRST_TOKEN_SENTINEL = Symbol("firstTokenTimeout");
         type ReadResult = { done: boolean; value?: Uint8Array };
 
         while (true) {
           let readResult: ReadResult;
-          if (!gotFirstToken) {
-            const readPromise = reader.read() as Promise<ReadResult>;
-            let firstTokenTimer: ReturnType<typeof setTimeout> | null = null;
-            const result = await Promise.race([
-              readPromise,
-              new Promise<typeof FIRST_TOKEN_SENTINEL>((resolve) => {
-                firstTokenTimer = setTimeout(
-                  () => resolve(FIRST_TOKEN_SENTINEL),
-                  firstTokenTimeoutForModel(model.id),
-                );
-              }),
-            ]);
-            // Always clear the timer — otherwise the happy path keeps the
-            // event loop alive for firstTokenTimeout ms after the stream
-            // ends, which for opus-4-7 (180s) is user-visible as a hang
-            // before a short-lived CLI exits.
-            if (firstTokenTimer) clearTimeout(firstTokenTimer);
-            if (result === FIRST_TOKEN_SENTINEL) {
-              readPromise.catch(() => {});
-              void reader.cancel().catch(() => {});
-              firstTokenTimedOut = true;
-              break;
+          try {
+            if (!gotFirstToken) {
+              const readPromise = reader.read() as Promise<ReadResult>;
+              let firstTokenTimer: ReturnType<typeof setTimeout> | null = null;
+              const result = await Promise.race([
+                readPromise,
+                new Promise<typeof FIRST_TOKEN_SENTINEL>((resolve) => {
+                  firstTokenTimer = setTimeout(
+                    () => resolve(FIRST_TOKEN_SENTINEL),
+                    firstTokenTimeoutForModel(model.id),
+                  );
+                }),
+              ]);
+              // Always clear the timer — otherwise the happy path keeps the
+              // event loop alive for firstTokenTimeout ms after the stream
+              // ends, which for opus-4-7 (180s) is user-visible as a hang
+              // before a short-lived CLI exits.
+              if (firstTokenTimer) clearTimeout(firstTokenTimer);
+              if (result === FIRST_TOKEN_SENTINEL) {
+                readPromise.catch(() => {});
+                void reader.cancel().catch(() => {});
+                firstTokenTimedOut = true;
+                break;
+              }
+              readResult = result as ReadResult;
+              gotFirstToken = true;
+              resetIdle();
+            } else {
+              readResult = (await reader.read()) as ReadResult;
             }
-            readResult = result as ReadResult;
-            gotFirstToken = true;
-            resetIdle();
-          } else {
-            readResult = (await reader.read()) as ReadResult;
+          } catch (error) {
+            if (options?.signal?.aborted) throw options.signal.reason ?? error;
+            if (idleCancelled) break;
+
+            transportError = errorMessage(error);
+            fileLog.logStreamError({
+              error: transportError,
+              context: "read_transport",
+              model: model.id,
+              attempt: retryCount,
+            });
+            void reader.cancel().catch(() => {});
+            break;
           }
 
           const { done, value } = readResult;
@@ -1090,7 +1134,7 @@ export function streamKiro(
 
         if (idleTimer) clearTimeout(idleTimer);
 
-        if (firstTokenTimedOut || idleCancelled || streamError) {
+        if (firstTokenTimedOut || idleCancelled || streamError || transportError) {
           // Once any output reached the consumer, a reset-and-retry would
           // DUPLICATE it: SSE deltas already sent can't be retracted. Only a
           // first-token timeout is guaranteed to have produced nothing, so it's
@@ -1099,7 +1143,13 @@ export function streamKiro(
           if (!alreadyStreamed && retryCount < MAX_RETRIES) {
             retryCount++;
             const delayMs = exponentialBackoff(retryCount - 1, 1000, MAX_RETRY_DELAY_MS);
-            const streamErrDesc = firstTokenTimedOut ? "first-token timed out" : idleCancelled ? "idle timed out" : `error: ${streamError}`;
+            const streamErrDesc = firstTokenTimedOut
+              ? "first-token timed out"
+              : idleCancelled
+                ? "idle timed out"
+                : transportError
+                  ? `network error: ${transportError}`
+                  : `error: ${streamError}`;
             fileLog.logStreamError({
               error: streamErrDesc,
               context: "retry",
@@ -1123,12 +1173,13 @@ export function streamKiro(
           }
           // Either we already streamed partial output (can't retract) or we're
           // out of retries.
-          if (streamError) {
+          if (streamError || transportError) {
             // Surface the error. With partial content already streamed, the
             // consumer sees the partial output followed by the error — better
             // than silently truncating or duplicating.
+            const finalError = streamError ?? transportError;
             throw new Error(
-              `Kiro API stream error${alreadyStreamed ? " after partial output" : " after max retries"}: ${streamError}`,
+              `Kiro API stream error${alreadyStreamed ? " after partial output" : " after max retries"}: ${finalError}`,
             );
           }
           if (!alreadyStreamed) {

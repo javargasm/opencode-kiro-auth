@@ -6,33 +6,34 @@ Kiro provider plugin for [OpenCode](https://opencode.ai). Authenticates via AWS 
 
 - **AWS Builder ID / IAM Identity Center** — OAuth device-code login with automatic token refresh
 - **Dynamic model discovery** — fetches available models from the Kiro API at runtime; falls back to a curated static catalog
+- **Credit-aware model names** — appends each Kiro `rateMultiplier` to the model picker label, e.g. `Claude Sonnet 5 (1.3x)`
 - **Local Anthropic gateway** — translates Anthropic Messages API requests to Kiro's CodeWhisperer streaming protocol
+- **Transport retries** — retries transient socket/proxy disconnects with exponential backoff before any output is streamed
 - **Adaptive thinking** — maps reasoning effort levels (`low` → `max`) through the `output_config.effort` parameter
 - **Multi-region** — supports `us-east-1` and `eu-central-1` Kiro API regions with automatic SSO region mapping
 - **Zero external dependencies** — self-contained plugin; no runtime deps beyond the OpenCode SDK
 
 ## Supported Models
 
-| Model | Reasoning | Context | Effort Levels |
-|:---|:---:|:---:|:---|
-| Claude Fable 5 | ✅ | 1M | low, medium, high, xhigh, max |
-| Claude Opus 4.8 | ✅ | 1M | low, medium, high, xhigh, max |
-| Claude Opus 4.7 | ✅ | 1M | low, medium, high, xhigh, max |
-| Claude Opus 4.6 | ✅ | 1M | low, medium, high, max |
-| Claude Sonnet 4.6 | ✅ | 1M | low, medium, high, max |
-| Claude Opus 4.5 | ✅ | 200K | — |
-| Claude Sonnet 4.5 | ✅ | 200K | — |
-| Claude Sonnet 4 | ✅ | 200K | — |
-| Claude Haiku 4.5 | ❌ | 200K | — |
-| DeepSeek 3.2 | ✅ | 128K | — |
-| Kimi K2.5 | ✅ | 200K | — |
-| MiniMax M2.1 / M2.5 | ❌ | 196K | — |
-| GLM 4.7 / 4.7 Flash | ✅/❌ | 128K | — |
-| Qwen3 Coder Next | ✅ | 256K | — |
-| Qwen3 Coder 480B | ✅ | 128K | — |
-| AGI Nova Beta | ✅ | 1M | — |
+| Model | Reasoning | Context | Rate | Effort Levels |
+|:---|:---:|:---:|:---:|:---|
+| Claude Sonnet 5 | ✅ | 1M | 1.3x | low, medium, high, xhigh, max |
+| Claude Opus 4.8 | ✅ | 1M | 2.2x | low, medium, high, xhigh, max |
+| Claude Opus 4.7 | ✅ | 1M | 2.2x | low, medium, high, xhigh, max |
+| Claude Opus 4.6 | ✅ | 1M | 2.2x | low, medium, high, max |
+| Claude Sonnet 4.6 | ✅ | 1M | 1.3x | low, medium, high, max |
+| Claude Opus 4.5 | ✅ | 200K | 2.2x | — |
+| Claude Sonnet 4.5 | ✅ | 200K | 1.3x | — |
+| Claude Sonnet 4 | ✅ | 200K | 1.3x | — |
+| Claude Haiku 4.5 | ❌ | 200K | 0.4x | — |
+| DeepSeek V3.2 | ✅ | 164K | 0.25x | — |
+| MiniMax M2.5 | ❌ | 196K | 0.25x | — |
+| MiniMax M2.1 | ❌ | 196K | 0.15x | — |
+| GLM-5 | ✅ | 200K | 0.5x | — |
+| Qwen3 Coder Next | ✅ | 256K | 0.05x | — |
+| Auto | ✅ | 1M | 1x | — |
 
-> Models without effort levels listed use Kiro's default reasoning behavior. Additional models may appear dynamically via the `ListAvailableModels` API.
+> Models without effort levels listed use Kiro's default reasoning behavior. Additional models may appear dynamically via the `ListAvailableModels` API. The model picker displays the upstream `rateMultiplier` next to every model returned by the endpoint or fallback catalog. `Claude Fable 5 (disabled)` remains in the fallback catalog for compatibility but is not advertised as an active model.
 
 ## Installation
 
@@ -120,6 +121,17 @@ Models that support adaptive thinking accept effort levels through OpenCode's re
 
 Not all models support every level — see the model table above for supported efforts per model.
 
+### Network retry behavior
+
+The gateway retries transient transport failures before any assistant output reaches the client. This covers cases like a proxy/VPN disconnect where `fetch()` fails with `The socket connection was closed unexpectedly` or the response stream closes before the first token.
+
+Retry policy:
+
+- `fetch()` socket failures before an HTTP response: exponential backoff (`1s`, `2s`, `4s`, capped at `10s`)
+- response-stream transport failures before the first token: same backoff policy
+- HTTP transient responses (`429`/`5xx`): retry with jitter
+- after partial text/tool output: no reset-and-retry, because already-sent SSE deltas cannot be retracted without duplicating output
+
 ### Usage bar (TUI)
 
 The plugin ships a TUI component that displays your Kiro credit usage directly in the OpenCode prompt area. It only appears when a Kiro model is active.
@@ -171,13 +183,34 @@ bun run check
 bun run typecheck
 
 # Run tests
-bun test
+bun run test
+
+# Run Bun gateway tests
+bun run test:bun
 
 # Run tests in watch mode
 bun test --watch
 
 # Build for distribution
 bun run build
+```
+
+### Release
+
+Patch/minor releases are tagged with `vX.Y.Z`. Pushing a tag triggers `.github/workflows/release.yaml`, which runs checks, builds the package, and publishes to npm with provenance.
+
+Required repository secret:
+
+- `NPM_TOKEN` — npm automation token with publish access to `@javargasm/opencode-kiro-auth`
+
+Release commands:
+
+```bash
+bun run check
+bun run build
+git tag vX.Y.Z
+git push origin main
+git push origin vX.Y.Z
 ```
 
 ### Debug logging
