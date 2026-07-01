@@ -1,5 +1,19 @@
 # @javargasm/opencode-kiro-auth
 
+## 0.6.1
+
+### Patch Changes
+
+- af645dd: Retry transient Kiro transport failures with exponential backoff.
+
+  - Retry `fetch()` socket/proxy disconnects before an HTTP response is received.
+  - Retry response-stream transport failures before the first assistant token.
+  - Keep the no-retry behavior after partial output to avoid duplicating already-sent SSE deltas.
+  - Document model rate multipliers, retry behavior, and release flow in the README.
+  - Add regression tests for fetch socket closures, pre-token stream transport errors, and post-partial-output no-retry behavior.
+
+- 6571fe1: Add a tag-based GitHub Actions release workflow that runs checks, builds, and publishes to npm with provenance.
+
 ## 0.6.0
 
 ### Minor Changes
