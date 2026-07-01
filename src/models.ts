@@ -8,6 +8,7 @@
 /** Canonical Kiro API IDs (dot form) accepted by the server. */
 export const KIRO_MODEL_IDS = new Set<string>([
   "claude-fable-5",
+  "claude-sonnet-5",
   "claude-opus-4.8",
   "claude-opus-4.7",
   "claude-opus-4.6",
@@ -16,8 +17,10 @@ export const KIRO_MODEL_IDS = new Set<string>([
   "claude-sonnet-4.5",
   "claude-sonnet-4",
   "claude-haiku-4.5",
-  "minimax-m2.1",
+  "deepseek-3.2",
   "minimax-m2.5",
+  "minimax-m2.1",
+  "glm-5",
   "qwen3-coder-next",
   "auto",
 ]);
@@ -72,6 +75,35 @@ export function resolveApiRegion(ssoRegion: string | undefined): string {
 
 const BASE_URL = "https://runtime.us-east-1.kiro.dev";
 const ZERO_COST = Object.freeze({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+const KIRO_CLI_ORIGIN = "KIRO_CLI";
+const KIRO_CLI_USER_AGENT =
+  "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererruntime/0.1.17593 os/macos lang/rust/1.92.0 md/appVersion-2.10.0 app/AmazonQ-For-CLI";
+const KIRO_CLI_X_AMZ_USER_AGENT = `${KIRO_CLI_USER_AGENT} m/F,C`;
+const KIRO_MANAGEMENT_TARGET = {
+  listAvailableProfiles: "AmazonCodeWhispererService.ListAvailableProfiles",
+  listAvailableModels: "AmazonCodeWhispererService.ListAvailableModels",
+} as const;
+const KIRO_MANAGEMENT_BASE_HEADERS = {
+  "Content-Type": "application/x-amz-json-1.0",
+  "user-agent": KIRO_CLI_USER_AGENT,
+  "x-amz-user-agent": KIRO_CLI_X_AMZ_USER_AGENT,
+  "x-amzn-codewhisperer-optout": "true",
+  Accept: "*/*",
+  "accept-encoding": "gzip",
+  "amz-sdk-request": "attempt=1; max=3",
+  Pragma: "no-cache",
+  "Cache-Control": "no-cache",
+} as const;
+
+type KiroManagementTarget = typeof KIRO_MANAGEMENT_TARGET[keyof typeof KIRO_MANAGEMENT_TARGET];
+
+function kiroManagementHeaders(accessToken: string, target: KiroManagementTarget): Record<string, string> {
+  return {
+    Authorization: `Bearer ${accessToken}`,
+    ...KIRO_MANAGEMENT_BASE_HEADERS,
+    "X-Amz-Target": target,
+  };
+}
 
 /** Fields every Kiro model shares. Spread into each literal below. */
 const KIRO_DEFAULTS = {
@@ -96,6 +128,13 @@ export interface KiroModel {
   cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
   contextWindow: number;
   maxTokens: number;
+  /**
+   * Credit rate multiplier from the Kiro ListAvailableModels catalog
+   * (`rateMultiplier`). Used to annotate the display name so users see the
+   * relative credit cost of each model directly in the picker. Defaults to
+   * 1.0 when the upstream catalog omits it.
+   */
+  rateMultiplier?: number;
   /** Optional per-model override for the first-token timeout (ms). */
   firstTokenTimeout?: number;
   /** Per-model idle timeout override (ms). */
@@ -144,6 +183,22 @@ export const kiroModels: KiroModel[] = [
     input: MULTIMODAL,
     contextWindow: 1_000_000,
     maxTokens: 128_000,
+    // rateMultiplier intentionally omitted: fable-5 is disabled and absent
+    // from the account catalog, so we don't fabricate a credit multiplier.
+    firstTokenTimeout: 180_000,
+    idleTimeout: 180_000,
+    supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
+    supportsThinkingConfig: true,
+  },
+  {
+    ...KIRO_DEFAULTS,
+    id: "claude-sonnet-5",
+    name: "Claude Sonnet 5",
+    reasoning: true,
+    input: MULTIMODAL,
+    contextWindow: 1_000_000,
+    maxTokens: 64_000,
+    rateMultiplier: 1.3,
     firstTokenTimeout: 180_000,
     idleTimeout: 180_000,
     supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
@@ -157,6 +212,7 @@ export const kiroModels: KiroModel[] = [
     input: MULTIMODAL,
     contextWindow: 1_000_000,
     maxTokens: 128_000,
+    rateMultiplier: 2.2,
     firstTokenTimeout: 180_000,
     idleTimeout: 180_000,
     supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
@@ -170,6 +226,7 @@ export const kiroModels: KiroModel[] = [
     input: MULTIMODAL,
     contextWindow: 1_000_000,
     maxTokens: 128_000,
+    rateMultiplier: 2.2,
     firstTokenTimeout: 180_000,
     idleTimeout: 180_000,
     supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
@@ -183,6 +240,7 @@ export const kiroModels: KiroModel[] = [
     input: MULTIMODAL,
     contextWindow: 1_000_000,
     maxTokens: 64_000,
+    rateMultiplier: 2.2,
     supportedEfforts: ["low", "medium", "high", "max"],
     supportsThinkingConfig: true,
   },
@@ -194,6 +252,7 @@ export const kiroModels: KiroModel[] = [
     input: MULTIMODAL,
     contextWindow: 1_000_000,
     maxTokens: 64_000,
+    rateMultiplier: 1.3,
     supportedEfforts: ["low", "medium", "high", "max"],
     supportsThinkingConfig: true,
   },
@@ -205,6 +264,7 @@ export const kiroModels: KiroModel[] = [
     input: MULTIMODAL,
     contextWindow: 200_000,
     maxTokens: 64_000,
+    rateMultiplier: 2.2,
   },
   {
     ...KIRO_DEFAULTS,
@@ -214,6 +274,7 @@ export const kiroModels: KiroModel[] = [
     input: MULTIMODAL,
     contextWindow: 200_000,
     maxTokens: 64_000,
+    rateMultiplier: 1.3,
   },
   {
     ...KIRO_DEFAULTS,
@@ -223,6 +284,7 @@ export const kiroModels: KiroModel[] = [
     input: MULTIMODAL,
     contextWindow: 200_000,
     maxTokens: 64_000,
+    rateMultiplier: 1.3,
   },
   {
     ...KIRO_DEFAULTS,
@@ -232,6 +294,17 @@ export const kiroModels: KiroModel[] = [
     input: MULTIMODAL,
     contextWindow: 200_000,
     maxTokens: 64_000,
+    rateMultiplier: 0.4,
+  },
+  {
+    ...KIRO_DEFAULTS,
+    id: "deepseek-3-2",
+    name: "DeepSeek V3.2",
+    reasoning: true,
+    input: MULTIMODAL,
+    contextWindow: 164_000,
+    maxTokens: 64_000,
+    rateMultiplier: 0.25,
   },
   {
     ...KIRO_DEFAULTS,
@@ -241,6 +314,7 @@ export const kiroModels: KiroModel[] = [
     input: TEXT_ONLY,
     contextWindow: 196_000,
     maxTokens: 64_000,
+    rateMultiplier: 0.25,
   },
   {
     ...KIRO_DEFAULTS,
@@ -250,6 +324,17 @@ export const kiroModels: KiroModel[] = [
     input: MULTIMODAL,
     contextWindow: 196_000,
     maxTokens: 64_000,
+    rateMultiplier: 0.15,
+  },
+  {
+    ...KIRO_DEFAULTS,
+    id: "glm-5",
+    name: "GLM-5",
+    reasoning: true,
+    input: TEXT_ONLY,
+    contextWindow: 200_000,
+    maxTokens: 64_000,
+    rateMultiplier: 0.5,
   },
   {
     ...KIRO_DEFAULTS,
@@ -259,6 +344,7 @@ export const kiroModels: KiroModel[] = [
     input: MULTIMODAL,
     contextWindow: 256_000,
     maxTokens: 64_000,
+    rateMultiplier: 0.05,
   },
   {
     ...KIRO_DEFAULTS,
@@ -268,14 +354,33 @@ export const kiroModels: KiroModel[] = [
     input: MULTIMODAL,
     contextWindow: 1_000_000,
     maxTokens: 64_000,
+    rateMultiplier: 1.0,
   },
 ];
+
+/**
+ * Format a model's display name with its credit rate multiplier appended,
+ * e.g. "Claude Opus 4.8 (2.2x)". Applied at the single display chokepoint
+ * (the OpenCode config hook) so BOTH paths are annotated:
+ *   - dynamic/endpoint models (name is the raw dotted id, e.g. "claude-opus-4.8")
+ *   - static/fallback models (name is the pretty label, e.g. "Claude Opus 4.8")
+ *
+ * When rateMultiplier is absent (e.g. the disabled fable-5) the name is
+ * returned unchanged — we never invent a multiplier.
+ */
+export function formatModelName(model: Pick<KiroModel, "name" | "rateMultiplier">): string {
+  const m = model.rateMultiplier;
+  if (typeof m !== "number" || !Number.isFinite(m)) return model.name;
+  return `${model.name} (${m}x)`;
+}
 
 // ---- Dynamic model resolution -----------------------------------------
 
 export interface KiroApiModel {
   modelId: string;
   modelName: string;
+  /** Credit rate multiplier from the ListAvailableModels catalog. */
+  rateMultiplier?: number;
   tokenLimits?: { maxInputTokens?: number; maxOutputTokens?: number };
   supportedInputTypes?: string[];
   /** Schema for extra fields accepted by GenerateAssistantResponse. */
@@ -314,12 +419,7 @@ export async function resolveProfileArn(
   const endpoint = `https://management.${apiRegion}.kiro.dev/`;
   const resp = await fetch(endpoint, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/x-amz-json-1.0",
-      "X-Amz-Target": "AmazonCodeWhispererService.ListAvailableProfiles",
-      "user-agent": "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererruntime/0.1.16551 os/macos lang/rust/1.92.0 md/appVersion-2.9.0 app/AmazonQ-For-CLI",
-    },
+    headers: kiroManagementHeaders(accessToken, KIRO_MANAGEMENT_TARGET.listAvailableProfiles),
     body: "{}",
   });
   if (!resp || !resp.ok) return null;
@@ -347,16 +447,13 @@ export async function fetchAvailableModels(
   apiRegion: string,
   profileArn: string,
 ): Promise<KiroApiModel[]> {
-  const url = `https://management.${apiRegion}.kiro.dev/?origin=KIRO_CLI&profileArn=${encodeURIComponent(profileArn)}`;
+  const url = `https://management.${apiRegion}.kiro.dev/?origin=${KIRO_CLI_ORIGIN}&profileArn=${encodeURIComponent(
+    profileArn,
+  )}`;
   const resp = await fetch(url, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/x-amz-json-1.0",
-      "X-Amz-Target": "AmazonCodeWhispererService.ListAvailableModels",
-      "user-agent": "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererruntime/0.1.16551 os/macos lang/rust/1.92.0 md/appVersion-2.9.0 app/AmazonQ-For-CLI",
-    },
-    body: "{}",
+    headers: kiroManagementHeaders(accessToken, KIRO_MANAGEMENT_TARGET.listAvailableModels),
+    body: JSON.stringify({ origin: KIRO_CLI_ORIGIN, profileArn }),
   });
   if (!resp.ok) {
     throw new Error(`ListAvailableModels failed: HTTP ${resp.status}`);
@@ -413,6 +510,11 @@ export function buildModelsFromApi(apiModels: KiroApiModel[]): KiroModel[] {
 
     const supportsThinkingConfig = !!m.additionalModelRequestFieldsSchema?.properties?.thinking;
 
+    const rateMultiplier =
+      typeof m.rateMultiplier === "number" && Number.isFinite(m.rateMultiplier)
+        ? m.rateMultiplier
+        : undefined;
+
     return {
       ...KIRO_DEFAULTS,
       id: dashId,
@@ -424,6 +526,7 @@ export function buildModelsFromApi(apiModels: KiroApiModel[]): KiroModel[] {
       firstTokenTimeout: modelTimeout(m.modelId, 90_000),
       idleTimeout: modelTimeout(m.modelId, 60_000),
       // Per-model overrides for known special cases
+      ...(rateMultiplier !== undefined ? { rateMultiplier } : {}),
       ...(supportedEfforts ? { supportedEfforts } : {}),
       ...(supportsThinkingConfig ? { supportsThinkingConfig } : {}),
     };

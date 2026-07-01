@@ -21,6 +21,9 @@ const MODEL_PRICING: Record<string, TokenPrice> = {
   // Claude Fable 5 (Exempt from cleanup)
   "claude-fable-5": { input: 10.00, output: 50.00 },
 
+  // Claude Sonnet 5 Series
+  "claude-sonnet-5": { input: 3.00, output: 15.00 },
+
   // Claude Opus 4 Series
   "claude-opus-4-8": { input: 5.00, output: 25.00 },
   "claude-opus-4-7": { input: 5.00, output: 25.00 },
@@ -36,8 +39,10 @@ const MODEL_PRICING: Record<string, TokenPrice> = {
   "claude-haiku-4-5": { input: 1.00, output: 5.00 },
 
   // Other active models
+  "deepseek-3-2": { input: 0.28, output: 0.42 },
   "minimax-m2-5": { input: 0.15, output: 1.20 },
   "minimax-m2-1": { input: 0.30, output: 1.20 },
+  "glm-5": { input: 0.60, output: 2.00 },
   "qwen3-coder-next": { input: 0.30, output: 1.00 },
   "auto": { input: 3.00, output: 15.00 },
 };

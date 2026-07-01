@@ -28,7 +28,8 @@ import {
   resolveProfileArn,
   buildModelsFromApi,
   resolveApiRegion,
-  setCachedDynamicModels
+  setCachedDynamicModels,
+  formatModelName
 } from "./models";
 
 // Global server instance to manage lifecycle across reloads
@@ -437,7 +438,7 @@ export const KiroPlugin: Plugin = async (input) => {
         if (kiro.models[m.id]) continue; // don't overwrite user customizations
         kiro.models[m.id] = {
           id: m.id,
-          name: m.name,
+          name: formatModelName(m),
           reasoning: m.reasoning,
           temperature: true,
           tool_call: true,
