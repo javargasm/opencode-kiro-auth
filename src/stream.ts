@@ -999,10 +999,9 @@ export function streamKiro(
           }
 
           const { done, value } = readResult;
-          if (done) break;
-          const decoded = decoder.decode(value, { stream: true });
+          const decoded = done ? decoder.decode() : decoder.decode(value, { stream: true });
           buffer += decoded;
-          if (log.isDebug()) {
+          if (!done && log.isDebug()) {
             log.debug("stream.chunk", {
               seq: chunkSeq++,
               bytes: value?.byteLength ?? 0,
@@ -1177,6 +1176,7 @@ export function streamKiro(
             }
             if (streamError) break;
           }
+          if (done) break;
         }
 
         if (idleTimer) clearTimeout(idleTimer);
@@ -1234,11 +1234,12 @@ export function streamKiro(
               `Kiro API error: ${firstTokenTimedOut ? "first token" : "idle"} timeout after max retries`,
             );
           }
-          // Timeout AFTER partial output: finalize gracefully with what we have
-          // instead of duplicating via a reset+retry. Fall through to finalize.
-          log.info(
-            `stream ${firstTokenTimedOut ? "first-token" : "idle"} timeout after partial output — finalizing with partial content`,
-          );
+          if (idleCancelled) {
+            throw new Error("Kiro API idle timeout after partial output");
+          }
+          // Preserve the existing first-token fallback. In practice this path
+          // cannot have streamed output because the first read never completed.
+          log.info("stream first-token timeout after partial output — finalizing with partial content");
         }
 
         // Stream ended cleanly. Cancel the deferred shim — either

@@ -3,6 +3,7 @@ import {
   buildModelsFromApi,
   fetchAvailableModels,
   formatModelName,
+  kiroModels,
   resetProfileArnCache,
   resolveApiRegion,
   resolveProfileArn,
@@ -57,8 +58,9 @@ describe("Kiro model catalog", () => {
       contextWindow: 1_000_000,
       maxTokens: 64_000,
     });
-    expect(formatModelName(model!)).toBe("claude-sonnet-5 (1.3x)");
-    expect(formatModelName({ name: "Claude Fable 5 (disabled)" })).toBe("Claude Fable 5 (disabled)");
+    // formatModelName resolves the pretty name from kiroModels by id
+    expect(formatModelName(model!)).toBe("Claude Sonnet 5 (1.3x)");
+    expect(formatModelName({ id: "claude-fable-5", name: "claude-fable-5" })).toBe("Claude Fable 5 (disabled)");
   });
 
   it("preserves native GPT and Claude catalog effort metadata", () => {
@@ -146,6 +148,39 @@ describe("Kiro model catalog", () => {
       supportsThinkingConfig: true,
       supportsMaxTokens: true,
     });
+  });
+
+  it("formatModelName resolves pretty name from kiroModels by id", () => {
+    // Dynamic catalog model with raw dotted name → resolved to static pretty name
+    const dynamic = buildModelsFromApi([
+      { modelId: "gpt-5.6-sol", modelName: "gpt-5.6-sol", rateMultiplier: 2.4 },
+    ]);
+    expect(formatModelName(dynamic[0]!)).toBe("GPT 5.6 Sol (2.4x)");
+
+    // Unknown model id falls back to the passed name
+    expect(formatModelName({ id: "unknown-model", name: "Unknown", rateMultiplier: 1.0 })).toBe("Unknown (1x)");
+
+    // No rateMultiplier returns just the resolved name
+    expect(formatModelName({ id: "claude-sonnet-4", name: "claude-sonnet-4" })).toBe("Claude Sonnet 4");
+  });
+
+  it("includes GPT 5.6 variants in static kiroModels", () => {
+    const gptIds = ["gpt-5-6-sol", "gpt-5-6-terra", "gpt-5-6-luna"];
+    for (const id of gptIds) {
+      const model = kiroModels.find((m) => m.id === id);
+      expect(model, `${id} should exist in kiroModels`).toBeDefined();
+      expect(model!.reasoning).toBe(true);
+      expect(model!.contextWindow).toBe(272_000);
+      expect(model!.maxTokens).toBe(128_000);
+      expect(model!.effortRequestField).toBe("reasoning");
+      expect(model!.nativeEfforts).toContain("none");
+      expect(model!.nativeEfforts).toContain("max");
+    }
+
+    // Verify specific rate multipliers
+    expect(kiroModels.find((m) => m.id === "gpt-5-6-sol")!.rateMultiplier).toBe(2.4);
+    expect(kiroModels.find((m) => m.id === "gpt-5-6-terra")!.rateMultiplier).toBe(1.2);
+    expect(kiroModels.find((m) => m.id === "gpt-5-6-luna")!.rateMultiplier).toBe(0.6);
   });
 });
 

@@ -71,6 +71,25 @@ describe("parseKiroEvents — full stream ordering (usage before metering)", () 
   });
 });
 
+describe("parseKiroEvents — partial event prefixes", () => {
+  const prefix = '{"content":';
+  const frame = '{"content":"complete"}';
+
+  it.each(Array.from({ length: prefix.length - 1 }, (_, index) => index + 1))(
+    "retains a content prefix split at boundary %i",
+    (splitAt) => {
+      const first = parseKiroEvents(`\x00\x01aws-framing\x7f${frame.slice(0, splitAt)}`);
+
+      expect(first.events).toEqual([]);
+      expect(first.remaining).toBe(prefix.slice(0, splitAt));
+
+      const second = parseKiroEvents(first.remaining + frame.slice(splitAt));
+      expect(second.remaining).toBe("");
+      expect(second.events).toEqual([{ type: "content", data: "complete" }]);
+    },
+  );
+});
+
 describe("redacted reasoning events", () => {
   it("preserves opaque redacted content without turning it into text", () => {
     const opaque = "c2Vuc2l0aXZlLXJlZGFjdGVkLWNvbnRlbnQ=";

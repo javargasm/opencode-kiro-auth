@@ -21,6 +21,9 @@ export const KIRO_MODEL_IDS = new Set<string>([
   "claude-sonnet-4",
   "claude-haiku-4.5",
   "deepseek-3.2",
+  "gpt-5.6-sol",
+  "gpt-5.6-terra",
+  "gpt-5.6-luna",
   "minimax-m2.5",
   "minimax-m2.1",
   "glm-5",
@@ -332,6 +335,51 @@ export const kiroModels: KiroModel[] = [
   },
   {
     ...KIRO_DEFAULTS,
+    id: "gpt-5-6-sol",
+    name: "GPT 5.6 Sol",
+    reasoning: true,
+    input: MULTIMODAL,
+    contextWindow: 272_000,
+    maxTokens: 128_000,
+    rateMultiplier: 2.4,
+    firstTokenTimeout: 230_000,
+    idleTimeout: 230_000,
+    nativeEfforts: ["none", "low", "medium", "high", "xhigh", "max"],
+    supportedEfforts: ["minimal", "low", "medium", "high", "xhigh"],
+    effortRequestField: "reasoning",
+  },
+  {
+    ...KIRO_DEFAULTS,
+    id: "gpt-5-6-terra",
+    name: "GPT 5.6 Terra",
+    reasoning: true,
+    input: MULTIMODAL,
+    contextWindow: 272_000,
+    maxTokens: 128_000,
+    rateMultiplier: 1.2,
+    firstTokenTimeout: 230_000,
+    idleTimeout: 230_000,
+    nativeEfforts: ["none", "low", "medium", "high", "xhigh", "max"],
+    supportedEfforts: ["minimal", "low", "medium", "high", "xhigh"],
+    effortRequestField: "reasoning",
+  },
+  {
+    ...KIRO_DEFAULTS,
+    id: "gpt-5-6-luna",
+    name: "GPT 5.6 Luna",
+    reasoning: true,
+    input: MULTIMODAL,
+    contextWindow: 272_000,
+    maxTokens: 128_000,
+    rateMultiplier: 0.6,
+    firstTokenTimeout: 230_000,
+    idleTimeout: 230_000,
+    nativeEfforts: ["none", "low", "medium", "high", "xhigh", "max"],
+    supportedEfforts: ["minimal", "low", "medium", "high", "xhigh"],
+    effortRequestField: "reasoning",
+  },
+  {
+    ...KIRO_DEFAULTS,
     id: "minimax-m2-5",
     name: "MiniMax M2.5",
     reasoning: false,
@@ -392,10 +440,12 @@ export const kiroModels: KiroModel[] = [
  * When rateMultiplier is absent (e.g. the disabled fable-5) the name is
  * returned unchanged — we never invent a multiplier.
  */
-export function formatModelName(model: Pick<KiroModel, "name" | "rateMultiplier">): string {
-  const m = model.rateMultiplier;
-  if (typeof m !== "number" || !Number.isFinite(m)) return model.name;
-  return `${model.name} (${m}x)`;
+export function formatModelName(model: Pick<KiroModel, "id" | "name" | "rateMultiplier">): string {
+  const staticModel = kiroModels.find((m) => m.id === model.id);
+  const name = staticModel?.name ?? model.name;
+  const rate = model.rateMultiplier;
+  if (typeof rate !== "number" || !Number.isFinite(rate)) return name;
+  return `${name} (${rate}x)`;
 }
 
 // ---- Dynamic model resolution -----------------------------------------
@@ -574,7 +624,7 @@ export async function fetchAvailableModels(
 /** Model families known to support reasoning/thinking. */
 const REASONING_FAMILIES = new Set([
   "claude-fable", "claude-sonnet", "claude-opus",
-  "deepseek", "kimi", "glm", "qwen", "agi-nova", "minimax"
+  "deepseek", "kimi", "glm", "qwen", "agi-nova", "minimax", "gpt"
 ]);
 
 function isReasoningModel(dotId: string): boolean {

@@ -7,7 +7,13 @@ import type {
   ToolResultMessage,
 } from "../src/types";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { streamKiro, firstTokenTimeoutForModel, regionFromEndpoint, resolveConversationId } from "../src/stream";
+import {
+  streamKiro,
+  firstTokenTimeoutForModel,
+  idleTimeoutForModel,
+  regionFromEndpoint,
+  resolveConversationId,
+} from "../src/stream";
 import { buildHistory, convertToolResultContent, convertToolsToKiro } from "../src/transform";
 import type { Tool } from "../src/types";
 import { AssistantMessageEventStream } from "../src/types";
@@ -60,19 +66,26 @@ async function collect(
   return events;
 }
 
-function mockFetchOk(body: string) {
+function mockFetchChunks(chunks: string[]) {
+  let index = 0;
+  const encoder = new TextEncoder();
   return vi.fn().mockResolvedValueOnce({
     ok: true,
     body: {
       getReader: () => ({
-        read: vi
-          .fn()
-          .mockResolvedValueOnce({ done: false, value: new TextEncoder().encode(body) })
-          .mockResolvedValueOnce({ done: true, value: undefined }),
+        read: vi.fn().mockImplementation(() =>
+          index < chunks.length
+            ? Promise.resolve({ done: false, value: encoder.encode(chunks[index++]!) })
+            : Promise.resolve({ done: true, value: undefined }),
+        ),
         cancel: vi.fn().mockResolvedValue(undefined),
       }),
     },
   });
+}
+
+function mockFetchOk(body: string) {
+  return mockFetchChunks([body]);
 }
 
 describe("streamKiro", () => {
@@ -306,6 +319,33 @@ describe("streamKiro", () => {
     }
   });
 
+  it("preserves assistant text when every content frame prefix is split", async () => {
+    const content = ["Every ", "frame ", "survives."];
+    const prefix = '{"content":';
+    const chunks = content.flatMap((text, index) => {
+      const frame = JSON.stringify({ content: text });
+      const splitAt = ((index * 4) % (prefix.length - 1)) + 1;
+      return [
+        `:event-type assistantResponseEvent:content-type application/json:message-type event${frame.slice(0, splitAt)}`,
+        frame.slice(splitAt),
+      ];
+    });
+    chunks.push('{"contextUsagePercentage":10}');
+    vi.spyOn(globalThis, "fetch").mockImplementation(mockFetchChunks(chunks));
+
+    const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+    const done = events.find((event) => event.type === "done");
+    expect(done?.type).toBe("done");
+    if (done?.type === "done") {
+      const text = done.message.content
+        .filter((block) => block.type === "text")
+        .map((block) => block.text)
+        .join("");
+      expect(text).toBe(content.join(""));
+      expect(text).not.toBe("");
+    }
+  });
+
   it("emits toolUse stopReason when tool called", async () => {
     const toolPayload = '{"name":"bash","toolUseId":"t1","input":"{\\"cmd\\":\\"ls\\"}","stop":true}';
     vi.spyOn(globalThis, "fetch").mockImplementation(mockFetchOk(`${toolPayload}{"contextUsagePercentage":20}`));
@@ -463,6 +503,55 @@ describe("streamKiro", () => {
     expect(err?.type).toBe("error");
     if (err?.type === "error") {
       expect(err.error.errorMessage).toContain("after partial output");
+    }
+  });
+
+  it("emits a terminal error when idle cancellation follows partial text and a complete tool call", async () => {
+    vi.useFakeTimers();
+    try {
+      let resolveHangingRead!: (result: { done: true; value: undefined }) => void;
+      const hangingRead = new Promise<{ done: true; value: undefined }>((resolve) => {
+        resolveHangingRead = resolve;
+      });
+      const read = vi.fn()
+        .mockResolvedValueOnce({
+          done: false,
+          value: new TextEncoder().encode(
+            '{"content":"Partial"}' +
+              '{"name":"bash","toolUseId":"t1","input":"{\\"cmd\\":\\"ls\\"}","stop":true}',
+          ),
+        })
+        .mockReturnValueOnce(hangingRead);
+      const cancel = vi.fn().mockImplementation(() => {
+        resolveHangingRead({ done: true, value: undefined });
+        return Promise.resolve();
+      });
+      const fetchMock = vi.fn().mockResolvedValueOnce({
+        ok: true,
+        body: { getReader: () => ({ read, cancel }) },
+      });
+      vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
+      const model = makeModel();
+
+      const pendingEvents = collect(streamKiro(model, makeContext(), { apiKey: "tok" }));
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(idleTimeoutForModel(model.id));
+      const events = await pendingEvents;
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(cancel).toHaveBeenCalledTimes(1);
+      expect(events.some((e) => e.type === "text_delta" && e.delta === "Partial")).toBe(true);
+      expect(events.some((e) => e.type === "toolcall_end")).toBe(true);
+      expect(events.find((e) => e.type === "done")).toBeUndefined();
+      const terminal = events[events.length - 1];
+      expect(terminal?.type).toBe("error");
+      if (terminal?.type === "error") {
+        expect(terminal.error.errorMessage).toContain("idle timeout");
+        expect(terminal.error.errorMessage).toContain("after partial output");
+        expect(terminal.error.stopReason).toBe("error");
+      }
+    } finally {
+      vi.useRealTimers();
     }
   });
 

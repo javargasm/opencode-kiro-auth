@@ -1139,6 +1139,8 @@ describe("Gateway bug fixes (#2, #3, #7, #13)", () => {
     const text = await resp.text();
     expect(text).toContain("event: error");
     expect(text).toContain("midstream boom");
+    expect(text).not.toContain("event: message_delta");
+    expect(text).not.toContain("event: message_stop");
     await server.stop(true);
   });
 

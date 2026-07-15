@@ -242,6 +242,20 @@ function findNextEventStart(buffer: string, from: number): number {
   return earliest;
 }
 
+function findTrailingEventPrefix(buffer: string, from: number): string {
+  const maxLength = Math.min(
+    buffer.length - from,
+    EVENT_PATTERNS.reduce((max, pattern) => Math.max(max, pattern.length - 1), 0),
+  );
+  for (let length = maxLength; length > 0; length--) {
+    const suffix = buffer.substring(buffer.length - length);
+    if (EVENT_PATTERNS.some((pattern) => pattern.length > length && pattern.startsWith(suffix))) {
+      return suffix;
+    }
+  }
+  return "";
+}
+
 /**
  * AWS Event Stream (application/vnd.amazon.eventstream) frames an exception as
  * a message whose type lives in the `:exception-type` header (with
@@ -290,6 +304,7 @@ export function parseKiroEvents(
   while (pos < buffer.length) {
     const jsonStart = findNextEventStart(buffer, pos);
     if (jsonStart < 0) {
+      remaining = findTrailingEventPrefix(buffer, pos);
       // No known event prefix in the remainder. If there are brace-opens
       // sitting in the gap, surface them — that's where an unrecognized
       // top-level key would live.
