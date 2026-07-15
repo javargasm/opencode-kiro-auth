@@ -702,7 +702,7 @@ export function streamKiro(
         let contextTruncationAttempt = 0;
         while (true) {
           const osName = resolveOS();
-          const ua = `aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17975 os/${osName} lang/rust/1.92.0 md/appVersion-2.12.1 app/AmazonQ-For-CLI`;
+          const ua = `aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17975 os/${osName} lang/rust/1.92.0 md/appVersion-2.12.2 app/AmazonQ-For-CLI`;
           const xAmzUa = `aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17975 os/${osName} lang/rust/1.92.0 m/F app/AmazonQ-For-CLI`;
           const requestBody = JSON.stringify(request);
 
