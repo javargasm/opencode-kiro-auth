@@ -4,6 +4,8 @@
 // Keeping them local eliminates the external dependency and makes the plugin
 // fully self-contained for the OpenCode plugin ecosystem.
 
+import type { KiroModel } from "./models";
+
 // ---- Content block types -----------------------------------------------
 
 export interface TextContent {
@@ -16,6 +18,8 @@ export interface ThinkingContent {
   type: "thinking";
   thinking: string;
   thinkingSignature?: string;
+  /** Opaque provider payload used to replay redacted reasoning. */
+  redactedContent?: string;
   /** When true, the thinking content was redacted by safety filters. */
   redacted?: boolean;
 }
@@ -95,6 +99,9 @@ export type Api = string;
 
 export type ThinkingLevel = "minimal" | "low" | "medium" | "high" | "xhigh";
 
+/** Exact effort labels accepted by the Kiro catalog request schemas. */
+export type KiroNativeEffort = "none" | "low" | "medium" | "high" | "xhigh" | "max";
+
 export interface Model<TApi extends Api> {
   id: string;
   name: string;
@@ -132,6 +139,12 @@ export interface SimpleStreamOptions {
   signal?: AbortSignal;
   apiKey?: string;
   sessionId?: string;
+  /** Absolute workspace path supplied by the OpenCode process for this request. */
+  workingDirectory?: string;
+  /** Account-specific profile supplied by the attaching OpenCode process. */
+  profileArn?: string;
+  /** Disable the process-wide profile cache for request-scoped bearer credentials. */
+  cacheProfileArn?: boolean;
   /**
    * Stable identifier used to group all file-log entries (requests,
    * responses, errors) for one session into a single
@@ -139,6 +152,10 @@ export interface SimpleStreamOptions {
    * request. Falls back to `sessionId` when omitted.
    */
   logSessionId?: string;
+  /** Request-scoped catalog metadata that must not fall back to another account. */
+  modelMetadata?: KiroModel;
+  /** A catalog-validated effort label; never normalize this value. */
+  nativeEffort?: KiroNativeEffort;
   reasoning?: ThinkingLevel;
   headers?: Record<string, string>;
 }
@@ -152,6 +169,7 @@ export type AssistantMessageEvent =
   | { type: "text_end"; contentIndex: number; content: string; partial: AssistantMessage }
   | { type: "thinking_start"; contentIndex: number; partial: AssistantMessage }
   | { type: "thinking_delta"; contentIndex: number; delta: string; partial: AssistantMessage }
+  | { type: "thinking_signature"; contentIndex: number; signature: string; partial: AssistantMessage }
   | { type: "thinking_end"; contentIndex: number; content: string; partial: AssistantMessage }
   | { type: "toolcall_start"; contentIndex: number; partial: AssistantMessage }
   | { type: "toolcall_delta"; contentIndex: number; delta: string; partial: AssistantMessage }

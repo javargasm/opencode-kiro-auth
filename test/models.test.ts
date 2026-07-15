@@ -4,8 +4,10 @@ import {
   fetchAvailableModels,
   formatModelName,
   resetProfileArnCache,
+  resolveApiRegion,
   resolveProfileArn,
 } from "../src/models";
+import { log } from "../src/debug";
 
 interface MockRespOpts {
   ok?: boolean;
@@ -31,6 +33,11 @@ afterEach(() => {
 });
 
 describe("Kiro model catalog", () => {
+  it("maps unsupported or malformed regions to a trusted Kiro API region", () => {
+    expect(resolveApiRegion("eu-west-1")).toBe("eu-central-1");
+    expect(resolveApiRegion("evil.example/#")).toBe("us-east-1");
+  });
+
   it("keeps API rate multipliers and formats model names for display", () => {
     const [model] = buildModelsFromApi([
       {
@@ -52,6 +59,93 @@ describe("Kiro model catalog", () => {
     });
     expect(formatModelName(model!)).toBe("claude-sonnet-5 (1.3x)");
     expect(formatModelName({ name: "Claude Fable 5 (disabled)" })).toBe("Claude Fable 5 (disabled)");
+  });
+
+  it("preserves native GPT and Claude catalog effort metadata", () => {
+    const gptEfforts = ["none", "low", "medium", "high", "xhigh", "max"];
+    const [sol, terra, luna, claude] = buildModelsFromApi([
+      {
+        modelId: "gpt-5.6-sol",
+        modelName: "GPT 5.6 Sol",
+        rateMultiplier: 1.5,
+        supportedInputTypes: ["TEXT"],
+        tokenLimits: { maxInputTokens: 128_000, maxOutputTokens: 32_000 },
+        additionalModelRequestFieldsSchema: {
+          properties: {
+            reasoning: {
+              properties: {
+                effort: { enum: gptEfforts },
+                mode: { enum: ["enabled", "disabled"] },
+              },
+            },
+          },
+        },
+      },
+      {
+        modelId: "gpt-5.6-terra",
+        modelName: "GPT 5.6 Terra",
+        additionalModelRequestFieldsSchema: {
+          properties: { reasoning: { properties: { effort: { enum: gptEfforts } } } },
+        },
+      },
+      {
+        modelId: "gpt-5.6-luna",
+        modelName: "GPT 5.6 Luna",
+        additionalModelRequestFieldsSchema: {
+          properties: { reasoning: { properties: { effort: { enum: gptEfforts } } } },
+        },
+      },
+      {
+        modelId: "claude-opus-4.7",
+        modelName: "Claude Opus 4.7",
+        rateMultiplier: 2,
+        supportedInputTypes: ["TEXT", "IMAGE"],
+        tokenLimits: { maxInputTokens: 200_000, maxOutputTokens: 64_000 },
+        additionalModelRequestFieldsSchema: {
+          properties: {
+            output_config: { properties: { effort: { enum: ["low", "medium", "high", "max"] } } },
+            thinking: { properties: { type: { enum: ["adaptive"] } } },
+            max_tokens: { type: "integer" },
+          },
+        },
+      },
+    ]);
+
+    expect(sol).toMatchObject({
+      id: "gpt-5-6-sol",
+      name: "GPT 5.6 Sol",
+      input: ["text"],
+      contextWindow: 128_000,
+      maxTokens: 32_000,
+      rateMultiplier: 1.5,
+      reasoning: true,
+      nativeEfforts: gptEfforts,
+      supportedEfforts: ["minimal", "low", "medium", "high", "xhigh"],
+      effortRequestField: "reasoning",
+    });
+    expect(sol?.supportsMaxTokens).toBeUndefined();
+    for (const gpt of [terra, luna]) {
+      expect(gpt).toMatchObject({
+        nativeEfforts: gptEfforts,
+        supportedEfforts: ["minimal", "low", "medium", "high", "xhigh"],
+        effortRequestField: "reasoning",
+      });
+      expect(gpt?.supportsMaxTokens).toBeUndefined();
+    }
+    expect(claude).toMatchObject({
+      id: "claude-opus-4-7",
+      name: "Claude Opus 4.7",
+      input: ["text", "image"],
+      contextWindow: 200_000,
+      maxTokens: 64_000,
+      rateMultiplier: 2,
+      reasoning: true,
+      nativeEfforts: ["low", "medium", "high", "max"],
+      supportedEfforts: ["minimal", "low", "medium", "xhigh"],
+      effortRequestField: "output_config",
+      supportsThinkingConfig: true,
+      supportsMaxTokens: true,
+    });
   });
 });
 
@@ -85,12 +179,47 @@ describe("Kiro management API requests", () => {
     expect(headers.Authorization).toBe("Bearer access-token");
     expect(headers["Content-Type"]).toBe("application/x-amz-json-1.0");
     expect(headers["X-Amz-Target"]).toBe("AmazonCodeWhispererService.ListAvailableModels");
-    expect(headers["user-agent"]).toContain("md/appVersion-2.10.0 app/AmazonQ-For-CLI");
+    expect(headers["user-agent"]).toContain("md/appVersion-2.12.1 app/AmazonQ-For-CLI");
     expect(headers["x-amz-user-agent"]).toContain("m/F,C");
     expect(headers["x-amzn-codewhisperer-optout"]).toBe("true");
     expect(headers["amz-sdk-request"]).toBe("attempt=1; max=3");
     expect(headers.Pragma).toBe("no-cache");
     expect(headers["Cache-Control"]).toBe("no-cache");
+  });
+
+  it("logs the model catalog exchange without credentials or the profile ARN", async () => {
+    const debugSpy = vi.spyOn(log, "debug");
+    const errorSpy = vi.spyOn(log, "error");
+    spyFetch().mockResolvedValueOnce(
+      mockResp({
+        json: {
+          models: [
+            { modelId: "auto", modelName: "auto" },
+            { modelId: "claude-sonnet-5", modelName: "claude-sonnet-5" },
+          ],
+        },
+      }),
+    );
+
+    const accessToken = "secret-access-token";
+    const profileArn = "arn:aws:codewhisperer:us-east-1:123456789012:profile/SECRET";
+    await fetchAvailableModels(accessToken, "us-east-1", profileArn);
+
+    expect(debugSpy).toHaveBeenCalledWith("model_catalog_request", expect.any(Object));
+    expect(debugSpy).toHaveBeenCalledWith("model_catalog_response", expect.objectContaining({
+      status: 200,
+      modelCount: 2,
+      returnedModelCount: 1,
+    }));
+    expect(errorSpy).not.toHaveBeenCalled();
+
+    const logged = JSON.stringify(debugSpy.mock.calls);
+    expect(logged).toContain("model_catalog_request");
+    expect(logged).toContain("model_catalog_response");
+    expect(logged).not.toContain("claude-sonnet-5");
+    expect(logged).toContain("[redacted]");
+    expect(logged).not.toContain(accessToken);
+    expect(logged).not.toContain(profileArn);
   });
 
   it("resolveProfileArn uses the method-specific ListAvailableProfiles target", async () => {
@@ -119,6 +248,6 @@ describe("Kiro management API requests", () => {
 
     const headers = init?.headers as Record<string, string>;
     expect(headers["X-Amz-Target"]).toBe("AmazonCodeWhispererService.ListAvailableProfiles");
-    expect(headers["user-agent"]).toContain("md/appVersion-2.10.0 app/AmazonQ-For-CLI");
+    expect(headers["user-agent"]).toContain("md/appVersion-2.12.1 app/AmazonQ-For-CLI");
   });
 });

@@ -5,6 +5,9 @@
 // API (e.g. "claude-sonnet-4.6"). Everything in this file is in the pi/dash
 // form except KIRO_MODEL_IDS and the output of resolveKiroModel.
 
+import { log } from "./debug";
+import type { KiroNativeEffort, ThinkingLevel } from "./types";
+
 /** Canonical Kiro API IDs (dot form) accepted by the server. */
 export const KIRO_MODEL_IDS = new Set<string>([
   "claude-fable-5",
@@ -70,14 +73,15 @@ const API_REGION_MAP: Record<string, string> = {
 
 export function resolveApiRegion(ssoRegion: string | undefined): string {
   if (!ssoRegion) return "us-east-1";
-  return API_REGION_MAP[ssoRegion] ?? ssoRegion;
+  if (ssoRegion === "us-east-1" || ssoRegion === "eu-central-1") return ssoRegion;
+  return API_REGION_MAP[ssoRegion] ?? "us-east-1";
 }
 
 const BASE_URL = "https://runtime.us-east-1.kiro.dev";
 const ZERO_COST = Object.freeze({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
 const KIRO_CLI_ORIGIN = "KIRO_CLI";
 const KIRO_CLI_USER_AGENT =
-  "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererruntime/0.1.17593 os/macos lang/rust/1.92.0 md/appVersion-2.10.0 app/AmazonQ-For-CLI";
+  "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererruntime/0.1.17593 os/macos lang/rust/1.92.0 md/appVersion-2.12.1 app/AmazonQ-For-CLI";
 const KIRO_CLI_X_AMZ_USER_AGENT = `${KIRO_CLI_USER_AGENT} m/F,C`;
 const KIRO_MANAGEMENT_TARGET = {
   listAvailableProfiles: "AmazonCodeWhispererService.ListAvailableProfiles",
@@ -94,6 +98,19 @@ const KIRO_MANAGEMENT_BASE_HEADERS = {
   Pragma: "no-cache",
   "Cache-Control": "no-cache",
 } as const;
+
+const REDACTED_PROFILE_ARN = "[redacted]";
+
+function redactProfileArn(value: string): string {
+  return value ? REDACTED_PROFILE_ARN : value;
+}
+
+function redactCatalogError(error: unknown, accessToken: string, profileArn: string): string {
+  let message = error instanceof Error ? error.message : String(error);
+  if (accessToken) message = message.replaceAll(accessToken, REDACTED_PROFILE_ARN);
+  if (profileArn) message = message.replaceAll(profileArn, REDACTED_PROFILE_ARN);
+  return message;
+}
 
 type KiroManagementTarget = typeof KIRO_MANAGEMENT_TARGET[keyof typeof KIRO_MANAGEMENT_TARGET];
 
@@ -163,13 +180,14 @@ export interface KiroModel {
    * See https://docs.anthropic.com/en/docs/build-with-claude/adaptive-thinking
    */
   reasoningHidden?: boolean;
-  /**
-   * Effort levels supported by this model for adaptive thinking.
-   * Sourced from `ListAvailableModels` → `additionalModelRequestFieldsSchema`.
-   * When present, the effort is sent via `additionalModelRequestFields.output_config.effort`
-   * in the GenerateAssistantResponse request body.
-   */
-  supportedEfforts?: string[];
+  /** Exact effort labels advertised by the Kiro catalog. */
+  nativeEfforts?: KiroNativeEffort[];
+  /** Normalized Pi levels retained for existing direct stream callers. */
+  supportedEfforts?: ThinkingLevel[];
+  /** Request field advertised by the catalog for effort overrides. */
+  effortRequestField?: "reasoning" | "output_config";
+  /** Whether the catalog advertises the top-level max_tokens field. */
+  supportsMaxTokens?: boolean;
   /** Whether the model supports `thinking` block configuration. */
   supportsThinkingConfig?: boolean;
 }
@@ -187,7 +205,8 @@ export const kiroModels: KiroModel[] = [
     // from the account catalog, so we don't fabricate a credit multiplier.
     firstTokenTimeout: 180_000,
     idleTimeout: 180_000,
-    supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
+    nativeEfforts: ["low", "medium", "high", "xhigh", "max"],
+    supportedEfforts: ["minimal", "low", "medium", "high", "xhigh"],
     supportsThinkingConfig: true,
   },
   {
@@ -201,7 +220,8 @@ export const kiroModels: KiroModel[] = [
     rateMultiplier: 1.3,
     firstTokenTimeout: 180_000,
     idleTimeout: 180_000,
-    supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
+    nativeEfforts: ["low", "medium", "high", "xhigh", "max"],
+    supportedEfforts: ["minimal", "low", "medium", "high", "xhigh"],
     supportsThinkingConfig: true,
   },
   {
@@ -215,7 +235,8 @@ export const kiroModels: KiroModel[] = [
     rateMultiplier: 2.2,
     firstTokenTimeout: 180_000,
     idleTimeout: 180_000,
-    supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
+    nativeEfforts: ["low", "medium", "high", "xhigh", "max"],
+    supportedEfforts: ["minimal", "low", "medium", "high", "xhigh"],
     supportsThinkingConfig: true,
   },
   {
@@ -229,7 +250,8 @@ export const kiroModels: KiroModel[] = [
     rateMultiplier: 2.2,
     firstTokenTimeout: 180_000,
     idleTimeout: 180_000,
-    supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
+    nativeEfforts: ["low", "medium", "high", "xhigh", "max"],
+    supportedEfforts: ["minimal", "low", "medium", "high", "xhigh"],
     supportsThinkingConfig: true,
   },
   {
@@ -241,7 +263,8 @@ export const kiroModels: KiroModel[] = [
     contextWindow: 1_000_000,
     maxTokens: 64_000,
     rateMultiplier: 2.2,
-    supportedEfforts: ["low", "medium", "high", "max"],
+    nativeEfforts: ["low", "medium", "high", "max"],
+    supportedEfforts: ["minimal", "low", "medium", "xhigh"],
     supportsThinkingConfig: true,
   },
   {
@@ -253,7 +276,8 @@ export const kiroModels: KiroModel[] = [
     contextWindow: 1_000_000,
     maxTokens: 64_000,
     rateMultiplier: 1.3,
-    supportedEfforts: ["low", "medium", "high", "max"],
+    nativeEfforts: ["low", "medium", "high", "max"],
+    supportedEfforts: ["minimal", "low", "medium", "xhigh"],
     supportsThinkingConfig: true,
   },
   {
@@ -387,9 +411,40 @@ export interface KiroApiModel {
   additionalModelRequestFieldsSchema?: {
     properties?: {
       output_config?: { properties?: { effort?: { enum?: string[] } } };
+      reasoning?: { properties?: { effort?: { enum?: string[] }; mode?: { enum?: string[] } } };
       thinking?: { properties?: { type?: { enum?: string[] } } };
+      max_tokens?: { type?: string };
     };
   };
+}
+
+const KIRO_TO_PI_EFFORT: Record<string, ThinkingLevel> = {
+  low: "minimal",
+  medium: "low",
+  high: "medium",
+  xhigh: "high",
+  max: "xhigh",
+};
+
+export const KIRO_NATIVE_EFFORTS = ["none", "low", "medium", "high", "xhigh", "max"] as const;
+
+export function isKiroNativeEffort(effort: unknown): effort is KiroNativeEffort {
+  return typeof effort === "string" && (KIRO_NATIVE_EFFORTS as readonly string[]).includes(effort);
+}
+
+function nativeSupportedEfforts(effortEnum: unknown): KiroNativeEffort[] | undefined {
+  if (!Array.isArray(effortEnum)) return undefined;
+  const nativeEfforts = effortEnum.filter(isKiroNativeEffort);
+  return nativeEfforts.length > 0 ? nativeEfforts : undefined;
+}
+
+function normalizeSupportedEfforts(nativeEfforts: KiroNativeEffort[] | undefined): ThinkingLevel[] | undefined {
+  if (!nativeEfforts) return undefined;
+  const normalized = nativeEfforts.flatMap((effort) => {
+    const level = KIRO_TO_PI_EFFORT[effort];
+    return level ? [level] : [];
+  });
+  return normalized.length > 0 ? [...new Set(normalized)] : undefined;
 }
 
 let cachedProfileArn: string | null = null;
@@ -412,15 +467,17 @@ export function seedProfileArn(arn: string): void {
 export async function resolveProfileArn(
   accessToken: string,
   apiRegion: string,
+  useCache = true,
 ): Promise<string | null> {
   if (profileArnSkipResolution) return null;
-  if (cachedProfileArn !== null) return cachedProfileArn;
+  if (useCache && cachedProfileArn !== null) return cachedProfileArn;
 
   const endpoint = `https://management.${apiRegion}.kiro.dev/`;
   const resp = await fetch(endpoint, {
     method: "POST",
     headers: kiroManagementHeaders(accessToken, KIRO_MANAGEMENT_TARGET.listAvailableProfiles),
     body: "{}",
+    signal: AbortSignal.timeout(10_000),
   });
   if (!resp || !resp.ok) return null;
 
@@ -431,7 +488,7 @@ export async function resolveProfileArn(
   const kiroProfile = profiles.find((p) => p.profileType === "KIRO" && p.status === "ACTIVE");
   const arn = kiroProfile?.arn ?? profiles[0]?.arn ?? null;
   
-  if (arn) {
+  if (arn && useCache) {
     cachedProfileArn = arn;
   }
   return arn;
@@ -450,16 +507,68 @@ export async function fetchAvailableModels(
   const url = `https://management.${apiRegion}.kiro.dev/?origin=${KIRO_CLI_ORIGIN}&profileArn=${encodeURIComponent(
     profileArn,
   )}`;
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: kiroManagementHeaders(accessToken, KIRO_MANAGEMENT_TARGET.listAvailableModels),
-    body: JSON.stringify({ origin: KIRO_CLI_ORIGIN, profileArn }),
-  });
-  if (!resp.ok) {
-    throw new Error(`ListAvailableModels failed: HTTP ${resp.status}`);
+  const target = KIRO_MANAGEMENT_TARGET.listAvailableModels;
+  const method = "POST";
+  const requestBody = { origin: KIRO_CLI_ORIGIN, profileArn: redactProfileArn(profileArn) };
+  const safeEndpoint = `https://management.${apiRegion}.kiro.dev/?origin=${KIRO_CLI_ORIGIN}&profileArn=${encodeURIComponent(
+    REDACTED_PROFILE_ARN,
+  )}`;
+  const logContext = {
+    method,
+    endpoint: safeEndpoint,
+    target,
+    profileArn: redactProfileArn(profileArn),
+  };
+  const logError = (error: unknown, status?: number) => {
+    log.error("model_catalog_error", {
+      ...logContext,
+      ...(status === undefined ? {} : { status }),
+      error: redactCatalogError(error, accessToken, profileArn),
+    });
+  };
+
+  log.debug("model_catalog_request", { ...logContext, request: requestBody });
+
+  let resp: Response;
+  try {
+    resp = await fetch(url, {
+      method,
+      headers: kiroManagementHeaders(accessToken, target),
+      body: JSON.stringify({ origin: KIRO_CLI_ORIGIN, profileArn }),
+      signal: AbortSignal.timeout(10_000),
+    });
+  } catch (error) {
+    logError(error);
+    throw error;
   }
-  const data = (await resp.json()) as { models?: KiroApiModel[] };
-  return (data.models ?? []).filter((m) => m.modelId !== "auto");
+
+  if (!resp.ok) {
+    const error = new Error(`ListAvailableModels failed: HTTP ${resp.status}`);
+    log.debug("model_catalog_response", {
+      ...logContext,
+      status: resp.status,
+      modelCount: 0,
+      modelCatalog: [],
+    });
+    logError(error, resp.status);
+    throw error;
+  }
+
+  try {
+    const data = (await resp.json()) as { models?: KiroApiModel[] };
+    const modelCatalog = data.models ?? [];
+    const models = modelCatalog.filter((m) => m.modelId !== "auto");
+    log.debug("model_catalog_response", {
+      ...logContext,
+      status: resp.status,
+      modelCount: modelCatalog.length,
+      returnedModelCount: models.length
+    });
+    return models;
+  } catch (error) {
+    logError(error, resp.status);
+    throw error;
+  }
 }
 
 /** Model families known to support reasoning/thinking. */
@@ -502,13 +611,20 @@ export function buildModelsFromApi(apiModels: KiroApiModel[]): KiroModel[] {
       : ["text"];
 
     // Extract supported effort levels from the model schema
-    const effortEnum = m.additionalModelRequestFieldsSchema
-      ?.properties?.output_config?.properties?.effort?.enum;
-    const supportedEfforts = Array.isArray(effortEnum) && effortEnum.length > 0
-      ? effortEnum
-      : undefined;
+    const schemaProperties = m.additionalModelRequestFieldsSchema?.properties;
+    const effortRequestField = schemaProperties?.reasoning?.properties?.effort?.enum
+      ? "reasoning"
+      : schemaProperties?.output_config?.properties?.effort?.enum
+        ? "output_config"
+        : undefined;
+    const effortEnum = effortRequestField === "reasoning"
+      ? schemaProperties?.reasoning?.properties?.effort?.enum
+      : schemaProperties?.output_config?.properties?.effort?.enum;
+    const nativeEfforts = nativeSupportedEfforts(effortEnum);
+    const supportedEfforts = normalizeSupportedEfforts(nativeEfforts);
 
     const supportsThinkingConfig = !!m.additionalModelRequestFieldsSchema?.properties?.thinking;
+    const supportsMaxTokens = !!schemaProperties?.max_tokens;
 
     const rateMultiplier =
       typeof m.rateMultiplier === "number" && Number.isFinite(m.rateMultiplier)
@@ -519,7 +635,7 @@ export function buildModelsFromApi(apiModels: KiroApiModel[]): KiroModel[] {
       ...KIRO_DEFAULTS,
       id: dashId,
       name: m.modelName,
-      reasoning: isReasoningModel(m.modelId),
+      reasoning: isReasoningModel(m.modelId) || Boolean(nativeEfforts?.length),
       input,
       contextWindow: m.tokenLimits?.maxInputTokens ?? 200_000,
       maxTokens: m.tokenLimits?.maxOutputTokens ?? 8_192,
@@ -527,7 +643,10 @@ export function buildModelsFromApi(apiModels: KiroApiModel[]): KiroModel[] {
       idleTimeout: modelTimeout(m.modelId, 60_000),
       // Per-model overrides for known special cases
       ...(rateMultiplier !== undefined ? { rateMultiplier } : {}),
+      ...(nativeEfforts ? { nativeEfforts } : {}),
       ...(supportedEfforts ? { supportedEfforts } : {}),
+      ...(effortRequestField ? { effortRequestField } : {}),
+      ...(supportsMaxTokens ? { supportsMaxTokens } : {}),
       ...(supportsThinkingConfig ? { supportsThinkingConfig } : {}),
     };
   });
@@ -541,5 +660,24 @@ export function getCachedDynamicModels(): KiroModel[] | null {
 }
 
 export function setCachedDynamicModels(models: KiroModel[] | null): void {
+  for (const model of models ?? []) {
+    KIRO_MODEL_IDS.add(model.id.replace(/(\d)-(\d)/g, "$1.$2"));
+  }
   cachedDynamicModels = models;
+}
+
+/** Use the active account catalog when it is loaded; static models are fallback-only. */
+export function findKiroModel(modelId: string): KiroModel | undefined {
+  const dynamicModels = getCachedDynamicModels();
+  return dynamicModels === null
+    ? kiroModels.find((model) => model.id === modelId)
+    : dynamicModels.find((model) => model.id === modelId);
+}
+
+/** Return an effort only when the selected catalog model explicitly advertises it. */
+export function validateNativeKiroEffort(
+  model: Pick<KiroModel, "nativeEfforts"> | undefined,
+  effort: unknown,
+): KiroNativeEffort | undefined {
+  return isKiroNativeEffort(effort) && model?.nativeEfforts?.includes(effort) ? effort : undefined;
 }

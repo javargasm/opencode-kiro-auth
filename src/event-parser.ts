@@ -13,7 +13,7 @@ export type KiroStreamEvent =
   | { type: "toolUseInput"; data: { input: string } }
   | { type: "toolUseStop"; data: { stop: boolean } }
   | { type: "contextUsage"; data: { contextUsagePercentage: number } }
-  | { type: "reasoning"; data: { text: string; signature?: string } }
+  | { type: "reasoning"; data: { text: string; signature?: string; redactedContent?: string } }
   | { type: "followupPrompt"; data: string }
   | { type: "usage"; data: { inputTokens?: number; outputTokens?: number } }
   | { type: "error"; data: { error: string; message?: string } }
@@ -57,7 +57,9 @@ export function parseKiroEventMulti(parsed: Record<string, unknown>): KiroStream
     events.push({ type: "content", data: parsed.content as string });
   }
 
-  if (parsed.reasoningContent !== undefined || parsed.reasoningText !== undefined || parsed.signature !== undefined || (parsed.text !== undefined && !parsed.content && !parsed.name && !parsed.message)) {
+  const redactedContent =
+    typeof parsed.redactedContent === "string" ? parsed.redactedContent : undefined;
+  if (parsed.reasoningContent !== undefined || parsed.reasoningText !== undefined || parsed.signature !== undefined || redactedContent !== undefined || (parsed.text !== undefined && !parsed.content && !parsed.name && !parsed.message)) {
     let text = "";
     let signature: string | undefined;
 
@@ -67,14 +69,18 @@ export function parseKiroEventMulti(parsed: Record<string, unknown>): KiroStream
       const rt = parsed.reasoningText as Record<string, unknown>;
       text = ((rt.text ?? rt.Text) || "") as string;
       signature = (rt.signature ?? rt.Signature) as string | undefined;
-    } else {
+    } else if (redactedContent === undefined) {
       text = (parsed.text as string) || "";
       signature = parsed.signature as string | undefined;
     }
 
     events.push({
       type: "reasoning",
-      data: { text, signature },
+      data: {
+        text,
+        signature,
+        ...(redactedContent !== undefined ? { redactedContent } : {}),
+      },
     });
   }
 
@@ -207,6 +213,7 @@ const EVENT_PATTERNS = [
   '{"content":',
   '{"reasoningText":',
   '{"reasoningContent":',
+  '{"redactedContent":',
   '{"metadata":',
   '{"metering":',
   '{"signature":',

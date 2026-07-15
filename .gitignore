@@ -33,3 +33,8 @@ logs/
 .atl/
 .codegraph/
 .opencode/
+
+# Local tooling artifacts
+graphify-out/
+.cursor/
+codegraph.json

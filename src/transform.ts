@@ -6,6 +6,7 @@
 // the padding used to cause echo-loop bugs downstream.
 
 import type {
+  AssistantMessage,
   ImageContent,
   Message,
   TextContent,
@@ -40,8 +41,12 @@ export interface KiroToolUse {
   input: Record<string, unknown>;
 }
 
+export type KiroToolResultContent =
+  | { text: string }
+  | { json: Record<string, unknown> };
+
 export interface KiroToolResult {
-  content: Array<{ text: string }>;
+  content: KiroToolResultContent[];
   status: "success" | "error";
   toolUseId: string;
 }
@@ -103,13 +108,16 @@ export interface KiroUserInputMessage {
 
 export interface KiroAssistantResponseMessage {
   content: string;
+  messageId?: string;
   toolUses?: KiroToolUse[];
-  reasoningContent?: {
-    reasoningText: {
-      text: string;
-      signature: string;
-    };
-  };
+  reasoningContent?:
+    | {
+        reasoningText: {
+          text: string;
+          signature: string;
+        };
+      }
+    | { redactedContent: string };
 }
 
 export interface KiroHistoryEntry {
@@ -132,6 +140,19 @@ export function truncate(text: string, limit: number): string {
   if (text.length <= limit) return text;
   const half = Math.floor(limit / 2);
   return `${text.substring(0, half)}\n... [TRUNCATED] ...\n${text.substring(text.length - half)}`;
+}
+
+/** Convert object output to Kiro JSON; arrays/scalars use bounded text. */
+export function convertToolResultContent(text: string): KiroToolResultContent {
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return { json: parsed as Record<string, unknown> };
+    }
+  } catch {
+    // Plain text and invalid JSON use the bounded text representation.
+  }
+  return { text: truncate(text, TOOL_RESULT_LIMIT) };
 }
 
 export function extractImages(msg: Message): ImageContent[] {
@@ -184,6 +205,24 @@ export function toKiroToolUseId(id: string): string {
   if (KIRO_TOOL_USE_ID_RE.test(id)) return id;
   const digest = createHash("sha256").update(id).digest("hex").slice(0, 22);
   return `tooluse_${digest}`;
+}
+
+const KIRO_MESSAGE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/** Resolve the UUID required by Kiro for replayed assistant reasoning. */
+export function resolveKiroAssistantMessageId(message: AssistantMessage): string {
+  const responseId = message.responseId?.trim();
+  const candidate = responseId?.startsWith("msg_") ? responseId.slice(4) : responseId;
+  if (candidate && KIRO_MESSAGE_ID_RE.test(candidate)) return candidate.toLowerCase();
+
+  const digest = createHash("sha256")
+    .update(`kiro-assistant-message\0${JSON.stringify(message.content)}`)
+    .digest();
+  const bytes = Buffer.from(digest.subarray(0, 16));
+  bytes[6] = (bytes[6]! & 0x0f) | 0x50;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
 }
 
 /**
@@ -354,20 +393,17 @@ export function buildHistory(
         content = `${systemPrompt}\n\n${content}`;
         systemPrepended = true;
       }
-      const images = extractImages(msg);
+      // Kiro accepts images only on currentMessage; replaying them in history
+      // returns IMAGE_FORMAT_UNSUPPORTED even when the bytes match the format.
       const uim: KiroUserInputMessage = {
         content,
         origin: "KIRO_CLI",
-        ...(images.length > 0 ? { images: convertImagesToKiro(images).images } : {}),
       };
 
       const prev = history[history.length - 1];
       if (prev?.userInputMessage) {
         // Merge into previous user message — Kiro alternates user/assistant.
         prev.userInputMessage.content += `\n\n${uim.content}`;
-        if (uim.images) {
-          prev.userInputMessage.images = [...(prev.userInputMessage.images ?? []), ...uim.images];
-        }
       } else {
         history.push({ userInputMessage: uim });
       }
@@ -378,6 +414,7 @@ export function buildHistory(
       let armContent = "";
       let armReasoningText = "";
       let armReasoningSignature = "";
+      let armRedactedContent: string | undefined;
       const armToolUses: KiroToolUse[] = [];
       if (Array.isArray(msg.content)) {
         for (const block of msg.content) {
@@ -389,7 +426,11 @@ export function buildHistory(
             // rejects replayed history with THINKING_SIGNATURE_INVALID when
             // the signature is missing or corrupted.
             const tb = block as ThinkingContent;
-            armReasoningText += tb.thinking;
+            if (tb.redactedContent !== undefined) {
+              armRedactedContent = tb.redactedContent;
+            } else if (!tb.redacted) {
+              armReasoningText += tb.thinking;
+            }
             if (tb.thinkingSignature) armReasoningSignature = tb.thinkingSignature;
           } else if (block.type === "toolCall") {
             const tc = block as ToolCall;
@@ -401,19 +442,21 @@ export function buildHistory(
           }
         }
       }
-      const hasReasoning = armReasoningText.length > 0;
+      const hasReasoning = armReasoningText.length > 0 || armRedactedContent !== undefined;
       if (!armContent && armToolUses.length === 0 && !hasReasoning) continue;
-      // Only include reasoningContent when we have a valid signature.
-      // Bedrock rejects empty/missing signatures with THINKING_SIGNATURE_INVALID.
-      // If the upstream harness (pi/OpenCode) didn't preserve the thinkingSignature,
-      // we silently drop the reasoning block from history — better to lose the
-      // thinking text than to crash the entire conversation.
-      const reasoningContent = hasReasoning && armReasoningSignature
-        ? { reasoningText: { text: armReasoningText, signature: armReasoningSignature } }
-        : undefined;
+      // Replay text reasoning only with a valid signature. Bedrock rejects
+      // empty/missing signatures with THINKING_SIGNATURE_INVALID. Redacted
+      // reasoning is replayed through its opaque redactedContent field.
+      const reasoningContent = armRedactedContent !== undefined
+        ? { redactedContent: armRedactedContent }
+        : armReasoningText.length > 0 && armReasoningSignature
+          ? { reasoningText: { text: armReasoningText, signature: armReasoningSignature } }
+          : undefined;
+      const messageId = reasoningContent ? resolveKiroAssistantMessageId(msg) : undefined;
       history.push({
         assistantResponseMessage: {
           content: armContent,
+          ...(messageId ? { messageId } : {}),
           ...(armToolUses.length > 0 ? { toolUses: armToolUses } : {}),
           ...(reasoningContent ? { reasoningContent } : {}),
         },
@@ -425,7 +468,7 @@ export function buildHistory(
     const trMsg = msg as ToolResultMessage;
     const toolResults: KiroToolResult[] = [
       {
-        content: [{ text: truncate(getContentText(msg), TOOL_RESULT_LIMIT) }],
+        content: [convertToolResultContent(getContentText(msg))],
         status: trMsg.isError ? "error" : "success",
         toolUseId: toKiroToolUseId(trMsg.toolCallId),
       },
@@ -439,7 +482,7 @@ export function buildHistory(
     while (j < historyMessages.length && historyMessages[j]?.role === "toolResult") {
       const next = historyMessages[j] as ToolResultMessage;
       toolResults.push({
-        content: [{ text: truncate(getContentText(next), TOOL_RESULT_LIMIT) }],
+        content: [convertToolResultContent(getContentText(next))],
         status: next.isError ? "error" : "success",
         toolUseId: toKiroToolUseId(next.toolCallId),
       });

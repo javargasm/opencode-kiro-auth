@@ -1,14 +1,72 @@
 import type { Server } from "bun";
-import { createHash } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { isAbsolute } from "node:path";
 import type { Message, Model, Api, Context } from "./types";
 import { streamKiro } from "./stream";
 import { log } from "./debug";
 import { enterSessionLog } from "./file-logger";
-import { KIRO_MODEL_IDS, fetchAvailableModels, buildModelsFromApi, setCachedDynamicModels, seedProfileArn } from "./models";
-import { resolveKiroModel, resolveApiRegion } from "./models";
+import {
+  KIRO_MODEL_IDS,
+  buildModelsFromApi,
+  findKiroModel,
+  fetchAvailableModels,
+  getCachedDynamicModels,
+  kiroModels,
+  resolveApiRegion,
+  resolveKiroModel,
+  resolveProfileArn,
+  seedProfileArn,
+  setCachedDynamicModels,
+  type KiroModel,
+  validateNativeKiroEffort,
+} from "./models";
 import { refreshKiroToken, startSocialLogin, BUILDER_ID_REGION } from "./oauth";
 import { stats } from "./dashboard-stats";
 import { getDashboardHtml } from "./dashboard-ui";
+
+export const OPENCODE_CWD_HEADER = "x-opencode-cwd";
+export const OPENCODE_EFFORT_HEADER = "x-opencode-kiro-effort";
+export const OPENCODE_REGION_HEADER = "x-opencode-kiro-region";
+export const OPENCODE_PROFILE_ARN_HEADER = "x-opencode-kiro-profile-arn";
+export const GATEWAY_AUTH_HEADER = "x-opencode-kiro-gateway-token";
+export const GATEWAY_AUTH_TIMESTAMP_HEADER = "x-opencode-kiro-gateway-timestamp";
+export const GATEWAY_AUTH_NONCE_HEADER = "x-opencode-kiro-gateway-nonce";
+export const GATEWAY_CHALLENGE_HEADER = "x-opencode-kiro-challenge";
+export const GATEWAY_PROTOCOL_VERSION = 3;
+export const GATEWAY_CAPABILITIES = ["request-workspace", "dynamic-models", "domain-separated-auth"] as const;
+
+export function gatewayChallengeProof(token: string, challenge: string): string {
+  return createHmac("sha256", token).update(`health-proof:v1:${challenge}`).digest("hex");
+}
+
+export function gatewayRequestSignature(token: string, timestamp: string, nonce: string): string {
+  return createHmac("sha256", token).update(`request-auth:v1:${timestamp}:${nonce}`).digest("hex");
+}
+
+const usedGatewayNonces = new Map<string, number>();
+
+function hasValidGatewayRequestAuth(req: Request, gatewayToken: string | undefined): boolean {
+  if (!gatewayToken) return true;
+  const timestamp = req.headers.get(GATEWAY_AUTH_TIMESTAMP_HEADER) ?? "";
+  const nonce = req.headers.get(GATEWAY_AUTH_NONCE_HEADER) ?? "";
+  const signature = req.headers.get(GATEWAY_AUTH_HEADER) ?? "";
+  const timestampMs = Number(timestamp);
+  if (!Number.isFinite(timestampMs) || Math.abs(Date.now() - timestampMs) > 30_000) return false;
+  if (!nonce || usedGatewayNonces.has(nonce) || !/^[a-f0-9]{64}$/.test(signature)) return false;
+
+  const expected = Buffer.from(gatewayRequestSignature(gatewayToken, timestamp, nonce), "hex");
+  const actual = Buffer.from(signature, "hex");
+  if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) return false;
+
+  usedGatewayNonces.set(nonce, timestampMs);
+  if (usedGatewayNonces.size > 1_000) {
+    const cutoff = Date.now() - 30_000;
+    for (const [key, at] of usedGatewayNonces) {
+      if (at < cutoff) usedGatewayNonces.delete(key);
+    }
+  }
+  return true;
+}
 
 // ── Gateway credential store ─────────────────────────────────────────
 // The gateway owns the Kiro auth lifecycle: import → store → refresh.
@@ -32,6 +90,79 @@ let _creds: GatewayCredentials | null = null;
 // tokens (the desktop endpoint), parallel refreshes invalidate each other and
 // cause intermittent auth failures.
 let _refreshInFlight: Promise<void> | null = null;
+let _modelsRefreshInFlight: Promise<KiroModel[] | null> | null = null;
+
+const ATTACHING_CATALOG_TTL_MS = 5 * 60_000;
+const ATTACHING_CATALOG_MAX_ENTRIES = 32;
+const OWNER_ACCESS_TOKEN_ALIAS_MAX_ENTRIES = 8;
+interface AttachingCatalog {
+  models: KiroModel[];
+  profileArn: string;
+  expiresAt: number;
+}
+const attachingCatalogs = new Map<string, AttachingCatalog>();
+const ownerAccessTokenAliases = new Set<string>();
+
+function accessTokenDigest(accessToken: string): string {
+  return createHash("sha256").update(accessToken).digest("hex");
+}
+
+function rememberOwnerAccessToken(accessToken: string): void {
+  if (!accessToken) return;
+  const digest = accessTokenDigest(accessToken);
+  ownerAccessTokenAliases.delete(digest);
+  ownerAccessTokenAliases.add(digest);
+  while (ownerAccessTokenAliases.size > OWNER_ACCESS_TOKEN_ALIAS_MAX_ENTRIES) {
+    const oldest = ownerAccessTokenAliases.values().next().value;
+    if (!oldest) break;
+    ownerAccessTokenAliases.delete(oldest);
+  }
+}
+
+function isOwnerAccessToken(accessToken: string): boolean {
+  return accessToken === _creds?.accessToken || ownerAccessTokenAliases.has(accessTokenDigest(accessToken));
+}
+
+function attachingCatalogKey(accessToken: string, region: string, profileArn?: string): string {
+  return createHash("sha256")
+    .update(`${accessToken}\0${resolveApiRegion(region)}\0${profileArn ?? ""}`)
+    .digest("hex");
+}
+
+function rememberAttachingCatalog(
+  accessToken: string,
+  region: string,
+  requestedProfileArn: string | undefined,
+  result: { models: KiroModel[]; profileArn: string },
+): void {
+  const now = Date.now();
+  for (const [key, entry] of attachingCatalogs) {
+    if (entry.expiresAt <= now) attachingCatalogs.delete(key);
+  }
+  const entry = {
+    models: result.models,
+    profileArn: result.profileArn,
+    expiresAt: now + ATTACHING_CATALOG_TTL_MS,
+  };
+  for (const profileArn of new Set([undefined, requestedProfileArn, result.profileArn])) {
+    const key = attachingCatalogKey(accessToken, region, profileArn);
+    if (!attachingCatalogs.has(key) && attachingCatalogs.size >= ATTACHING_CATALOG_MAX_ENTRIES) {
+      const oldest = attachingCatalogs.keys().next().value;
+      if (oldest) attachingCatalogs.delete(oldest);
+    }
+    attachingCatalogs.set(key, entry);
+  }
+}
+
+function getAttachingCatalog(accessToken: string, region: string, profileArn?: string): AttachingCatalog | undefined {
+  const key = attachingCatalogKey(accessToken, region, profileArn);
+  const entry = attachingCatalogs.get(key);
+  if (!entry || entry.expiresAt <= Date.now()) {
+    attachingCatalogs.delete(key);
+    return undefined;
+  }
+  return entry;
+}
 
 export function getAuthRegion(): string { return _creds?.region ?? "us-east-1"; }
 
@@ -54,6 +185,8 @@ export async function initGatewayAuth(): Promise<void> {
       imported.tokenKey || "",
     ];
 
+    ownerAccessTokenAliases.clear();
+    rememberOwnerAccessToken(imported.accessToken);
     _creds = {
       accessToken: imported.accessToken,
       refreshPacked: packParts.join("|"),
@@ -65,8 +198,6 @@ export async function initGatewayAuth(): Promise<void> {
 
     log.info(`[gateway-auth] Initialized (method=${imported.authMethod}, region=${imported.region})`);
 
-    let activeAccessToken = imported.accessToken;
-
     if (imported.refreshToken) {
       try {
         log.info("[gateway-auth] Refreshing token at startup…");
@@ -75,31 +206,73 @@ export async function initGatewayAuth(): Promise<void> {
           _creds.region,
           _creds.authMethod as any
         );
+        rememberOwnerAccessToken(_creds.accessToken);
         _creds.accessToken = refreshed.access;
         _creds.refreshPacked = refreshed.refresh;
         _creds.expiresAt = refreshed.expires;
-        activeAccessToken = refreshed.access;
         log.info("[gateway-auth] Token refreshed on startup successfully");
       } catch (err) {
         log.warn("[gateway-auth] Startup token refresh failed, trying with existing token", err);
       }
     }
 
-    // Fetch available models from the backend to ensure dynamic models are used
-    try {
-      if (imported.profileArn) {
-        const apiModels = await fetchAvailableModels(activeAccessToken, imported.region, imported.profileArn);
-        const built = buildModelsFromApi(apiModels);
-        setCachedDynamicModels(built);
-        log.info(`[kiro-models.fetched] Found ${built.length} available models`);
-      } else {
-        log.info(`[kiro-models.fetched] Skipping fetch, no profileArn available`);
-      }
-    } catch (err) {
-      log.warn("[gateway-auth] Failed to fetch dynamic models (will fallback to static list)", err);
-    }
+    await refreshGatewayModels();
   } catch (err) {
     log.error("[gateway-auth] Init failed", err);
+  }
+}
+
+/** Fetch a catalog for explicit request credentials without borrowing another account's profile. */
+export async function fetchGatewayModelsForCredentials(
+  accessToken: string,
+  region: string,
+  profileArn?: string,
+  useProfileCache = false,
+): Promise<{ models: KiroModel[]; profileArn: string } | null> {
+  const apiRegion = resolveApiRegion(region);
+  const resolvedProfileArn = profileArn
+    ?? await resolveProfileArn(accessToken, apiRegion, useProfileCache)
+    ?? undefined;
+  if (!resolvedProfileArn) return null;
+
+  const apiModels = await fetchAvailableModels(accessToken, apiRegion, resolvedProfileArn);
+  return { models: buildModelsFromApi(apiModels), profileArn: resolvedProfileArn };
+}
+
+/** Refresh the owner's model catalog while preserving the last good cache on failure. */
+export async function refreshGatewayModels(): Promise<KiroModel[] | null> {
+  if (_modelsRefreshInFlight) return _modelsRefreshInFlight;
+  if (!_creds?.accessToken) return getCachedDynamicModels();
+
+  _modelsRefreshInFlight = (async () => {
+    try {
+      const accessToken = await getAccessToken();
+      const result = await fetchGatewayModelsForCredentials(
+        accessToken,
+        _creds!.region,
+        _creds!.profileArn,
+        true,
+      );
+      if (!result) {
+        log.info("[kiro-models.fetched] Skipping fetch, no profileArn available");
+        return getCachedDynamicModels();
+      }
+
+      _creds!.profileArn = result.profileArn;
+      seedProfileArn(result.profileArn);
+      setCachedDynamicModels(result.models);
+      log.info(`[kiro-models.fetched] Found ${result.models.length}`);
+      return result.models;
+    } catch (err) {
+      log.warn("[gateway-auth] Failed to fetch dynamic models (will fallback to last known list)", err);
+      return getCachedDynamicModels();
+    }
+  })();
+
+  try {
+    return await _modelsRefreshInFlight;
+  } finally {
+    _modelsRefreshInFlight = null;
   }
 }
 
@@ -119,6 +292,7 @@ async function getAccessToken(): Promise<string> {
           creds.region,
           creds.authMethod,
         );
+        rememberOwnerAccessToken(creds.accessToken);
         creds.accessToken = refreshed.access;
         creds.refreshPacked = refreshed.refresh;
         creds.expiresAt = refreshed.expires;
@@ -257,6 +431,7 @@ export async function fetchKiroUsageLimits(): Promise<KiroUsageLimits> {
 
 /** @internal — test helper to inject credentials without Kiro CLI */
 export function _seedCredentials(token: string, region = "us-east-1", expiresAt = Date.now() + 3600_000) {
+  ownerAccessTokenAliases.clear();
   _creds = {
     accessToken: token,
     refreshPacked: "",
@@ -264,6 +439,12 @@ export function _seedCredentials(token: string, region = "us-east-1", expiresAt 
     authMethod: "idc",
     expiresAt,
   };
+}
+
+/** @internal — test helper to simulate a gateway owner without local credentials. */
+export function _clearCredentials(): void {
+  ownerAccessTokenAliases.clear();
+  _creds = null;
 }
 
 /**
@@ -454,9 +635,18 @@ export function stripTitleMarkdown(text: string): string {
   return t;
 }
 
-export function startGatewayServer(port: number = 0): Promise<Server<any>> {
+export interface GatewayServerOptions {
+  isReady?: () => boolean;
+  gatewayToken?: string;
+}
+
+export function startGatewayServer(
+  port: number = 0,
+  options: GatewayServerOptions = {},
+): Promise<Server<any>> {
   return new Promise((resolve) => {
     const server = Bun.serve({
+      hostname: "127.0.0.1",
       port,
       // Reasoning models can take 30-60s before emitting the first token
       // while thinking. Bun's default 10s idle timeout is far too short.
@@ -469,7 +659,18 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
           const origin = req.headers.get("origin");
           const headers: Record<string, string> = {
             "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type, Authorization",
+            "Access-Control-Allow-Headers": [
+              "Content-Type",
+              "Authorization",
+              "x-session-id",
+              OPENCODE_CWD_HEADER,
+              OPENCODE_EFFORT_HEADER,
+              OPENCODE_REGION_HEADER,
+              OPENCODE_PROFILE_ARN_HEADER,
+              GATEWAY_AUTH_HEADER,
+              GATEWAY_AUTH_TIMESTAMP_HEADER,
+              GATEWAY_AUTH_NONCE_HEADER,
+            ].join(", "),
           };
           if (origin && isLocalhostOrigin(origin)) {
             headers["Access-Control-Allow-Origin"] = origin;
@@ -500,7 +701,57 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
 
         // Health check endpoint
         if (url.pathname === "/health" || url.pathname === "/") {
-          return new Response(JSON.stringify({ status: "healthy", service: "opencode-kiro-gateway" }), {
+          const challenge = req.headers.get(GATEWAY_CHALLENGE_HEADER);
+          return new Response(JSON.stringify({
+            status: "healthy",
+            service: "opencode-kiro-gateway",
+            protocolVersion: GATEWAY_PROTOCOL_VERSION,
+            capabilities: GATEWAY_CAPABILITIES,
+            ready: options.isReady?.() ?? true,
+            proof: options.gatewayToken && challenge
+              ? gatewayChallengeProof(options.gatewayToken, challenge)
+              : undefined,
+          }), {
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+
+        if (url.pathname === "/v1/models" && req.method === "GET") {
+          if (isDisallowedBrowserRequest(req)) {
+            return anthropicError(403, "authentication_error", "Browser origin not allowed");
+          }
+          if (!hasValidGatewayRequestAuth(req, options.gatewayToken)) {
+            return anthropicError(401, "authentication_error", "Invalid local gateway token");
+          }
+          let dynamicModels: KiroModel[] | null;
+          if (url.searchParams.get("refresh") === "1") {
+            const bearer = req.headers.get("authorization")?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
+            if (bearer) {
+              try {
+                const requestRegion = req.headers.get(OPENCODE_REGION_HEADER)?.trim() || BUILDER_ID_REGION;
+                const requestProfileArn = req.headers.get(OPENCODE_PROFILE_ARN_HEADER)?.trim() || undefined;
+                const result = await fetchGatewayModelsForCredentials(
+                  bearer,
+                  requestRegion,
+                  requestProfileArn,
+                );
+                dynamicModels = result?.models ?? null;
+                if (result) rememberAttachingCatalog(bearer, requestRegion, requestProfileArn, result);
+              } catch {
+                return anthropicError(502, "api_error", "Kiro model catalog request failed");
+              }
+            } else {
+              dynamicModels = await refreshGatewayModels();
+            }
+          } else {
+            dynamicModels = getCachedDynamicModels();
+          }
+          const models = dynamicModels ?? kiroModels;
+          return new Response(JSON.stringify({
+            object: "list",
+            source: dynamicModels !== null ? "dynamic" : "static",
+            data: models,
+          }), {
             headers: { "Content-Type": "application/json" },
           });
         }
@@ -517,7 +768,8 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
             // Fire-and-forget: wait for the callback to complete in the background
             // and update the credential store when it does.
             waitForCredentials()
-              .then((creds) => {
+              .then(async (creds) => {
+                ownerAccessTokenAliases.clear();
                 _creds = {
                   accessToken: creds.accessToken,
                   refreshPacked: creds.refreshPacked,
@@ -529,6 +781,7 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
                 if (creds.profileArn) {
                   seedProfileArn(creds.profileArn);
                 }
+                await refreshGatewayModels();
                 log.info(`[gateway] Login completed (${creds.authMethod}) — credentials updated`);
               })
               .catch((err) => {
@@ -554,12 +807,14 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
           if (isDisallowedBrowserRequest(req)) {
             return anthropicError(403, "invalid_request_error", "Cross-origin requests are not allowed");
           }
-          // Gateway owns auth — get a fresh token from the credential store.
-          // OpenCode still sends a token in headers (for its own bookkeeping)
-          // but we ignore it and use our own.
+          if (!hasValidGatewayRequestAuth(req, options.gatewayToken)) {
+            return anthropicError(401, "authentication_error", "Invalid local gateway token");
+          }
+          const bearer = req.headers.get("authorization")?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
+          const ownerRequest = !bearer || isOwnerAccessToken(bearer);
           let accessToken: string;
           try {
-            accessToken = await getAccessToken();
+            accessToken = ownerRequest ? await getAccessToken() : bearer!;
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             return anthropicError(401, "authentication_error", `Kiro: ${msg}`);
@@ -573,6 +828,10 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
 
           const anthropicModelId = body.model;
           const anthropicMessages = body.messages || [];
+          const workingDirectory = req.headers.get(OPENCODE_CWD_HEADER)?.trim();
+          if (workingDirectory && !isAbsolute(workingDirectory)) {
+            return anthropicError(400, "invalid_request_error", `${OPENCODE_CWD_HEADER} must be an absolute path`);
+          }
           // Anthropic system can be string or array of content blocks
           let systemPrompt = "";
           if (typeof body.system === "string") {
@@ -586,8 +845,8 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
           // Kiro/CodeWhisperer exposes no temperature knob — read for
           // logging/parity only; intentionally NOT forwarded to the API.
           const temperature = body.temperature ?? 0.5;
-          // Anthropic requires max_tokens; forward it so streamKiro can pass it
-          // through additionalModelRequestFields on models that accept it.
+          // Anthropic requires max_tokens; streamKiro forwards it only when the
+          // target catalog explicitly advertises top-level max_tokens.
           const maxTokens = typeof body.max_tokens === "number" ? body.max_tokens : undefined;
 
           // Bind this request to its own session log file. Derived once and
@@ -612,30 +871,77 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
               tools: body.tools ? translateAnthropicToolsToPi(body.tools) : undefined,
             };
 
-            // Region and endpoint come from the credential store
-            const apiRegion = resolveApiRegion(_creds!.region);
+            const requestRegion = req.headers.get(OPENCODE_REGION_HEADER)?.trim();
+            const requestProfileArn = req.headers.get(OPENCODE_PROFILE_ARN_HEADER)?.trim();
+            const requestAuthRegion = requestRegion || _creds?.region || BUILDER_ID_REGION;
+            const apiRegion = resolveApiRegion(requestAuthRegion);
             const kiroEndpoint = `https://runtime.${apiRegion}.kiro.dev`;
+            const globalCatalogModel = typeof anthropicModelId === "string"
+              ? findKiroModel(anthropicModelId)
+              : undefined;
+            let attachingCatalog = bearer && !ownerRequest
+              ? getAttachingCatalog(bearer, requestAuthRegion, requestProfileArn)
+              : undefined;
+            const requestsNativeEffort = Boolean(
+              req.headers.get(OPENCODE_EFFORT_HEADER)
+              || body.output_config?.effort
+              || body.reasoning_effort,
+            );
+            if (
+              bearer
+              && !ownerRequest
+              && !attachingCatalog
+              && (!globalCatalogModel || requestsNativeEffort)
+            ) {
+              try {
+                const result = await fetchGatewayModelsForCredentials(
+                  bearer,
+                  requestAuthRegion,
+                  requestProfileArn,
+                );
+                if (!result) {
+                  return anthropicError(502, "api_error", "Kiro profile is unavailable for this account");
+                }
+                rememberAttachingCatalog(bearer, requestAuthRegion, requestProfileArn, result);
+                attachingCatalog = getAttachingCatalog(bearer, requestAuthRegion, requestProfileArn);
+              } catch {
+                return anthropicError(502, "api_error", "Kiro account catalog refresh failed");
+              }
+            }
+            const profileArn = requestProfileArn
+              || attachingCatalog?.profileArn
+              || (ownerRequest ? _creds?.profileArn : undefined);
+            const attachingModels = attachingCatalog?.models;
 
-            const piModel: Model<Api> = {
-              id: anthropicModelId,
-              name: anthropicModelId,
-              provider: "kiro",
-              api: "kiro-api",
-              baseUrl: kiroEndpoint,
-              reasoning: true,
-              input: ["text", "image"],
-              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-              contextWindow: 1_000_000,
-              maxTokens: 128_000,
-            };
+            const catalogModel = typeof anthropicModelId === "string"
+              ? attachingModels?.find((model) => model.id === anthropicModelId)
+                ?? (ownerRequest ? globalCatalogModel : undefined)
+              : undefined;
+            const piModel: Model<Api> = catalogModel
+              ? { ...catalogModel, baseUrl: kiroEndpoint }
+              : {
+                id: anthropicModelId,
+                name: anthropicModelId,
+                provider: "kiro",
+                api: "kiro-api",
+                baseUrl: kiroEndpoint,
+                reasoning: true,
+                input: ["text", "image"],
+                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+                contextWindow: 1_000_000,
+                maxTokens: 128_000,
+              };
 
             log.debug("[gateway] body-keys", Object.keys(body));
 
-            // OpenCode sends effort in `output_config.effort` (Anthropic extended thinking format)
-            // or fallback to `reasoning_effort` (standard Anthropic field).
-            const reasoningEffort = body.output_config?.effort
-              ?? body.reasoning_effort
-              ?? undefined;
+            // The local header preserves the selected native variant when the
+            // Anthropic SDK omits `none`; body fields keep direct API callers
+            // backward compatible. Every candidate is catalog-validated.
+            const nativeEffort = [
+              req.headers.get(OPENCODE_EFFORT_HEADER),
+              body.output_config?.effort,
+              body.reasoning_effort,
+            ].map((effort) => validateNativeKiroEffort(catalogModel, effort)).find(Boolean);
 
             // Title-generation turns need wrapping markdown stripped from the
             // model's output (Kiro models return "**Title**" despite the prompt).
@@ -643,14 +949,10 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
 
             log.info(`[gateway] → ${kiroEndpoint} model=${anthropicModelId} region=${apiRegion} stream=${streamRequested}`);
 
-            // Seed profileArn from the credential store (already imported at init)
-            if (_creds!.profileArn) {
-              seedProfileArn(_creds!.profileArn);
-            }
-
             const kiroStream = streamKiro(piModel, context, {
               apiKey: accessToken,
-              reasoning: reasoningEffort,
+              modelMetadata: catalogModel ?? (bearer ? piModel as KiroModel : undefined),
+              nativeEffort,
               temperature,
               maxTokens,
               // The log session id is a stable per-conversation key (survives
@@ -658,6 +960,9 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
               // every turn of one conversation shares a single id, like Kiro CLI.
               sessionId: logSessionId,
               logSessionId,
+              workingDirectory: workingDirectory || undefined,
+              profileArn,
+              cacheProfileArn: ownerRequest,
             });
 
             if (streamRequested) {
@@ -755,7 +1060,7 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
                     startHeartbeat();
 
                     let contentBlockIndex = 0;
-                    let activeBlockType: "thinking" | "text" | "tool_use" | null = null;
+                    let activeBlockType: "thinking" | "redacted_thinking" | "text" | "tool_use" | null = null;
                     // For title turns we buffer text deltas and emit the
                     // markdown-stripped title once at the end, since wrapping
                     // like **Title** can't be detected from a single delta.
@@ -796,7 +1101,24 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
                     const processEvent = (event: any) => {
                       // Real event arrived — reset the heartbeat idle window.
                       lastActivity = Date.now();
-                      if (event.type === "thinking_delta") {
+                      if (event.type === "thinking_start") {
+                        const block = event.partial?.content?.[event.contentIndex];
+                        if (block?.type === "thinking" && block.redactedContent) {
+                          closeActiveBlock();
+                          activeBlockType = "redacted_thinking";
+                          controller.enqueue(
+                            "event: content_block_start\ndata: " +
+                            JSON.stringify({
+                              type: "content_block_start",
+                              index: contentBlockIndex++,
+                              content_block: {
+                                type: "redacted_thinking",
+                                data: block.redactedContent,
+                              },
+                            }) + "\n\n"
+                          );
+                        }
+                      } else if (event.type === "thinking_delta") {
                         ensureBlockStarted("thinking");
                         controller.enqueue(
                           "event: content_block_delta\ndata: " +
@@ -809,6 +1131,23 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
                             }
                           }) + "\n\n"
                         );
+                      } else if (event.type === "thinking_signature") {
+                        ensureBlockStarted("thinking");
+                        controller.enqueue(
+                          "event: content_block_delta\ndata: " +
+                          JSON.stringify({
+                            type: "content_block_delta",
+                            index: contentBlockIndex - 1,
+                            delta: {
+                              type: "signature_delta",
+                              signature: event.signature,
+                            },
+                          }) + "\n\n"
+                        );
+                      } else if (event.type === "thinking_end") {
+                        if (activeBlockType === "thinking" || activeBlockType === "redacted_thinking") {
+                          closeActiveBlock();
+                        }
                       } else if (event.type === "text_delta") {
                         ensureBlockStarted("text");
                         if (isTitleTurn) {
@@ -925,7 +1264,7 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
                       outputTokens,
                       credits,
                       stream: true,
-                      effort: reasoningEffort,
+                      effort: nativeEffort,
                     });
 
                     // NOTE (protocol deviation, kept on purpose) — Anthropic
@@ -1003,10 +1342,18 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
                     text: isTitleTurn ? stripTitleMarkdown(part.text) : part.text,
                   });
                 } else if (part.type === "thinking") {
-                  anthropicContent.push({
-                    type: "thinking",
-                    thinking: part.thinking,
-                  });
+                  if (part.redactedContent) {
+                    anthropicContent.push({
+                      type: "redacted_thinking",
+                      data: part.redactedContent,
+                    });
+                  } else {
+                    anthropicContent.push({
+                      type: "thinking",
+                      thinking: part.thinking,
+                      ...(part.thinkingSignature ? { signature: part.thinkingSignature } : {}),
+                    });
+                  }
                 } else if (part.type === "toolCall") {
                   anthropicContent.push({
                     type: "tool_use",
@@ -1034,7 +1381,7 @@ export function startGatewayServer(port: number = 0): Promise<Server<any>> {
                 outputTokens,
                 credits,
                 stream: false,
-                effort: reasoningEffort,
+                effort: nativeEffort,
               });
 
               const responseBody = {
@@ -1128,7 +1475,18 @@ function translateAnthropicToPi(messages: any[]): Message[] {
           if (part.type === "text") {
             contentParts.push({ type: "text", text: part.text });
           } else if (part.type === "thinking") {
-            contentParts.push({ type: "thinking", thinking: part.thinking });
+            contentParts.push({
+              type: "thinking",
+              thinking: part.thinking,
+              ...(part.signature ? { thinkingSignature: part.signature } : {}),
+            });
+          } else if (part.type === "redacted_thinking") {
+            contentParts.push({
+              type: "thinking",
+              thinking: "",
+              redacted: true,
+              redactedContent: part.data,
+            });
           } else if (part.type === "tool_use") {
             contentParts.push({
               type: "toolCall",

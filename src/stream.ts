@@ -7,6 +7,7 @@ import type {
   AssistantMessage,
   Context,
   ImageContent,
+  KiroNativeEffort,
   Model,
   SimpleStreamOptions,
   TextContent,
@@ -20,7 +21,7 @@ import { parseKiroEvents } from "./event-parser";
 import { isPermanentError } from "./health";
 import type { KiroModel } from "./models";
 import { createHash } from "node:crypto";
-import { kiroModels, resolveKiroModel, getCachedDynamicModels, resolveProfileArn, resetProfileArnCache, seedProfileArn } from "./models";
+import { findKiroModel, resolveKiroModel, resolveProfileArn, resetProfileArnCache, seedProfileArn } from "./models";
 import { ThinkingTagParser } from "./thinking-parser";
 import { countTokens } from "./tokenizer";
 import { abortableDelay } from "./oauth";
@@ -28,6 +29,7 @@ import { createSessionLogger, ensureLogDir, isFileLoggingEnabled, LOG_DIR } from
 
 import {
   buildHistory,
+  convertToolResultContent,
   convertImagesToKiro,
   convertToolsToKiro,
   extractImages,
@@ -42,9 +44,8 @@ import {
   type KiroUserInputMessage,
   normalizeMessages,
   parseToolArgs,
+  resolveKiroAssistantMessageId,
   toKiroToolUseId,
-  TOOL_RESULT_LIMIT,
-  truncate,
 } from "./transform";
 import {
   COMPACTION_THRESHOLD_PCT,
@@ -100,10 +101,7 @@ function errorMessage(error: unknown): string {
 }
 
 function findModel(modelId: string): KiroModel | undefined {
-  return (
-    (kiroModels.find((x) => x.id === modelId) as KiroModel | undefined) ??
-    getCachedDynamicModels()?.find((x) => x.id === modelId)
-  );
+  return findKiroModel(modelId);
 }
 
 export function firstTokenTimeoutForModel(modelId: string): number {
@@ -218,9 +216,9 @@ interface KiroRequest {
     history?: KiroHistoryEntry[];
   };
   profileArn?: string;
-  agentMode?: string;
   additionalModelRequestFields?: {
     output_config?: { effort?: string };
+    reasoning?: { effort?: string };
     thinking?: { type: "adaptive" | "disabled"; display?: "summarized" | "omitted" };
     max_tokens?: number;
 
@@ -346,9 +344,16 @@ export function streamKiro(
       }
 
       const endpoint = model.baseUrl || "https://runtime.us-east-1.kiro.dev";
-      const profileArn = await resolveProfileArn(accessToken, regionFromEndpoint(endpoint));
+      const profileArn = options?.profileArn ?? await resolveProfileArn(
+        accessToken,
+        regionFromEndpoint(endpoint),
+        options?.cacheProfileArn !== false,
+      );
       const kiroModelId = resolveKiroModel(model.id);
-      const thinkingEnabled = !!options?.reasoning || model.reasoning;
+      const nativeEffort = options?.nativeEffort;
+      const thinkingEnabled = nativeEffort === "none"
+        ? false
+        : Boolean(nativeEffort) || !!options?.reasoning || model.reasoning;
       // Kiro models where upstream hides reasoning entirely (no `<thinking>`
       // tags in the text stream, no native reasoning event). We surface a
       // redacted ThinkingContent shim so downstream UIs can show a
@@ -363,6 +368,7 @@ export function streamKiro(
         thinkingEnabled,
         reasoningHidden,
         reasoning: options?.reasoning,
+        nativeEffort,
         messageCount: context.messages.length,
         toolCount: context.tools?.length ?? 0,
         hasSystemPrompt: !!context.systemPrompt,
@@ -376,7 +382,7 @@ export function streamKiro(
       // frames. The directive goes in the seed prompt content (first userInputMessage),
       // NOT in additionalModelRequestFields. Matches the real Kiro CLI behavior.
       if (thinkingEnabled && !reasoningHidden) {
-        const reasoningLevel = String(options?.reasoning ?? "");
+        const reasoningLevel = nativeEffort ?? String(options?.reasoning ?? "");
         const budget =
           reasoningLevel === "xhigh" || reasoningLevel === "max"
             ? 50000
@@ -390,10 +396,11 @@ export function streamKiro(
         }`;
       }
 
-      // Build envState from the host process (matches real Kiro CLI).
+      // A shared gateway may belong to a different OpenCode process, so prefer
+      // the workspace attached to this request over the gateway process cwd.
       const envState: KiroEnvState = {
         operatingSystem: resolveOS(),
-        currentWorkingDirectory: process.cwd(),
+        currentWorkingDirectory: options?.workingDirectory ?? process.cwd(),
       };
 
       // Stable per-session conversationId (matches Kiro CLI: one id for the
@@ -438,6 +445,7 @@ export function streamKiro(
           let armContent = "";
           let armReasoningText = "";
           let armReasoningSignature = "";
+          let armRedactedContent: string | undefined;
           const armToolUses: Array<{ name: string; toolUseId: string; input: Record<string, unknown> }> = [];
           if (Array.isArray(am.content)) {
             for (const b of am.content) {
@@ -447,7 +455,13 @@ export function streamKiro(
                 // Accumulate thinking text + signature for the reasoningContent field.
                 // The real Kiro CLI uses a structured field, NOT <thinking> XML tags.
                 const tb = b as unknown as { thinking: string; thinkingSignature?: string };
-                armReasoningText += tb.thinking;
+                const redactedContent = (b as ThinkingContent).redactedContent;
+                const redacted = (b as ThinkingContent).redacted;
+                if (redactedContent !== undefined) {
+                  armRedactedContent = redactedContent;
+                } else if (!redacted) {
+                  armReasoningText += tb.thinking;
+                }
                 if (tb.thinkingSignature) armReasoningSignature = tb.thinkingSignature;
               } else if (b.type === "toolCall") {
                 const tc = b as ToolCall;
@@ -459,14 +473,18 @@ export function streamKiro(
               }
             }
           }
-          const hasReasoning = armReasoningText.length > 0;
+          const hasReasoning = armReasoningText.length > 0 || armRedactedContent !== undefined;
           if (armContent || armToolUses.length > 0 || hasReasoning) {
             const last = history[history.length - 1];
-            const reasoningContent = hasReasoning && armReasoningSignature
-              ? { reasoningText: { text: armReasoningText, signature: armReasoningSignature } }
-              : undefined;
+            const reasoningContent = armRedactedContent !== undefined
+              ? { redactedContent: armRedactedContent }
+              : armReasoningText.length > 0 && armReasoningSignature
+                ? { reasoningText: { text: armReasoningText, signature: armReasoningSignature } }
+                : undefined;
+            const messageId = reasoningContent ? resolveKiroAssistantMessageId(am) : undefined;
             if (last && !last.userInputMessage && last.assistantResponseMessage) {
               last.assistantResponseMessage.content += `\n\n${armContent}`;
+              if (messageId) last.assistantResponseMessage.messageId = messageId;
               if (armToolUses.length > 0) {
                 last.assistantResponseMessage.toolUses = [
                   ...(last.assistantResponseMessage.toolUses ?? []),
@@ -480,6 +498,7 @@ export function streamKiro(
               history.push({
                 assistantResponseMessage: {
                   content: armContent,
+                  ...(messageId ? { messageId } : {}),
                   ...(armToolUses.length > 0 ? { toolUses: armToolUses } : {}),
                   ...(reasoningContent ? { reasoningContent } : {}),
                 },
@@ -493,7 +512,7 @@ export function streamKiro(
             if (m?.role === "toolResult") {
               const trm = m as ToolResultMessage;
               currentToolResults.push({
-                content: [{ text: truncate(getContentText(m), TOOL_RESULT_LIMIT) }],
+                content: [convertToolResultContent(getContentText(m))],
                 status: trm.isError ? "error" : "success",
                 toolUseId: toKiroToolUseId(trm.toolCallId),
               });
@@ -516,7 +535,7 @@ export function streamKiro(
             if (m?.role === "toolResult") {
               const trm = m as ToolResultMessage;
               currentToolResults.push({
-                content: [{ text: truncate(getContentText(m), TOOL_RESULT_LIMIT) }],
+                content: [convertToolResultContent(getContentText(m))],
                 status: trm.isError ? "error" : "success",
                 toolUseId: toKiroToolUseId(trm.toolCallId),
               });
@@ -608,31 +627,41 @@ export function streamKiro(
             ...(history.length > 0 ? { history } : {}),
           },
           ...(profileArn ? { profileArn } : {}),
-          agentMode: "vibe",
         };
 
-        // Attach adaptive thinking effort when the model supports it.
-        // Pi has 5 levels (minimal…xhigh), Kiro has 5 (low…max).
-        // Pi's extra bottom level (`minimal`) means each maps one up.
-        const staticModel = kiroModels.find((m) => m.id === model.id) as KiroModel | undefined;
-        const dynamicModel = getCachedDynamicModels()?.find((m) => m.id === model.id);
-        const supportedEfforts = staticModel?.supportedEfforts ?? dynamicModel?.supportedEfforts;
-        const supportsThinkingConfig = staticModel?.supportsThinkingConfig ?? dynamicModel?.supportsThinkingConfig;
-        if (supportedEfforts && supportedEfforts.length > 0 && options?.reasoning && typeof options.reasoning === "string") {
-          if (supportedEfforts.includes(options.reasoning)) {
+        // Native effort is reserved for validated gateway values. Existing
+        // direct callers continue using Pi's normalized ThinkingLevel mapping.
+        const modelMetadata = options?.modelMetadata ?? findKiroModel(model.id) ?? (model as KiroModel);
+        const nativeEfforts = modelMetadata.nativeEfforts;
+        const supportedEfforts = modelMetadata?.supportedEfforts;
+        const effortRequestField = modelMetadata?.effortRequestField;
+        const supportsMaxTokens = modelMetadata?.supportsMaxTokens;
+        const piToKiroEffort: Record<string, KiroNativeEffort> = {
+          minimal: "low",
+          low: "medium",
+          medium: "high",
+          high: "xhigh",
+          xhigh: "max",
+        };
+        if (nativeEffort && nativeEfforts?.includes(nativeEffort)) {
+          request.additionalModelRequestFields = request.additionalModelRequestFields || {};
+          request.additionalModelRequestFields[effortRequestField ?? "output_config"] = { effort: nativeEffort };
+          log.debug("effort.set", { effort: nativeEffort, model: model.id, source: "native" });
+        } else if (supportedEfforts && supportedEfforts.length > 0 && options?.reasoning && typeof options.reasoning === "string") {
+          const effort = piToKiroEffort[options.reasoning];
+          const supported = nativeEfforts
+            ? effort !== undefined && nativeEfforts.includes(effort)
+            : supportedEfforts.includes(options.reasoning as typeof supportedEfforts[number]);
+          if (effort && supported) {
             request.additionalModelRequestFields = request.additionalModelRequestFields || {};
-            request.additionalModelRequestFields.output_config = { effort: options.reasoning };
-            log.debug("effort.set", { effort: options.reasoning, model: model.id });
+            request.additionalModelRequestFields[effortRequestField ?? "output_config"] = { effort };
+            log.debug("effort.set", { effort, model: model.id, source: "normalized" });
           }
         }
 
-        // Forward max_tokens, but ONLY for models that advertise a thinking
-        // config schema — those are the same models whose
-        // additionalModelRequestFieldsSchema includes a `max_tokens` field, so
-        // they accept the object. Sending it to models without that schema
-        // risks an "Improperly formed request". Clamp to the schema bounds
-        // (min 1024) and the model's own output window.
-        if (supportsThinkingConfig && typeof options?.maxTokens === "number" && options.maxTokens > 0) {
+        // Forward max_tokens only when the catalog advertises the top-level
+        // field. Thinking support alone does not imply max_tokens support.
+        if (supportsMaxTokens && typeof options?.maxTokens === "number" && options.maxTokens > 0) {
           const capped = Math.min(
             Math.max(Math.floor(options.maxTokens), 1024),
             model.maxTokens || 64_000,
@@ -673,8 +702,8 @@ export function streamKiro(
         let contextTruncationAttempt = 0;
         while (true) {
           const osName = resolveOS();
-          const ua = `aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.16551 os/${osName} lang/rust/1.92.0 md/appVersion-2.9.0 app/AmazonQ-For-CLI`;
-          const xAmzUa = `aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.16551 os/${osName} lang/rust/1.92.0 m/F app/AmazonQ-For-CLI`;
+          const ua = `aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17975 os/${osName} lang/rust/1.92.0 md/appVersion-2.12.1 app/AmazonQ-For-CLI`;
+          const xAmzUa = `aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17975 os/${osName} lang/rust/1.92.0 m/F app/AmazonQ-For-CLI`;
           const requestBody = JSON.stringify(request);
 
 
@@ -1021,6 +1050,20 @@ export function streamKiro(
                 // Native reasoning event from Kiro (Opus 4.7+).
                 // Accumulate chunks into a single Pi thinking block.
                 cancelHiddenShim();
+                if (!output.responseId) output.responseId = crypto.randomUUID();
+                if (event.data.redactedContent !== undefined) {
+                  const contentIndex = output.content.length;
+                  const block: ThinkingContent = {
+                    type: "thinking",
+                    thinking: "",
+                    redacted: true,
+                    redactedContent: event.data.redactedContent,
+                  };
+                  output.content.push(block);
+                  stream.push({ type: "thinking_start", contentIndex, partial: output });
+                  stream.push({ type: "thinking_end", contentIndex, content: "", partial: output });
+                  break;
+                }
                 const lastIsThinking =
                   output.content.length > 0 &&
                   output.content[output.content.length - 1]?.type === "thinking";
@@ -1041,8 +1084,12 @@ export function streamKiro(
                 }
                 if (event.data.signature) {
                   tc.thinkingSignature = event.data.signature;
-                  // Signature indicates the end of the reasoning block.
-                  // Pi engine automatically handles the final state.
+                  stream.push({
+                    type: "thinking_signature",
+                    contentIndex,
+                    signature: event.data.signature,
+                    partial: output,
+                  });
                 }
                 break;
               }

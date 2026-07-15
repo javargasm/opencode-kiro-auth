@@ -16,6 +16,7 @@ vi.mock("node:fs", async (importOriginal) => {
 import {
   selectKiroTokenRowForWrite,
   sameKiroCliCredential,
+  matchesPackedKiroCredential,
   importFromKiroSsoCache,
   importFromKiroCli,
   getKiroCliCredentialsAllowExpired,
@@ -121,6 +122,34 @@ describe("sameKiroCliCredential", () => {
 
   it("returns false when tokenKey differs", () => {
     expect(sameKiroCliCredential(base, { ...base, tokenKey: "kirocli:social:token" })).toBe(false);
+  });
+});
+
+describe("matchesPackedKiroCredential", () => {
+  const candidate: KiroCliCredentials = {
+    accessToken: "current-access",
+    refreshToken: "current-refresh",
+    clientId: "client-id",
+    clientSecret: "client-secret",
+    region: "us-east-1",
+    authMethod: "idc",
+    source: "kiro-cli-db",
+    tokenKey: "kirocli:odic:token",
+  };
+
+  it("matches the same persisted CLI row after access-token rotation", () => {
+    const packed = "older-refresh|client-id|client-secret|idc|kiro-cli-db|kirocli:odic:token";
+    expect(matchesPackedKiroCredential(packed, candidate)).toBe(true);
+  });
+
+  it("does not match a different persisted CLI row", () => {
+    const packed = "current-refresh|client-id|client-secret|idc|kiro-cli-db|kirocli:other:token";
+    expect(matchesPackedKiroCredential(packed, candidate)).toBe(false);
+  });
+
+  it("falls back to refresh and client identity when no row key is packed", () => {
+    expect(matchesPackedKiroCredential("current-refresh|client-id|client-secret|idc||", candidate)).toBe(true);
+    expect(matchesPackedKiroCredential("different|client-id|client-secret|idc||", candidate)).toBe(false);
   });
 });
 

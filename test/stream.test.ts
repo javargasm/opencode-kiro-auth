@@ -8,10 +8,10 @@ import type {
 } from "../src/types";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { streamKiro, firstTokenTimeoutForModel, regionFromEndpoint, resolveConversationId } from "../src/stream";
-import { convertToolsToKiro } from "../src/transform";
+import { buildHistory, convertToolResultContent, convertToolsToKiro } from "../src/transform";
 import type { Tool } from "../src/types";
 import { AssistantMessageEventStream } from "../src/types";
-import { resetProfileArnCache, seedProfileArn, setCachedDynamicModels } from "../src/models";
+import { buildModelsFromApi, resetProfileArnCache, seedProfileArn, setCachedDynamicModels } from "../src/models";
 import type { KiroModel } from "../src/models";
 import { ThinkingTagParser } from "../src/thinking-parser";
 
@@ -81,6 +81,7 @@ describe("streamKiro", () => {
   });
 
   afterEach(() => {
+    setCachedDynamicModels(null);
     vi.restoreAllMocks();
   });
 
@@ -130,13 +131,166 @@ describe("streamKiro", () => {
 
     // user-agent and x-amz-user-agent must differ (m/F vs md/appVersion)
     expect(opts.headers["user-agent"]).toContain("aws-sdk-rust/1.3.15");
-    expect(opts.headers["user-agent"]).toContain("md/appVersion-2.9.0");
+    expect(opts.headers["user-agent"]).toContain("api/codewhispererstreaming/0.1.17975");
+    expect(opts.headers["user-agent"]).toContain("md/appVersion-2.12.1");
     expect(opts.headers["x-amz-user-agent"]).toContain("aws-sdk-rust/1.3.15");
+    expect(opts.headers["x-amz-user-agent"]).toContain("api/codewhispererstreaming/0.1.17975");
     expect(opts.headers["x-amz-user-agent"]).toContain("m/F");
     expect(opts.headers["x-amz-user-agent"]).not.toContain("md/appVersion");
 
     // x-amzn-kiro-agent-mode must NOT be sent (not present in real client)
     expect(opts.headers["x-amzn-kiro-agent-mode"]).toBeUndefined();
+  });
+
+  it.each([
+    ["minimal", "low"],
+    ["xhigh", "max"],
+  ] as const)("preserves direct normalized GPT reasoning %s as Kiro effort %s", async (reasoning, effort) => {
+    const [model] = buildModelsFromApi([{
+      modelId: "gpt-5.2",
+      modelName: "GPT 5.2",
+      additionalModelRequestFieldsSchema: {
+        properties: {
+          reasoning: { properties: { effort: { enum: ["none", "low", "medium", "high", "xhigh", "max"] } } },
+        },
+      },
+    }]);
+    setCachedDynamicModels([model!]);
+    const fetchMock = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":10}');
+    vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
+
+    await collect(streamKiro(model!, makeContext(), { apiKey: "tok", reasoning }));
+
+    const body = JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string);
+    expect(body.additionalModelRequestFields.reasoning).toEqual({ effort });
+    expect(body.additionalModelRequestFields.output_config).toBeUndefined();
+  });
+
+  it.each(["none", "low", "medium", "high", "xhigh", "max"] as const)(
+    "serializes raw GPT native effort %s with scoped catalog metadata",
+    async (effort) => {
+      const [model] = buildModelsFromApi([{
+        modelId: "gpt-5.6-sol",
+        modelName: "GPT 5.6 Sol",
+        additionalModelRequestFieldsSchema: {
+          properties: {
+            reasoning: { properties: { effort: { enum: ["none", "low", "medium", "high", "xhigh", "max"] } } },
+          },
+        },
+      }]);
+      setCachedDynamicModels([{ ...model!, effortRequestField: "output_config" }]);
+      const fetchMock = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":10}');
+      vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
+
+      await collect(streamKiro(model!, makeContext(), {
+        apiKey: "tok", nativeEffort: effort, modelMetadata: model!,
+      }));
+
+      const body = JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string);
+      expect(body.additionalModelRequestFields.reasoning).toEqual({ effort });
+      expect(body.additionalModelRequestFields.output_config).toBeUndefined();
+      if (effort === "none") {
+        expect(body.conversationState.currentMessage.userInputMessage.content).not.toContain("<thinking_mode>");
+        expect(body.conversationState.currentMessage.userInputMessage.content).not.toContain("<max_thinking_length>");
+      }
+    },
+  );
+
+  it("maps Claude effort to output_config.effort", async () => {
+    const [model] = buildModelsFromApi([{
+      modelId: "claude-opus-4.7",
+      modelName: "Claude Opus 4.7",
+      additionalModelRequestFieldsSchema: {
+        properties: {
+          output_config: { properties: { effort: { enum: ["low", "medium", "high", "xhigh", "max"] } } },
+        },
+      },
+    }]);
+    setCachedDynamicModels([model!]);
+    const fetchMock = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":10}');
+    vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
+
+    await collect(streamKiro(model!, makeContext(), { apiKey: "tok", reasoning: "high" }));
+
+    const body = JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string);
+    expect(body.additionalModelRequestFields.output_config).toEqual({ effort: "xhigh" });
+    expect(body.additionalModelRequestFields.reasoning).toBeUndefined();
+  });
+
+  it.each(["low", "medium", "high", "max"] as const)(
+    "serializes raw Claude native effort %s unchanged",
+    async (effort) => {
+      const [model] = buildModelsFromApi([{
+        modelId: "claude-opus-4.7",
+        modelName: "Claude Opus 4.7",
+        additionalModelRequestFieldsSchema: {
+          properties: {
+            output_config: { properties: { effort: { enum: ["low", "medium", "high", "max"] } } },
+          },
+        },
+      }]);
+      setCachedDynamicModels([model!]);
+      const fetchMock = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":10}');
+      vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
+
+      await collect(streamKiro(model!, makeContext(), { apiKey: "tok", nativeEffort: effort }));
+
+      const body = JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string);
+      expect(body.additionalModelRequestFields.output_config).toEqual({ effort });
+      expect(body.additionalModelRequestFields.reasoning).toBeUndefined();
+    },
+  );
+
+  it("forwards max_tokens only when the catalog advertises it", async () => {
+    const [gpt] = buildModelsFromApi([{
+      modelId: "gpt-5.6-terra",
+      modelName: "GPT 5.6 Terra",
+      additionalModelRequestFieldsSchema: {
+        properties: {
+          reasoning: { properties: { effort: { enum: ["none", "low", "medium", "high", "xhigh", "max"] } } },
+        },
+      },
+    }]);
+    setCachedDynamicModels([gpt!]);
+    const fetchMock = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":10}');
+    vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
+
+    await collect(streamKiro(gpt!, makeContext(), { apiKey: "tok", maxTokens: 100 }));
+    const body = JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string);
+    expect(body.additionalModelRequestFields?.max_tokens).toBeUndefined();
+
+    const [claude] = buildModelsFromApi([{
+      modelId: "claude-opus-4.7",
+      modelName: "Claude Opus 4.7",
+      additionalModelRequestFieldsSchema: {
+        properties: {
+          output_config: { properties: { effort: { enum: ["low", "medium", "high", "max"] } } },
+          thinking: { properties: { type: { enum: ["adaptive"] } } },
+          max_tokens: { type: "integer" },
+        },
+      },
+    }]);
+    setCachedDynamicModels([claude!]);
+    const secondFetch = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":10}');
+    vi.spyOn(globalThis, "fetch").mockImplementation(secondFetch);
+    await collect(streamKiro(claude!, makeContext(), { apiKey: "tok", maxTokens: 100 }));
+    const secondBody = JSON.parse(secondFetch.mock.calls[0]?.[1]?.body as string);
+    expect(secondBody.additionalModelRequestFields.max_tokens).toBe(1024);
+  });
+
+  it("uses the request workspace in Kiro envState", async () => {
+    const fetchMock = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":10}');
+    vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
+
+    await collect(streamKiro(makeModel(), makeContext(), {
+      apiKey: "tok",
+      workingDirectory: "/tmp/request-workspace",
+    }));
+
+    const body = JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string);
+    expect(
+      body.conversationState.currentMessage.userInputMessage.userInputMessageContext.envState.currentWorkingDirectory,
+    ).toBe("/tmp/request-workspace");
   });
 
   it("parses text + contextUsage into usage", async () => {
@@ -322,7 +476,119 @@ describe("streamKiro", () => {
     expect(body.conversationState.currentMessage.userInputMessage.origin).toBe("KIRO_CLI");
     expect(body.conversationState.currentMessage.userInputMessage.modelId).toBe("claude-sonnet-4.5");
     expect(body.conversationState.agentTaskType).toBe("vibe");
-    expect(body.agentMode).toBe("vibe");
+    expect(body.agentMode).toBeUndefined();
+  });
+
+  it("preserves redacted reasoning for replay without exposing opaque text", async () => {
+    const opaque = "c2Vuc2l0aXZlLXJlZGFjdGVkLWNvbnRlbnQ=";
+    const fetchMock = mockFetchOk(
+      `${JSON.stringify({ redactedContent: opaque })}{"content":"Hi"}{"contextUsagePercentage":5}`,
+    );
+    vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
+
+    const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+    const done = events.find((e) => e.type === "done");
+    expect(done?.type).toBe("done");
+    if (done?.type === "done") {
+      const thinking = done.message.content.find((block) => block.type === "thinking");
+      expect(thinking).toMatchObject({
+        type: "thinking",
+        thinking: "",
+        redacted: true,
+        redactedContent: opaque,
+      });
+      expect(done.message.responseId).toEqual(expect.any(String));
+      expect(events.filter((event) => event.type === "thinking_delta")).toEqual([]);
+
+      const history = buildHistory(
+        [
+          { role: "user", content: "previous", timestamp: ts },
+          done.message,
+          { role: "user", content: "current", timestamp: ts },
+        ],
+        "claude-sonnet-4.5",
+      ).history;
+      const replayed = history.find((entry) => entry.assistantResponseMessage)?.assistantResponseMessage;
+      expect(replayed).toMatchObject({
+        messageId: done.message.responseId,
+        reasoningContent: { redactedContent: opaque },
+      });
+      expect(replayed?.reasoningContent).not.toHaveProperty("reasoningText");
+
+      const messageWithoutResponseId = { ...done.message, responseId: undefined };
+      const buildFallbackId = () => buildHistory(
+        [
+          { role: "user", content: "previous", timestamp: ts },
+          messageWithoutResponseId,
+          { role: "user", content: "current", timestamp: ts },
+        ],
+        "claude-sonnet-4.5",
+      ).history.find((entry) => entry.assistantResponseMessage)?.assistantResponseMessage?.messageId;
+      const fallbackId = buildFallbackId();
+      expect(fallbackId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+      expect(buildFallbackId()).toBe(fallbackId);
+    }
+  });
+
+  it("converts JSON tool results to json blocks and truncates plain text blocks", () => {
+    expect(convertToolResultContent('{"ok":true,"items":[1,2]}')).toEqual({
+      json: { ok: true, items: [1, 2] },
+    });
+    expect(convertToolResultContent("[1,2]")).toEqual({ text: "[1,2]" });
+    expect(convertToolResultContent("plain tool output")).toEqual({ text: "plain tool output" });
+  });
+
+  it("omits images from replayed history", () => {
+    const history = buildHistory(
+      [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "inspect this" },
+            { type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" },
+          ],
+          timestamp: ts,
+        },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "inspected" }],
+          api: "kiro-api",
+          provider: "kiro",
+          model: "claude-sonnet-4-5",
+          usage: zeroUsage,
+          stopReason: "stop",
+          timestamp: ts,
+        },
+        { role: "user", content: "continue", timestamp: ts },
+      ],
+      "claude-sonnet-4.5",
+    ).history;
+
+    expect(history[0]?.userInputMessage?.content).toContain("inspect this");
+    expect(history[0]?.userInputMessage?.images).toBeUndefined();
+  });
+
+  it("keeps supported images on the current message", async () => {
+    const fetchMock = mockFetchOk('{"content":"seen"}{"contextUsagePercentage":5}');
+    vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
+    const context: Context = {
+      systemPrompt: "",
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: "inspect this" },
+          { type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" },
+        ],
+        timestamp: ts,
+      }],
+      tools: [],
+    };
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+    const body = JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string);
+    expect(body.conversationState.currentMessage.userInputMessage.images).toEqual([
+      { format: "png", source: { bytes: "iVBORw0KGgo=" } },
+    ]);
   });
 
   it("injects thinking mode tags when reasoning is enabled", async () => {
@@ -974,6 +1240,26 @@ describe("firstTokenTimeoutForModel (#9 — consults dynamic models)", () => {
     ]);
     expect(firstTokenTimeoutForModel("dyn-opus")).toBe(180_000);
   });
+
+  it("prefers refreshed metadata over the static definition for a known model", () => {
+    setCachedDynamicModels([
+      {
+        id: "claude-opus-4-8",
+        name: "Refreshed Opus",
+        api: "kiro-api",
+        provider: "kiro",
+        baseUrl: "x",
+        reasoning: true,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 1,
+        maxTokens: 1,
+        firstTokenTimeout: 45_000,
+      } as KiroModel,
+    ]);
+
+    expect(firstTokenTimeoutForModel("claude-opus-4-8")).toBe(45_000);
+  });
 });
 
 function mockFetchReader(body: string) {
@@ -1073,11 +1359,24 @@ describe("streamKiro bug fixes", () => {
     }
   });
 
-  it("#11: forwards clamped max_tokens for thinking-config models", async () => {
+  it("#11: forwards clamped max_tokens for catalog-advertised models", async () => {
+    const [model] = buildModelsFromApi([{
+      modelId: "claude-opus-4.8",
+      modelName: "Claude Opus 4.8",
+      tokenLimits: { maxOutputTokens: 128_000 },
+      additionalModelRequestFieldsSchema: {
+        properties: {
+          output_config: { properties: { effort: { enum: ["low", "medium", "high", "max"] } } },
+          thinking: { properties: { type: { enum: ["adaptive"] } } },
+          max_tokens: { type: "integer" },
+        },
+      },
+    }]);
+    setCachedDynamicModels([model!]);
     const fetchMock = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":5}');
     vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
     await collect(
-      streamKiro(makeModel({ id: "claude-opus-4-8", maxTokens: 128000 }), makeContext(), {
+      streamKiro(model!, makeContext(), {
         apiKey: "tok",
         maxTokens: 50000,
       }),
@@ -1087,10 +1386,23 @@ describe("streamKiro bug fixes", () => {
   });
 
   it("#11: clamps max_tokens to the model output window", async () => {
+    const [model] = buildModelsFromApi([{
+      modelId: "claude-opus-4.8",
+      modelName: "Claude Opus 4.8",
+      tokenLimits: { maxOutputTokens: 64_000 },
+      additionalModelRequestFieldsSchema: {
+        properties: {
+          output_config: { properties: { effort: { enum: ["low", "medium", "high", "max"] } } },
+          thinking: { properties: { type: { enum: ["adaptive"] } } },
+          max_tokens: { type: "integer" },
+        },
+      },
+    }]);
+    setCachedDynamicModels([model!]);
     const fetchMock = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":5}');
     vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
     await collect(
-      streamKiro(makeModel({ id: "claude-opus-4-8", maxTokens: 64000 }), makeContext(), {
+      streamKiro(model!, makeContext(), {
         apiKey: "tok",
         maxTokens: 999999,
       }),
@@ -1099,11 +1411,22 @@ describe("streamKiro bug fixes", () => {
     expect(body.additionalModelRequestFields?.max_tokens).toBe(64000);
   });
 
-  it("#11: omits max_tokens for models without thinking config", async () => {
+  it("#11: omits max_tokens when the catalog does not advertise it", async () => {
+    const [model] = buildModelsFromApi([{
+      modelId: "claude-sonnet-4.5",
+      modelName: "Claude Sonnet 4.5",
+      additionalModelRequestFieldsSchema: {
+        properties: {
+          output_config: { properties: { effort: { enum: ["low", "medium", "high", "max"] } } },
+          thinking: { properties: { type: { enum: ["adaptive"] } } },
+        },
+      },
+    }]);
+    setCachedDynamicModels([model!]);
     const fetchMock = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":5}');
     vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
     await collect(
-      streamKiro(makeModel({ id: "claude-sonnet-4-5" }), makeContext(), { apiKey: "tok", maxTokens: 50000 }),
+      streamKiro(model!, makeContext(), { apiKey: "tok", maxTokens: 50000 }),
     );
     const body = JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string);
     expect(body.additionalModelRequestFields?.max_tokens).toBeUndefined();
@@ -1228,6 +1551,7 @@ describe("text-only END_TURN stream (real capture #2, no metadataEvent)", () => 
       '{"unit":"credit","unitPlural":"credits","usage":0.4933805256384743}';
     vi.spyOn(globalThis, "fetch").mockImplementation(mockFetchOk(body));
     const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+    expect(events.some((event) => event.type === "thinking_signature" && event.signature === "SIG==")).toBe(true);
     const done = events.find((e) => e.type === "done");
     expect(done?.type).toBe("done");
     if (done?.type === "done") {

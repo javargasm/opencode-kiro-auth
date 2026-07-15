@@ -107,6 +107,7 @@ export async function tryRegisterAndAuthorize(
         scopes: SSO_SCOPES,
         grantTypes: ["urn:ietf:params:oauth:grant-type:device_code", "refresh_token"],
       }),
+      signal: AbortSignal.timeout(10_000),
     });
     if (!regResp.ok) return null;
     const { clientId, clientSecret } = (await regResp.json()) as ClientRegisterResponse;
@@ -115,6 +116,7 @@ export async function tryRegisterAndAuthorize(
       method: "POST",
       headers: { "Content-Type": "application/json", "User-Agent": "opencode-kiro" },
       body: JSON.stringify({ clientId, clientSecret, startUrl }),
+      signal: AbortSignal.timeout(10_000),
     });
     if (!devResp.ok) return null;
 
@@ -156,6 +158,9 @@ export async function pollForToken(
           deviceCode: devAuth.deviceCode,
           grantType: "urn:ietf:params:oauth:grant-type:device_code",
         }),
+        signal: signal
+          ? AbortSignal.any([signal, AbortSignal.timeout(10_000)])
+          : AbortSignal.timeout(10_000),
       });
     } catch {
       continue;
@@ -207,6 +212,7 @@ export async function refreshKiroToken(
       method: "POST",
       headers: { "Content-Type": "application/json", "User-Agent": "opencode-kiro" },
       body: JSON.stringify({ refreshToken }),
+      signal: AbortSignal.timeout(10_000),
     });
     if (!resp.ok) {
       const body = await resp.text().catch(() => "");
@@ -251,6 +257,7 @@ export async function refreshKiroToken(
     method: "POST",
     headers: { "Content-Type": "application/json", "User-Agent": "opencode-kiro" },
     body: JSON.stringify({ clientId, clientSecret, refreshToken, grantType: "refresh_token" }),
+    signal: AbortSignal.timeout(10_000),
   });
   if (!resp.ok) {
     const body = await resp.text().catch(() => "");
@@ -790,6 +797,7 @@ export async function startSocialLogin(): Promise<{
           code_verifier: verifier,
           redirect_uri: tokenRedirectUri,
         }),
+        signal: AbortSignal.timeout(10_000),
       });
 
       if (!resp.ok) {
@@ -831,4 +839,3 @@ export async function startSocialLogin(): Promise<{
 
   return { signInUrl, waitForCredentials };
 }
-

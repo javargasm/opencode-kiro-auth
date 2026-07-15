@@ -71,6 +71,22 @@ describe("parseKiroEvents — full stream ordering (usage before metering)", () 
   });
 });
 
+describe("redacted reasoning events", () => {
+  it("preserves opaque redacted content without turning it into text", () => {
+    const opaque = "c2Vuc2l0aXZlLXJlZGFjdGVkLWNvbnRlbnQ=";
+    const { events } = parseKiroEvents(
+      ":event-type reasoningContentEvent:content-type application/json:message-type event" +
+        JSON.stringify({ redactedContent: opaque }),
+    );
+    const reasoning = events.find((e) => e.type === "reasoning");
+    expect(reasoning).toBeDefined();
+    if (reasoning?.type === "reasoning") {
+      expect(reasoning.data.text).toBe("");
+      expect(reasoning.data.redactedContent).toBe(opaque);
+    }
+  });
+});
+
 describe("AWS Event Stream exception framing (vnd.amazon.eventstream)", () => {
   // Simulate the text-decoded bytes of an exception message: header name +
   // value-type byte (0x07 = string) + 2-byte big-endian length + value, then

@@ -335,6 +335,23 @@ export function sameKiroCliCredential(
     left.authMethod === right.authMethod;
 }
 
+/** Match OpenCode's packed refresh credential to its current Kiro CLI row. */
+export function matchesPackedKiroCredential(
+  refreshPacked: string,
+  candidate: KiroCliCredentials | null,
+): boolean {
+  if (!candidate) return false;
+  const [refreshToken = "", clientId = "", clientSecret = "", , source = "", tokenKey = ""] =
+    refreshPacked.split("|");
+  const clientMatches = (!clientId || clientId === (candidate.clientId ?? ""))
+    && (!clientSecret || clientSecret === (candidate.clientSecret ?? ""));
+
+  if (source && tokenKey) {
+    return clientMatches && source === candidate.source && tokenKey === candidate.tokenKey;
+  }
+  return Boolean(refreshToken) && clientMatches && refreshToken === candidate.refreshToken;
+}
+
 /**
  * Extract region from an ARN string (e.g. arn:aws:codewhisperer:us-east-1:...).
  * Returns undefined if the ARN is malformed.
