@@ -4,6 +4,9 @@ on:
   push:
     tags:
       - "v*"
+  # Allow re-publishing the version currently on main without moving a tag
+  # (used to recover a release whose tag-triggered run failed).
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -11,23 +14,28 @@ permissions:
 
 jobs:
   publish:
+    name: Publish npm package
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+      # Node 24 ships an npm new enough that the upgrade below stays engine-compatible.
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
           registry-url: "https://registry.npmjs.org"
-      # Trusted Publishing via OIDC requires npm >= 11.5.1. Node 20 ships
-      # with npm 10.x, so upgrade the global npm CLI before publishing.
+      # Trusted publishing (OIDC) requires npm >= 11.5.1. npm@latest (12.x) needs
+      # Node >= 24.15, which the Node 24 runner satisfies.
       - run: npm install -g npm@latest
       - run: bun install --frozen-lockfile
       - run: bun run typecheck
-      # Gateway tests (test:bun) use Bun.serve and require the bun runtime;
-      # they run locally via `bun run check` but are skipped in CI.
+      # test:bun uses Bun.serve and needs the bun runtime; it runs locally via
+      # `bun run check` but is skipped in CI. `bun run test` covers the rest.
       - run: bun run test
       - run: bun run build
-      - run: npm publish
+      # No NODE_AUTH_TOKEN: authentication comes from the OIDC trusted publisher
+      # configured for this repo + workflow on npmjs.com. Provenance is implied
+      # by trusted publishing but kept explicit for clarity.
+      - run: npm publish --provenance --access public
