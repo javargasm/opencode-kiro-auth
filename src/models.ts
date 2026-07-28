@@ -12,6 +12,7 @@ import type { KiroNativeEffort, ThinkingLevel } from "./types";
 export const KIRO_MODEL_IDS = new Set<string>([
   "claude-fable-5",
   "claude-sonnet-5",
+  "claude-opus-5",
   "claude-opus-4.8",
   "claude-opus-4.7",
   "claude-opus-4.6",
@@ -84,7 +85,7 @@ const BASE_URL = "https://runtime.us-east-1.kiro.dev";
 const ZERO_COST = Object.freeze({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
 const KIRO_CLI_ORIGIN = "KIRO_CLI";
 const KIRO_CLI_USER_AGENT =
-  "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererruntime/0.1.17593 os/macos lang/rust/1.92.0 md/appVersion-2.12.2 app/AmazonQ-For-CLI";
+  "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererruntime/0.1.17593 os/macos lang/rust/1.92.0 md/appVersion-2.15.0 app/AmazonQ-For-CLI";
 const KIRO_CLI_X_AMZ_USER_AGENT = `${KIRO_CLI_USER_AGENT} m/F,C`;
 const KIRO_MANAGEMENT_TARGET = {
   listAvailableProfiles: "AmazonCodeWhispererService.ListAvailableProfiles",
@@ -225,7 +226,26 @@ export const kiroModels: KiroModel[] = [
     idleTimeout: 180_000,
     nativeEfforts: ["low", "medium", "high", "xhigh", "max"],
     supportedEfforts: ["minimal", "low", "medium", "high", "xhigh"],
+    effortRequestField: "output_config",
     supportsThinkingConfig: true,
+    supportsMaxTokens: true,
+  },
+  {
+    ...KIRO_DEFAULTS,
+    id: "claude-opus-5",
+    name: "Claude Opus 5",
+    reasoning: true,
+    input: MULTIMODAL,
+    contextWindow: 1_000_000,
+    maxTokens: 128_000,
+    rateMultiplier: 2.2,
+    firstTokenTimeout: 180_000,
+    idleTimeout: 180_000,
+    nativeEfforts: ["low", "medium", "high", "xhigh", "max"],
+    supportedEfforts: ["minimal", "low", "medium", "high", "xhigh"],
+    effortRequestField: "output_config",
+    supportsThinkingConfig: true,
+    supportsMaxTokens: true,
   },
   {
     ...KIRO_DEFAULTS,
@@ -240,7 +260,9 @@ export const kiroModels: KiroModel[] = [
     idleTimeout: 180_000,
     nativeEfforts: ["low", "medium", "high", "xhigh", "max"],
     supportedEfforts: ["minimal", "low", "medium", "high", "xhigh"],
+    effortRequestField: "output_config",
     supportsThinkingConfig: true,
+    supportsMaxTokens: true,
   },
   {
     ...KIRO_DEFAULTS,
@@ -255,7 +277,9 @@ export const kiroModels: KiroModel[] = [
     idleTimeout: 180_000,
     nativeEfforts: ["low", "medium", "high", "xhigh", "max"],
     supportedEfforts: ["minimal", "low", "medium", "high", "xhigh"],
+    effortRequestField: "output_config",
     supportsThinkingConfig: true,
+    supportsMaxTokens: true,
   },
   {
     ...KIRO_DEFAULTS,
@@ -268,7 +292,9 @@ export const kiroModels: KiroModel[] = [
     rateMultiplier: 2.2,
     nativeEfforts: ["low", "medium", "high", "max"],
     supportedEfforts: ["minimal", "low", "medium", "xhigh"],
+    effortRequestField: "output_config",
     supportsThinkingConfig: true,
+    supportsMaxTokens: true,
   },
   {
     ...KIRO_DEFAULTS,
@@ -281,7 +307,9 @@ export const kiroModels: KiroModel[] = [
     rateMultiplier: 1.3,
     nativeEfforts: ["low", "medium", "high", "max"],
     supportedEfforts: ["minimal", "low", "medium", "xhigh"],
+    effortRequestField: "output_config",
     supportsThinkingConfig: true,
+    supportsMaxTokens: true,
   },
   {
     ...KIRO_DEFAULTS,

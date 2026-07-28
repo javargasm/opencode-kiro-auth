@@ -214,7 +214,7 @@ describe("Kiro management API requests", () => {
     expect(headers.Authorization).toBe("Bearer access-token");
     expect(headers["Content-Type"]).toBe("application/x-amz-json-1.0");
     expect(headers["X-Amz-Target"]).toBe("AmazonCodeWhispererService.ListAvailableModels");
-    expect(headers["user-agent"]).toContain("md/appVersion-2.12.2 app/AmazonQ-For-CLI");
+    expect(headers["user-agent"]).toContain("md/appVersion-2.15.0 app/AmazonQ-For-CLI");
     expect(headers["x-amz-user-agent"]).toContain("m/F,C");
     expect(headers["x-amzn-codewhisperer-optout"]).toBe("true");
     expect(headers["amz-sdk-request"]).toBe("attempt=1; max=3");
@@ -283,6 +283,6 @@ describe("Kiro management API requests", () => {
 
     const headers = init?.headers as Record<string, string>;
     expect(headers["X-Amz-Target"]).toBe("AmazonCodeWhispererService.ListAvailableProfiles");
-    expect(headers["user-agent"]).toContain("md/appVersion-2.12.2 app/AmazonQ-For-CLI");
+    expect(headers["user-agent"]).toContain("md/appVersion-2.15.0 app/AmazonQ-For-CLI");
   });
 });

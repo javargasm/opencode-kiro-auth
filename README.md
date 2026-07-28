@@ -18,7 +18,11 @@ Kiro provider plugin for [OpenCode](https://opencode.ai). Authenticates via AWS 
 | Model | Reasoning | Context | Rate | Effort Levels |
 |:---|:---:|:---:|:---:|:---|
 | Claude Sonnet 5 | ✅ | 1M | 1.3x | low, medium, high, xhigh, max |
+| Claude Opus 5 | ✅ | 1M | 2.2x | low, medium, high, xhigh, max |
 | Claude Opus 4.8 | ✅ | 1M | 2.2x | low, medium, high, xhigh, max |
+| GPT 5.6 Sol | ✅ | 272K | 2.4x | none, low, medium, high, xhigh, max |
+| GPT 5.6 Terra | ✅ | 272K | 1.2x | none, low, medium, high, xhigh, max |
+| GPT 5.6 Luna | ✅ | 272K | 0.6x | none, low, medium, high, xhigh, max |
 | Claude Opus 4.7 | ✅ | 1M | 2.2x | low, medium, high, xhigh, max |
 | Claude Opus 4.6 | ✅ | 1M | 2.2x | low, medium, high, max |
 | Claude Sonnet 4.6 | ✅ | 1M | 1.3x | low, medium, high, max |
@@ -111,13 +115,14 @@ Use the model picker in the OpenCode TUI or set a default in your `opencode.json
 
 ### Reasoning effort
 
-Models that support adaptive thinking accept effort levels through OpenCode's reasoning configuration. The plugin passes them 1:1 to Kiro's `output_config.effort` parameter:
+Models that support adaptive thinking accept effort levels through OpenCode's reasoning configuration. The plugin passes them 1:1 to Kiro's `output_config.effort` (or `reasoning.effort`) parameter:
 
+- `none` — reasoning disabled (GPT 5.6 series)
 - `low` — speed/cost optimized
 - `medium` — balanced general-purpose
 - `high` — default, best balance
-- `xhigh` — complex multi-step tasks (Fable 5, Opus 4.7, 4.8)
-- `max` — maximum reasoning depth (Fable 5, Opus 4.7, 4.8)
+- `xhigh` — complex multi-step tasks (Opus 5, Opus 4.8, Opus 4.7, Sonnet 5, GPT 5.6)
+- `max` — maximum reasoning depth (Opus 5, Opus 4.8, Opus 4.7, Sonnet 5, GPT 5.6)
 
 Not all models support every level — see the model table above for supported efforts per model.
 

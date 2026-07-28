@@ -1,5 +1,19 @@
 # @javargasm/opencode-kiro-auth
 
+## 0.7.3
+
+### Patch Changes
+
+- Update Kiro model catalog static definitions and User-Agent headers to match official Kiro CLI client responses and requests.
+
+  Models:
+  - Add static catalog entry for `Claude Opus 5` and configure `effortRequestField: "output_config"` and `supportsMaxTokens: true` for all Claude reasoning models.
+  - Update cost estimation pricing in `dashboard-stats.ts` for `claude-opus-5` and the GPT 5.6 series (`gpt-5-6-sol`, `gpt-5-6-terra`, `gpt-5-6-luna`).
+  - Update `README.md` supported models table and reasoning effort documentation.
+
+  Headers:
+  - Bump Kiro CLI `appVersion` in User-Agent and X-Amz-User-Agent strings from `2.12.2` to `2.15.0`.
+
 ## 0.7.0
 
 ### Minor Changes

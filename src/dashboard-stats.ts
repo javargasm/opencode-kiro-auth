@@ -24,11 +24,19 @@ const MODEL_PRICING: Record<string, TokenPrice> = {
   // Claude Sonnet 5 Series
   "claude-sonnet-5": { input: 3.00, output: 15.00 },
 
+  // Claude Opus 5 Series
+  "claude-opus-5": { input: 5.00, output: 25.00 },
+
   // Claude Opus 4 Series
   "claude-opus-4-8": { input: 5.00, output: 25.00 },
   "claude-opus-4-7": { input: 5.00, output: 25.00 },
   "claude-opus-4-6": { input: 5.00, output: 25.00 },
   "claude-opus-4-5": { input: 5.00, output: 25.00 },
+
+  // GPT 5.6 Series
+  "gpt-5-6-sol": { input: 5.00, output: 25.00 },
+  "gpt-5-6-terra": { input: 2.50, output: 10.00 },
+  "gpt-5-6-luna": { input: 1.25, output: 5.00 },
 
   // Claude Sonnet 4 Series
   "claude-sonnet-4-6": { input: 3.00, output: 15.00 },
