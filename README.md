@@ -99,7 +99,7 @@ Once the plugin is loaded, authenticate through the OpenCode TUI:
 
 After authentication, select any Kiro model in the OpenCode model picker. The plugin:
 
-1. Starts a local Anthropic-compatible gateway on a random port
+1. Starts a shared local Anthropic-compatible gateway on `127.0.0.1:7438`
 2. Registers all available models as OpenCode provider entries
 3. Routes requests through `@ai-sdk/anthropic` → local gateway → Kiro CodeWhisperer API
 
@@ -125,6 +125,63 @@ Models that support adaptive thinking accept effort levels through OpenCode's re
 - `max` — maximum reasoning depth (Opus 5, Opus 4.8, Opus 4.7, Sonnet 5, GPT 5.6)
 
 Not all models support every level — see the model table above for supported efforts per model.
+
+### Using the gateway from other clients
+
+The gateway accepts standard Anthropic Messages API clients; it is not limited to
+OpenCode. Keep an OpenCode process with the plugin loaded while using it, then use
+`http://127.0.0.1:7438` as the Anthropic base URL. The local gateway secret is
+created with mode `0600` at:
+
+```text
+${XDG_CACHE_HOME:-$HOME/.cache}/opencode-kiro/gateway-token
+```
+
+For Claude Code and other clients that use bearer authentication:
+
+```bash
+export ANTHROPIC_BASE_URL="http://127.0.0.1:7438"
+export ANTHROPIC_AUTH_TOKEN="$(cat "${XDG_CACHE_HOME:-$HOME/.cache}/opencode-kiro/gateway-token")"
+export ANTHROPIC_MODEL="claude-sonnet-4-6"
+claude
+```
+
+For a persistent Claude Code configuration, use `apiKeyHelper`. Values under
+`env` in `~/.claude/settings.json` are literal strings and do not execute shell
+substitutions such as `$(cat ...)`:
+
+```json
+{
+  "apiKeyHelper": "cat \"${XDG_CACHE_HOME:-$HOME/.cache}/opencode-kiro/gateway-token\"",
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:7438"
+  }
+}
+```
+
+Anthropic SDKs normally send the same value as `x-api-key`. Both standard forms
+are supported:
+
+```bash
+GATEWAY_TOKEN="$(cat "${XDG_CACHE_HOME:-$HOME/.cache}/opencode-kiro/gateway-token")"
+export ANTHROPIC_BASE_URL="http://127.0.0.1:7438"
+export ANTHROPIC_API_KEY="$GATEWAY_TOKEN"
+
+curl -sS "http://127.0.0.1:7438/v1/models" \
+  -H "x-api-key: $GATEWAY_TOKEN"
+
+curl -sS "http://127.0.0.1:7438/v1/messages" \
+  -H "x-api-key: $GATEWAY_TOKEN" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "content-type: application/json" \
+  -d '{"model":"claude-sonnet-4-6","max_tokens":1024,"messages":[{"role":"user","content":"Hello"}]}'
+```
+
+You can set `KIRO_GATEWAY_TOKEN` before starting OpenCode to choose a stable
+secret instead. This secret authenticates only the loopback gateway; it is not
+an AWS/Kiro access token and must not be shared. The API implements Anthropic
+`GET /v1/models` and `POST /v1/messages`; OpenAI `chat/completions` payloads are
+not supported.
 
 ### Network retry behavior
 
@@ -285,7 +342,10 @@ test/
                         │ • Handles retry, capacity, context truncation
 ```
 
-The gateway runs on `127.0.0.1` on a random port. It accepts standard Anthropic Messages API requests and translates them bidirectionally to Kiro's proprietary CodeWhisperer streaming protocol.
+The gateway runs on the fixed loopback address `127.0.0.1:7438` so multiple
+OpenCode processes and external local clients can share it. It accepts standard
+Anthropic Messages API requests and translates them bidirectionally to Kiro's
+proprietary CodeWhisperer streaming protocol.
 
 ## License
 

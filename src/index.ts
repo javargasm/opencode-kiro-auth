@@ -62,6 +62,16 @@ type GatewayServer = Awaited<ReturnType<typeof startGatewayServer>>;
 type GatewayMode = "stopped" | "owned" | "shared";
 type GatewayProbeStatus = "ready" | "starting" | "unavailable" | "incompatible";
 
+interface GatewayRecoveryOptions {
+  timeoutMs?: number;
+  probeTimeoutMs?: number;
+  retryIntervalMs?: number;
+}
+
+const GATEWAY_RECOVERY_TIMEOUT_MS = 30_000;
+const GATEWAY_PROBE_TIMEOUT_MS = 1_500;
+const GATEWAY_RETRY_INTERVAL_MS = 100;
+
 // Module-level state is shared by every workspace loaded in one OpenCode process.
 let gatewayServer: GatewayServer | null = null;
 let gatewayMode: GatewayMode = "stopped";
@@ -174,12 +184,16 @@ export function gatewayRequestHeaders(gatewayToken: string): Record<string, stri
   };
 }
 
-export async function probeGateway(port: number, gatewayToken?: string): Promise<GatewayProbeStatus> {
+export async function probeGateway(
+  port: number,
+  gatewayToken?: string,
+  timeoutMs: number = GATEWAY_PROBE_TIMEOUT_MS,
+): Promise<GatewayProbeStatus> {
   try {
     const challenge = crypto.randomUUID();
     const response = await fetch(`${gatewayOrigin(port)}/health`, {
       headers: { [GATEWAY_CHALLENGE_HEADER]: challenge },
-      signal: AbortSignal.timeout(750),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     if (!response.ok) return "unavailable";
     const body = await response.json() as {
@@ -227,21 +241,55 @@ export async function startOrAttachGateway(
   port: number,
   initialize: () => Promise<void> = initGatewayAuth,
   gatewayToken?: string,
+  recovery: GatewayRecoveryOptions = {},
 ): Promise<{ mode: Exclude<GatewayMode, "stopped">; server: GatewayServer | null }> {
   let ready = false;
-  let server: GatewayServer;
+  let server: GatewayServer | null = null;
   try {
     server = await startGatewayServer(port, { isReady: () => ready, gatewayToken });
   } catch (startError) {
-    if (await waitForCompatibleGateway(port, gatewayToken)) {
-      return { mode: "shared", server: null };
+    const timeoutMs = recovery.timeoutMs ?? GATEWAY_RECOVERY_TIMEOUT_MS;
+    const probeTimeoutMs = recovery.probeTimeoutMs ?? GATEWAY_PROBE_TIMEOUT_MS;
+    const retryIntervalMs = recovery.retryIntervalMs ?? GATEWAY_RETRY_INTERVAL_MS;
+    const deadline = Date.now() + timeoutMs;
+    let lastStartError: unknown = startError;
+    let lastStatus: GatewayProbeStatus = "unavailable";
+
+    // The current owner can be temporarily unable to answer /health while its
+    // event loop is busy, or it can exit between our probe and bind attempt.
+    // Keep alternating authenticated probes and takeover attempts until one
+    // process wins instead of giving up after one failed rebind.
+    while (Date.now() < deadline) {
+      lastStatus = await probeGateway(port, gatewayToken, probeTimeoutMs);
+      if (lastStatus === "ready") {
+        return { mode: "shared", server: null };
+      }
+      if (lastStatus === "incompatible") {
+        throw new Error(`Port ${port} is owned by an incompatible local service`);
+      }
+
+      if (lastStatus === "unavailable") {
+        try {
+          server = await startGatewayServer(port, { isReady: () => ready, gatewayToken });
+          break;
+        } catch (retryError) {
+          lastStartError = retryError;
+        }
+      }
+
+      const remainingMs = deadline - Date.now();
+      if (remainingMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, Math.min(retryIntervalMs, remainingMs)));
+      }
     }
-    try {
-      server = await startGatewayServer(port, { isReady: () => ready, gatewayToken });
-    } catch (retryError) {
-      const detail = retryError instanceof Error ? retryError.message : String(retryError);
+
+    if (!server) {
+      const detail = lastStartError instanceof Error ? lastStartError.message : String(lastStartError);
       const initialDetail = startError instanceof Error ? startError.message : String(startError);
-      throw new Error(`Cannot start or attach to the local gateway on port ${port}: ${detail} (${initialDetail})`);
+      throw new Error(
+        `Cannot start or attach to the local gateway on port ${port} after ${timeoutMs}ms `
+        + `(last probe: ${lastStatus}): ${detail} (${initialDetail})`,
+      );
     }
   }
 

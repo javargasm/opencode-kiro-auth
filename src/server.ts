@@ -32,8 +32,13 @@ export const GATEWAY_AUTH_HEADER = "x-opencode-kiro-gateway-token";
 export const GATEWAY_AUTH_TIMESTAMP_HEADER = "x-opencode-kiro-gateway-timestamp";
 export const GATEWAY_AUTH_NONCE_HEADER = "x-opencode-kiro-gateway-nonce";
 export const GATEWAY_CHALLENGE_HEADER = "x-opencode-kiro-challenge";
-export const GATEWAY_PROTOCOL_VERSION = 3;
-export const GATEWAY_CAPABILITIES = ["request-workspace", "dynamic-models", "domain-separated-auth"] as const;
+export const GATEWAY_PROTOCOL_VERSION = 4;
+export const GATEWAY_CAPABILITIES = [
+  "request-workspace",
+  "dynamic-models",
+  "domain-separated-auth",
+  "standard-client-auth",
+] as const;
 
 export function gatewayChallengeProof(token: string, challenge: string): string {
   return createHmac("sha256", token).update(`health-proof:v1:${challenge}`).digest("hex");
@@ -45,8 +50,28 @@ export function gatewayRequestSignature(token: string, timestamp: string, nonce:
 
 const usedGatewayNonces = new Map<string, number>();
 
+function bearerToken(req: Request): string | undefined {
+  return req.headers.get("authorization")?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim() || undefined;
+}
+
+function matchesGatewayToken(candidate: string | null | undefined, gatewayToken: string | undefined): boolean {
+  if (!candidate || !gatewayToken) return false;
+  const actual = Buffer.from(candidate.trim());
+  const expected = Buffer.from(gatewayToken);
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
 function hasValidGatewayRequestAuth(req: Request, gatewayToken: string | undefined): boolean {
   if (!gatewayToken) return true;
+  // Generic Anthropic clients cannot generate OpenCode's nonce-bound HMAC.
+  // Accept the local gateway secret through either standard API-key transport.
+  if (
+    matchesGatewayToken(req.headers.get("x-api-key"), gatewayToken)
+    || matchesGatewayToken(bearerToken(req), gatewayToken)
+  ) {
+    return true;
+  }
+
   const timestamp = req.headers.get(GATEWAY_AUTH_TIMESTAMP_HEADER) ?? "";
   const nonce = req.headers.get(GATEWAY_AUTH_NONCE_HEADER) ?? "";
   const signature = req.headers.get(GATEWAY_AUTH_HEADER) ?? "";
@@ -661,7 +686,11 @@ export function startGatewayServer(
             "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
             "Access-Control-Allow-Headers": [
               "Content-Type",
+              "Accept",
               "Authorization",
+              "x-api-key",
+              "anthropic-version",
+              "anthropic-beta",
               "x-session-id",
               OPENCODE_CWD_HEADER,
               OPENCODE_EFFORT_HEADER,
@@ -725,7 +754,8 @@ export function startGatewayServer(
           }
           let dynamicModels: KiroModel[] | null;
           if (url.searchParams.get("refresh") === "1") {
-            const bearer = req.headers.get("authorization")?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
+            const requestBearer = bearerToken(req);
+            const bearer = matchesGatewayToken(requestBearer, options.gatewayToken) ? undefined : requestBearer;
             if (bearer) {
               try {
                 const requestRegion = req.headers.get(OPENCODE_REGION_HEADER)?.trim() || BUILDER_ID_REGION;
@@ -810,7 +840,10 @@ export function startGatewayServer(
           if (!hasValidGatewayRequestAuth(req, options.gatewayToken)) {
             return anthropicError(401, "authentication_error", "Invalid local gateway token");
           }
-          const bearer = req.headers.get("authorization")?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
+          const requestBearer = bearerToken(req);
+          // Authorization may carry the local gateway secret for clients that
+          // do not support x-api-key. Never forward that secret to Kiro.
+          const bearer = matchesGatewayToken(requestBearer, options.gatewayToken) ? undefined : requestBearer;
           const ownerRequest = !bearer || isOwnerAccessToken(bearer);
           let accessToken: string;
           try {

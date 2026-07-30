@@ -4,6 +4,7 @@ import {
   GATEWAY_CHALLENGE_HEADER,
   GATEWAY_PROTOCOL_VERSION,
   OPENCODE_EFFORT_HEADER,
+  gatewayChallengeProof,
   refreshGatewayModels,
   startGatewayServer,
   _clearCredentials,
@@ -150,6 +151,48 @@ describe("Local HTTP Gateway Server (Anthropic Protocol)", () => {
     await server.stop(true);
   });
 
+  it("accepts the gateway token from standard Anthropic client headers", async () => {
+    const gatewayToken = "generic-client-gateway-token";
+    _seedCredentials("owner-kiro-access-token");
+    mockStreamKiro.mockImplementation(okStream);
+    const server = await startGatewayServer(0, { gatewayToken });
+    const send = (headers: Record<string, string>) => fetch(`http://127.0.0.1:${server.port}/v1/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...headers },
+      body: JSON.stringify({ model: "claude-sonnet-4-6", messages: [{ role: "user", content: "Hello" }] }),
+    });
+
+    try {
+      const models = await fetch(`http://127.0.0.1:${server.port}/v1/models`, {
+        headers: { "x-api-key": gatewayToken },
+      });
+      expect(models.status).toBe(200);
+      expect((await send({ "x-api-key": gatewayToken })).status).toBe(200);
+      expect((await send({ Authorization: `Bearer ${gatewayToken}` })).status).toBe(200);
+      expect(mockStreamKiro).toHaveBeenCalledTimes(2);
+      expect((mockStreamKiro.mock.calls[0] as any[])[2]?.apiKey).toBe("owner-kiro-access-token");
+      expect((mockStreamKiro.mock.calls[1] as any[])[2]?.apiKey).toBe("owner-kiro-access-token");
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  it("rejects incorrect static API keys", async () => {
+    const server = await startGatewayServer(0, { gatewayToken: "correct-gateway-token" });
+    const response = await fetch(`http://127.0.0.1:${server.port}/v1/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": "incorrect-gateway-token" },
+      body: JSON.stringify({ model: "claude-sonnet-4-6", messages: [{ role: "user", content: "Hello" }] }),
+    });
+
+    expect(response.status).toBe(401);
+    expect(await response.json()).toMatchObject({
+      error: { type: "authentication_error", message: "Invalid local gateway token" },
+    });
+    expect(mockStreamKiro).not.toHaveBeenCalled();
+    await server.stop(true);
+  });
+
   it("attaches a second controller to a compatible gateway and takes over after owner shutdown", async () => {
     const gatewayToken = "shared-test-token";
     const owner = await startGatewayServer(0, { gatewayToken });
@@ -193,6 +236,70 @@ describe("Local HTTP Gateway Server (Anthropic Protocol)", () => {
     }, 50);
 
     const takeover = await takeoverPromise;
+    expect(takeover.mode).toBe("owned");
+    expect(takeover.server?.port).toBe(port);
+    await takeover.server?.stop(true);
+  });
+
+  it("keeps recovering while an occupied gateway is temporarily too slow to probe", async () => {
+    const gatewayToken = "slow-health-recovery-token";
+    let healthResponsive = false;
+    const owner = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      async fetch(req) {
+        if (!healthResponsive) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        const challenge = req.headers.get(GATEWAY_CHALLENGE_HEADER);
+        return Response.json({
+          status: "healthy",
+          service: "opencode-kiro-gateway",
+          protocolVersion: GATEWAY_PROTOCOL_VERSION,
+          capabilities: GATEWAY_CAPABILITIES,
+          ready: true,
+          proof: challenge ? gatewayChallengeProof(gatewayToken, challenge) : undefined,
+        });
+      },
+    });
+    const recovery = startOrAttachGateway(owner.port!, async () => {}, gatewayToken, {
+      timeoutMs: 1_000,
+      probeTimeoutMs: 10,
+      retryIntervalMs: 10,
+    });
+
+    setTimeout(() => {
+      healthResponsive = true;
+    }, 80);
+
+    const attached = await recovery;
+    expect(attached.mode).toBe("shared");
+    expect(attached.server).toBeNull();
+    await owner.stop(true);
+  });
+
+  it("takes ownership after an unresponsive listener releases the port", async () => {
+    const gatewayToken = "unresponsive-takeover-token";
+    const previousOwner = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      async fetch() {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        return new Response(null, { status: 503 });
+      },
+    });
+    const port = previousOwner.port!;
+    const recovery = startOrAttachGateway(port, async () => {}, gatewayToken, {
+      timeoutMs: 1_000,
+      probeTimeoutMs: 10,
+      retryIntervalMs: 10,
+    });
+
+    setTimeout(() => {
+      void previousOwner.stop(true);
+    }, 80);
+
+    const takeover = await recovery;
     expect(takeover.mode).toBe("owned");
     expect(takeover.server?.port).toBe(port);
     await takeover.server?.stop(true);
@@ -346,14 +453,17 @@ describe("Local HTTP Gateway Server (Anthropic Protocol)", () => {
     }
   });
 
-  it("accepts the local effort header in CORS preflight", async () => {
+  it("accepts Anthropic and local headers in CORS preflight", async () => {
     const server = await startGatewayServer(0);
     const response = await fetch(`http://127.0.0.1:${server.port}/v1/messages`, {
       method: "OPTIONS",
       headers: { Origin: "http://localhost:3000" },
     });
 
-    expect(response.headers.get("Access-Control-Allow-Headers")).toContain(OPENCODE_EFFORT_HEADER);
+    const allowedHeaders = response.headers.get("Access-Control-Allow-Headers");
+    expect(allowedHeaders).toContain(OPENCODE_EFFORT_HEADER);
+    expect(allowedHeaders).toContain("x-api-key");
+    expect(allowedHeaders).toContain("anthropic-version");
     expect(response.headers.get("Access-Control-Allow-Origin")).toBe("http://localhost:3000");
     await server.stop(true);
   });
