@@ -1,5 +1,11 @@
 # @javargasm/opencode-kiro-auth
 
+## 8.1.1
+
+### Patch Changes
+
+- Finalize a fully parsed tool turn when Kiro emits its generic retryable `ServiceException` immediately after the completed tool call, while continuing to surface genuine partial-text and incomplete-tool failures.
+
 ## 8.1.0
 
 ### Minor Changes

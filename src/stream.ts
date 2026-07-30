@@ -76,6 +76,8 @@ const CONTEXT_TRUNCATION_DROP_RATIO = 0.3;
 const TOO_BIG_PATTERNS = ["CONTENT_LENGTH_EXCEEDS_THRESHOLD", "Input is too long"];
 const NON_RETRYABLE_BODY_PATTERNS = ["MONTHLY_REQUEST_COUNT", "Improperly formed"];
 const CAPACITY_PATTERN = "INSUFFICIENT_MODEL_CAPACITY";
+const RECOVERABLE_POST_OUTPUT_SERVICE_EXCEPTION =
+  "ServiceException: Encountered an unexpected error when processing the request, please try again.";
 
 function exponentialBackoff(attempt: number, baseMs: number, maxMs: number): number {
   return Math.min(baseMs * 2 ** attempt, maxMs);
@@ -99,6 +101,10 @@ function isTransientError(status: number): boolean {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function isRecoverablePostOutputServiceException(error: string | null): boolean {
+  return error === RECOVERABLE_POST_OUTPUT_SERVICE_EXCEPTION;
 }
 
 function yieldToEventLoop(): Promise<void> {
@@ -918,6 +924,7 @@ export function streamKiro(
         let emittedToolCalls = 0;
         let sawAnyToolCalls = false;
         let currentToolCall: KiroToolCallState | null = null;
+        let endedAtCompletedToolUse = false;
         const flushToolCall = () => {
           if (!currentToolCall) return;
           if (emitToolCall(currentToolCall, output, stream)) emittedToolCalls++;
@@ -1034,6 +1041,9 @@ export function streamKiro(
             const sequence = eventSeq++;
             if (debugEvents) log.debug("stream.event", { seq: sequence, event });
             fileLog.logResponseEvent({ type: event.type, data: event.data, eventSeq: sequence });
+            if (event.type !== "toolUseStop" && event.type !== "error") {
+              endedAtCompletedToolUse = false;
+            }
             switch (event.type) {
               case "contextUsage": {
                 const pct = event.data.contextUsagePercentage;
@@ -1137,7 +1147,11 @@ export function streamKiro(
                 }
                 currentToolCall.input += tc.input || "";
                 if (tc.input) totalContent += tc.input;
-                if (tc.stop) flushToolCall();
+                if (tc.stop) {
+                  const emittedBeforeStop = emittedToolCalls;
+                  flushToolCall();
+                  endedAtCompletedToolUse = emittedToolCalls > emittedBeforeStop;
+                }
                 break;
               }
               case "toolUseInput": {
@@ -1146,7 +1160,12 @@ export function streamKiro(
                 break;
               }
               case "toolUseStop": {
-                if (event.data.stop) flushToolCall();
+                if (event.data.stop) {
+                  const emittedBeforeStop = emittedToolCalls;
+                  flushToolCall();
+                  endedAtCompletedToolUse = currentToolCall === null
+                    && (endedAtCompletedToolUse || emittedToolCalls > emittedBeforeStop);
+                }
                 break;
               }
               case "usage": {
@@ -1203,6 +1222,27 @@ export function streamKiro(
             stopReason: serverStopReason,
           });
           transportError = null;
+        }
+
+        if (isRecoverablePostOutputServiceException(streamError)) {
+          if (terminalOutputIsComplete) {
+            log.info("stream ServiceException arrived after terminal metadata — finalizing completed turn", {
+              stopReason: serverStopReason,
+            });
+            streamError = null;
+          } else if (
+            endedAtCompletedToolUse
+            && currentToolCall === null
+            && emittedToolCalls > 0
+          ) {
+            // The generic retryable ServiceException can be emitted immediately
+            // after a fully parsed tool call, before Kiro sends metadata. The
+            // tool block is already complete and consumer-visible, so retries
+            // would duplicate it; finalize this turn as TOOL_USE instead.
+            log.info("stream ServiceException arrived after completed tool call — finalizing tool turn");
+            serverStopReason = "TOOL_USE";
+            streamError = null;
+          }
         }
 
         if (firstTokenTimedOut || idleCancelled || streamError || transportError) {

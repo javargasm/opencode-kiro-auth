@@ -1614,6 +1614,109 @@ describe("streamKiro bug fixes", () => {
     }
   });
 
+  it("finalizes a completed tool turn followed by the generic retryable ServiceException", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      mockFetchOk(
+        '{"name":"read","toolUseId":"call-1","input":"{\\"filePath\\":\\"/tmp/a\\"}","stop":true}' +
+          '{"error":"ServiceException","message":"Encountered an unexpected error when processing the request, please try again."}',
+      ),
+    );
+
+    const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+
+    expect(events.some((event) => event.type === "toolcall_end")).toBe(true);
+    expect(events.find((event) => event.type === "error")).toBeUndefined();
+    const done = events.at(-1);
+    expect(done?.type).toBe("done");
+    if (done?.type === "done") {
+      expect(done.reason).toBe("toolUse");
+      const toolCall = done.message.content.find((block) => block.type === "toolCall");
+      expect(toolCall).toMatchObject({
+        type: "toolCall",
+        id: "call-1",
+        name: "read",
+        arguments: { filePath: "/tmp/a" },
+      });
+    }
+  });
+
+  it("still surfaces the generic ServiceException after partial text without a terminal boundary", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      mockFetchOk(
+        '{"content":"Partial"}' +
+          '{"error":"ServiceException","message":"Encountered an unexpected error when processing the request, please try again."}',
+      ),
+    );
+
+    const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+
+    expect(events.some((event) => event.type === "text_delta" && event.delta === "Partial")).toBe(true);
+    const terminal = events.at(-1);
+    expect(terminal?.type).toBe("error");
+    if (terminal?.type === "error") {
+      expect(terminal.error.errorMessage).toContain("ServiceException");
+      expect(terminal.error.errorMessage).toContain("after partial output");
+    }
+  });
+
+  it("retries then surfaces the generic ServiceException after an incomplete tool call", async () => {
+    vi.useFakeTimers();
+    try {
+      const body =
+        '{"name":"read","toolUseId":"call-1","input":"{\\"filePath\\":"}' +
+        '{"error":"ServiceException","message":"Encountered an unexpected error when processing the request, please try again."}';
+      const encoder = new TextEncoder();
+      const fetchMock = vi.fn().mockImplementation(() => Promise.resolve({
+        ok: true,
+        body: {
+          getReader: () => ({
+            read: vi.fn()
+              .mockResolvedValueOnce({ done: false, value: encoder.encode(body) })
+              .mockResolvedValueOnce({ done: true, value: undefined }),
+            cancel: vi.fn().mockResolvedValue(undefined),
+          }),
+        },
+      }));
+      vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
+
+      const pendingEvents = collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+      await vi.advanceTimersByTimeAsync(7_000);
+      const events = await pendingEvents;
+
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+      expect(events.some((event) => event.type === "toolcall_end")).toBe(false);
+      const terminal = events.at(-1);
+      expect(terminal?.type).toBe("error");
+      if (terminal?.type === "error") {
+        expect(terminal.error.errorMessage).toContain("ServiceException");
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("finalizes when the generic ServiceException follows authoritative terminal metadata", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      mockFetchOk(
+        '{"content":"Complete"}' +
+          '{"stopReason":"END_TURN"}' +
+          '{"contextUsagePercentage":5}' +
+          '{"error":"ServiceException","message":"Encountered an unexpected error when processing the request, please try again."}',
+      ),
+    );
+
+    const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+
+    expect(events.find((event) => event.type === "error")).toBeUndefined();
+    const done = events.at(-1);
+    expect(done?.type).toBe("done");
+    if (done?.type === "done") {
+      expect(done.reason).toBe("stop");
+      const text = done.message.content.find((block) => block.type === "text");
+      expect(text?.type === "text" ? text.text : "").toBe("Complete");
+    }
+  });
+
   it("#16: a signature-only reasoning frame creates no empty thinking block", async () => {
     vi.spyOn(globalThis, "fetch").mockImplementation(
       mockFetchOk('{"signature":"sig-only"}{"content":"Hi"}{"contextUsagePercentage":5}'),
