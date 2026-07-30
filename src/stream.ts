@@ -58,6 +58,7 @@ import {
 
 const FIRST_TOKEN_TIMEOUT_DEFAULT_MS = 90_000;
 const IDLE_TIMEOUT_MS = 60_000;
+const STREAM_EVENT_YIELD_INTERVAL = 128;
 const MAX_RETRIES = 3;
 const MAX_RETRY_DELAY_MS = 10_000;
 
@@ -98,6 +99,10 @@ function isTransientError(status: number): boolean {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function yieldToEventLoop(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
 }
 
 function findModel(modelId: string): KiroModel | undefined {
@@ -999,6 +1004,7 @@ export function streamKiro(
           }
 
           const { done, value } = readResult;
+          const bufferedBeforeRead = buffer.length;
           const decoded = done ? decoder.decode() : decoder.decode(value, { stream: true });
           buffer += decoded;
           if (!done && log.isDebug()) {
@@ -1013,25 +1019,21 @@ export function streamKiro(
           const { events, remaining } = parseKiroEvents(buffer);
           buffer = remaining;
 
-          // Only reset the idle timer when real events arrive — raw byte
-          // reads (keepalive framing, partial chunks) must NOT prevent the
-          // idle timeout from firing. Without this guard, the API's
-          // keepalive framing resets the timer on every chunk, causing
-          // potentially infinite stream hangs.
-          if (events.length > 0) resetIdle();
+          // Reset on complete events or growth of a parser-retained incomplete
+          // event. Arbitrary framing/keepalive bytes are discarded by the
+          // parser and therefore cannot keep a dead stream alive, while a
+          // large tool-use frame split across reads still counts as progress.
+          const retainedFrameProgress = !done
+            && decoded.length > 0
+            && remaining.length > bufferedBeforeRead;
+          if (events.length > 0 || retainedFrameProgress) resetIdle();
 
-          if (log.isDebug() && events.length > 0) {
-            for (const ev of events) {
-              log.debug("stream.event", { seq: eventSeq++, event: ev });
-            }
-          }
-
-          // File-based response event logging (KIRO_FILE_LOG=1)
-          for (const ev of events) {
-            fileLog.logResponseEvent({ type: ev.type, data: ev.data, eventSeq });
-          }
-
-          for (const event of events) {
+          const debugEvents = log.isDebug();
+          for (let eventIndex = 0; eventIndex < events.length; eventIndex++) {
+            const event = events[eventIndex]!;
+            const sequence = eventSeq++;
+            if (debugEvents) log.debug("stream.event", { seq: sequence, event });
+            fileLog.logResponseEvent({ type: event.type, data: event.data, eventSeq: sequence });
             switch (event.type) {
               case "contextUsage": {
                 const pct = event.data.contextUsagePercentage;
@@ -1175,18 +1177,44 @@ export function streamKiro(
               }
             }
             if (streamError) break;
+            if ((eventIndex + 1) % STREAM_EVENT_YIELD_INTERVAL === 0) {
+              // A single 256 KiB read can contain tens of thousands of tiny
+              // events. Yield between bounded batches so this process can
+              // continue serving gateway health checks and concurrent clients.
+              await yieldToEventLoop();
+            }
           }
           if (done) break;
         }
 
         if (idleTimer) clearTimeout(idleTimer);
 
+        const authoritativeStopReason = mapKiroStopReason(serverStopReason);
+        const terminalOutputIsComplete = authoritativeStopReason !== null
+          && currentToolCall === null
+          && (authoritativeStopReason !== "toolUse" || emittedToolCalls > 0);
+        if (transportError && terminalOutputIsComplete) {
+          // Kiro sometimes closes the HTTP body after sending its authoritative
+          // terminal metadata but before fetch observes a clean EOF. At that
+          // point the turn is complete; surfacing the later socket reset would
+          // incorrectly replace a valid answer with an API error.
+          log.info("stream transport closed after terminal metadata — finalizing completed turn", {
+            error: transportError,
+            stopReason: serverStopReason,
+          });
+          transportError = null;
+        }
+
         if (firstTokenTimedOut || idleCancelled || streamError || transportError) {
           // Once any output reached the consumer, a reset-and-retry would
           // DUPLICATE it: SSE deltas already sent can't be retracted. Only a
           // first-token timeout is guaranteed to have produced nothing, so it's
           // the only case where reset+retry is always safe.
-          const alreadyStreamed = totalContent.length > 0 || emittedToolCalls > 0;
+          // Incomplete tool JSON is accumulated in totalContent before the tool
+          // call is validated/emitted. It is safe to retry that case because no
+          // semantic output reached the consumer yet; output.content tracks the
+          // blocks that were actually surfaced.
+          const alreadyStreamed = output.content.length > 0;
           if (!alreadyStreamed && retryCount < MAX_RETRIES) {
             retryCount++;
             const delayMs = exponentialBackoff(retryCount - 1, 1000, MAX_RETRY_DELAY_MS);

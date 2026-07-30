@@ -8,13 +8,62 @@
 //
 // Files are created/appended on first write; safe to delete mid-session.
 
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFile, mkdirSync } from "node:fs";
 import { AsyncLocalStorage } from "node:async_hooks";
 
 /** Root directory for ALL Kiro file logs (session logs, debug log, request dumps). */
 export const LOG_DIR = "/tmp/kiro-logs";
 
 let dirEnsured = false;
+
+interface PendingLogWrite {
+  lines: string[];
+  scheduled: boolean;
+  writing: boolean;
+  onError?: (error: NodeJS.ErrnoException) => void;
+}
+
+const pendingLogWrites = new Map<string, PendingLogWrite>();
+
+function scheduleLogFlush(file: string, pending: PendingLogWrite): void {
+  if (pending.scheduled || pending.writing || pending.lines.length === 0) return;
+  pending.scheduled = true;
+  setImmediate(() => {
+    pending.scheduled = false;
+    if (pending.writing || pending.lines.length === 0) return;
+
+    const payload = `${pending.lines.splice(0).join("\n")}\n`;
+    pending.writing = true;
+    appendFile(file, payload, (error) => {
+      pending.writing = false;
+      if (error) pending.onError?.(error);
+      if (pending.lines.length > 0) {
+        scheduleLogFlush(file, pending);
+      } else if (!pending.scheduled) {
+        pendingLogWrites.delete(file);
+      }
+    });
+  });
+}
+
+/**
+ * Append one line without blocking the gateway event loop. Lines targeting the
+ * same file are batched and written serially, preserving their enqueue order.
+ */
+export function appendLogLine(
+  file: string,
+  line: string,
+  onError?: (error: NodeJS.ErrnoException) => void,
+): void {
+  let pending = pendingLogWrites.get(file);
+  if (!pending) {
+    pending = { lines: [], scheduled: false, writing: false };
+    pendingLogWrites.set(file, pending);
+  }
+  if (onError) pending.onError = onError;
+  pending.lines.push(line);
+  scheduleLogFlush(file, pending);
+}
 
 /**
  * File logging (the structured `session-{id}.log` files under /tmp/kiro-logs,
@@ -97,7 +146,7 @@ function writeLine(file: string, data: Record<string, unknown>): void {
     ...data,
   };
   try {
-    appendFileSync(file, JSON.stringify(entry) + "\n");
+    appendLogLine(file, JSON.stringify(entry));
   } catch {
     // Silent — debug logging should never crash the provider.
   }

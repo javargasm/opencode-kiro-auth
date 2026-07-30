@@ -121,6 +121,8 @@ describe("Kiro model catalog", () => {
       maxTokens: 32_000,
       rateMultiplier: 1.5,
       reasoning: true,
+      firstTokenTimeout: 230_000,
+      idleTimeout: 230_000,
       nativeEfforts: gptEfforts,
       supportedEfforts: ["minimal", "low", "medium", "high", "xhigh"],
       effortRequestField: "reasoning",
@@ -131,6 +133,8 @@ describe("Kiro model catalog", () => {
         nativeEfforts: gptEfforts,
         supportedEfforts: ["minimal", "low", "medium", "high", "xhigh"],
         effortRequestField: "reasoning",
+        firstTokenTimeout: 230_000,
+        idleTimeout: 230_000,
       });
       expect(gpt?.supportsMaxTokens).toBeUndefined();
     }

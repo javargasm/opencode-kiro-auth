@@ -4,6 +4,8 @@ import {
   GATEWAY_CHALLENGE_HEADER,
   GATEWAY_PROTOCOL_VERSION,
   OPENCODE_EFFORT_HEADER,
+  OPENCODE_PROFILE_ARN_HEADER,
+  OPENCODE_REGION_HEADER,
   gatewayChallengeProof,
   refreshGatewayModels,
   startGatewayServer,
@@ -1352,5 +1354,57 @@ describe("Gateway bug fixes (#2, #3, #7, #13)", () => {
     expect(mockRefresh).toHaveBeenCalledTimes(1);
     expect((mockStreamKiro.mock.calls[1] as any[])[2]?.apiKey).toBe("owner-token-after-refresh");
     await server.stop(true);
+  });
+
+  it("routes a rotated owner bearer by stable profile identity", async () => {
+    const profileArn = "arn:aws:codewhisperer:us-east-1:1:profile/OWNER";
+    const [model] = buildModelsFromApi([{
+      modelId: "gpt-5.6-sol",
+      modelName: "GPT 5.6 Sol",
+      additionalModelRequestFieldsSchema: {
+        properties: {
+          reasoning: { properties: { effort: { enum: ["none", "low", "medium", "high", "xhigh", "max"] } } },
+        },
+      },
+    }]);
+    _seedCredentials("fresh-owner-token", "us-east-1", Date.now() + 3600_000, profileArn);
+    setCachedDynamicModels([model!]);
+    mockStreamKiro.mockImplementation(okStream);
+    const server = await startGatewayServer(0);
+    const nativeFetch = globalThis.fetch;
+    const managementFetch = vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: false,
+      status: 400,
+    } as Response);
+
+    try {
+      const response = await nativeFetch(`http://127.0.0.1:${server.port}/v1/messages`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer stale-owner-token",
+          [OPENCODE_REGION_HEADER]: "us-east-1",
+          [OPENCODE_PROFILE_ARN_HEADER]: profileArn,
+          [OPENCODE_EFFORT_HEADER]: "max",
+        },
+        body: JSON.stringify({
+          model: model!.id,
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      });
+
+      expect(response.status).toBe(200);
+      expect(managementFetch).not.toHaveBeenCalled();
+      expect((mockStreamKiro.mock.calls[0] as any[])[2]).toMatchObject({
+        apiKey: "fresh-owner-token",
+        profileArn,
+        nativeEffort: "max",
+        cacheProfileArn: true,
+      });
+    } finally {
+      managementFetch.mockRestore();
+      setCachedDynamicModels(null);
+      await server.stop(true);
+    }
   });
 });

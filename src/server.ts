@@ -148,6 +148,27 @@ function isOwnerAccessToken(accessToken: string): boolean {
   return accessToken === _creds?.accessToken || ownerAccessTokenAliases.has(accessTokenDigest(accessToken));
 }
 
+function isOwnerRequest(
+  accessToken: string | undefined,
+  region: string | undefined,
+  profileArn: string | undefined,
+): boolean {
+  if (!accessToken) return true;
+  if (isOwnerAccessToken(accessToken)) return true;
+  if (
+    profileArn
+    && _creds?.profileArn === profileArn
+    && resolveApiRegion(region || _creds.region) === resolveApiRegion(_creds.region)
+  ) {
+    // Access tokens rotate, but the account profile is stable. A long-lived
+    // OpenCode process can therefore send an older token for the same owner.
+    // Remember it as an alias and dispatch with the gateway's fresh token.
+    rememberOwnerAccessToken(accessToken);
+    return true;
+  }
+  return false;
+}
+
 function attachingCatalogKey(accessToken: string, region: string, profileArn?: string): string {
   return createHash("sha256")
     .update(`${accessToken}\0${resolveApiRegion(region)}\0${profileArn ?? ""}`)
@@ -455,13 +476,19 @@ export async function fetchKiroUsageLimits(): Promise<KiroUsageLimits> {
 }
 
 /** @internal — test helper to inject credentials without Kiro CLI */
-export function _seedCredentials(token: string, region = "us-east-1", expiresAt = Date.now() + 3600_000) {
+export function _seedCredentials(
+  token: string,
+  region = "us-east-1",
+  expiresAt = Date.now() + 3600_000,
+  profileArn?: string,
+) {
   ownerAccessTokenAliases.clear();
   _creds = {
     accessToken: token,
     refreshPacked: "",
     region,
     authMethod: "idc",
+    profileArn,
     expiresAt,
   };
 }
@@ -756,10 +783,10 @@ export function startGatewayServer(
           if (url.searchParams.get("refresh") === "1") {
             const requestBearer = bearerToken(req);
             const bearer = matchesGatewayToken(requestBearer, options.gatewayToken) ? undefined : requestBearer;
-            if (bearer) {
+            const requestRegion = req.headers.get(OPENCODE_REGION_HEADER)?.trim() || BUILDER_ID_REGION;
+            const requestProfileArn = req.headers.get(OPENCODE_PROFILE_ARN_HEADER)?.trim() || undefined;
+            if (bearer && !isOwnerRequest(bearer, requestRegion, requestProfileArn)) {
               try {
-                const requestRegion = req.headers.get(OPENCODE_REGION_HEADER)?.trim() || BUILDER_ID_REGION;
-                const requestProfileArn = req.headers.get(OPENCODE_PROFILE_ARN_HEADER)?.trim() || undefined;
                 const result = await fetchGatewayModelsForCredentials(
                   bearer,
                   requestRegion,
@@ -844,7 +871,10 @@ export function startGatewayServer(
           // Authorization may carry the local gateway secret for clients that
           // do not support x-api-key. Never forward that secret to Kiro.
           const bearer = matchesGatewayToken(requestBearer, options.gatewayToken) ? undefined : requestBearer;
-          const ownerRequest = !bearer || isOwnerAccessToken(bearer);
+          const requestRegion = req.headers.get(OPENCODE_REGION_HEADER)?.trim();
+          const requestProfileArn = req.headers.get(OPENCODE_PROFILE_ARN_HEADER)?.trim();
+          const requestAuthRegion = requestRegion || _creds?.region || BUILDER_ID_REGION;
+          const ownerRequest = isOwnerRequest(bearer, requestAuthRegion, requestProfileArn);
           let accessToken: string;
           try {
             accessToken = ownerRequest ? await getAccessToken() : bearer!;
@@ -904,9 +934,6 @@ export function startGatewayServer(
               tools: body.tools ? translateAnthropicToolsToPi(body.tools) : undefined,
             };
 
-            const requestRegion = req.headers.get(OPENCODE_REGION_HEADER)?.trim();
-            const requestProfileArn = req.headers.get(OPENCODE_PROFILE_ARN_HEADER)?.trim();
-            const requestAuthRegion = requestRegion || _creds?.region || BUILDER_ID_REGION;
             const apiRegion = resolveApiRegion(requestAuthRegion);
             const kiroEndpoint = `https://runtime.${apiRegion}.kiro.dev`;
             const globalCatalogModel = typeof anthropicModelId === "string"
@@ -937,7 +964,11 @@ export function startGatewayServer(
                 }
                 rememberAttachingCatalog(bearer, requestAuthRegion, requestProfileArn, result);
                 attachingCatalog = getAttachingCatalog(bearer, requestAuthRegion, requestProfileArn);
-              } catch {
+              } catch (error) {
+                log.warn(
+                  "[gateway] Attaching account catalog refresh failed",
+                  error instanceof Error ? error.message : String(error),
+                );
                 return anthropicError(502, "api_error", "Kiro account catalog refresh failed");
               }
             }

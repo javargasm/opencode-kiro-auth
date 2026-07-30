@@ -1,5 +1,28 @@
 # @javargasm/opencode-kiro-auth
 
+## 8.1.0
+
+### Minor Changes
+
+- Improve shared-gateway and Kiro stream reliability across concurrent OpenCode processes.
+
+  Gateway ownership:
+
+  - Recognize rotated owner credentials by stable Kiro profile and region, allowing long-lived clients with an older bearer to use the gateway's current access token.
+  - Preserve account-specific catalog isolation for attaching clients while avoiding stale-token owner catalog refreshes.
+
+  Streaming:
+
+  - Preserve tuned timeout policy when static models are replaced by the dynamic account catalog, including the 230-second first-token and idle timeouts for GPT 5.6.
+  - Count growth of a parser-recognized incomplete frame as stream progress without allowing arbitrary keepalive bytes to suppress idle timeouts.
+  - Finalize completed turns when the transport closes after authoritative Kiro terminal metadata, while retaining errors for genuine mid-output truncation.
+  - Retry socket closures that only buffered an incomplete tool call which had not yet reached the consumer.
+
+  Gateway responsiveness:
+
+  - Replace synchronous per-event diagnostic writes with ordered asynchronous batches.
+  - Yield between large parsed-event batches so health probes and concurrent clients remain responsive during high-volume model output.
+
 ## 0.8.0
 
 ### Minor Changes

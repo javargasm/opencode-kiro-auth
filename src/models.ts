@@ -683,6 +683,7 @@ export function buildModelsFromApi(apiModels: KiroApiModel[]): KiroModel[] {
     KIRO_MODEL_IDS.add(m.modelId);
 
     const dashId = dotToDash(m.modelId);
+    const staticModel = kiroModels.find((model) => model.id === dashId);
     const supportedTypes = m.supportedInputTypes ?? ["TEXT"];
     const input: ("text" | "image")[] = supportedTypes.includes("IMAGE")
       ? ["text", "image"]
@@ -717,8 +718,11 @@ export function buildModelsFromApi(apiModels: KiroApiModel[]): KiroModel[] {
       input,
       contextWindow: m.tokenLimits?.maxInputTokens ?? 200_000,
       maxTokens: m.tokenLimits?.maxOutputTokens ?? 8_192,
-      firstTokenTimeout: modelTimeout(m.modelId, 90_000),
-      idleTimeout: modelTimeout(m.modelId, 60_000),
+      // The account catalog does not publish timeout policy. Preserve tuned
+      // values for known models (notably GPT 5.6) instead of replacing them
+      // with the generic dynamic-catalog defaults.
+      firstTokenTimeout: staticModel?.firstTokenTimeout ?? modelTimeout(m.modelId, 90_000),
+      idleTimeout: staticModel?.idleTimeout ?? modelTimeout(m.modelId, 60_000),
       // Per-model overrides for known special cases
       ...(rateMultiplier !== undefined ? { rateMultiplier } : {}),
       ...(nativeEfforts ? { nativeEfforts } : {}),

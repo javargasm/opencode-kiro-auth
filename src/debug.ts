@@ -7,9 +7,9 @@
 // redirected exclusively to that file (appended, one JSON line per record)
 // so CLI stdout/stderr stays clean during capture sessions.
 
-import { appendFileSync, mkdirSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
-import { currentSessionLogFile } from "./file-logger";
+import { appendLogLine, currentSessionLogFile } from "./file-logger";
 
 export type LogLevel = "error" | "warn" | "info" | "debug";
 
@@ -52,10 +52,15 @@ function writeToFile(filePath: string, line: string): void {
       mkdirSync(dir, { recursive: true });
       ensuredDirs.add(dir);
     }
-    appendFileSync(filePath, line + "\n");
+    appendLogLine(filePath, line, (err) => {
+      // Fall back to stderr so the failure isn't silent, but only once per
+      // process to avoid log-loop amplification.
+      if (!fileFallbackWarned) {
+        fileFallbackWarned = true;
+        console.error(`[opencode-kiro] ERROR failed to write KIRO_LOG_FILE=${filePath}:`, err);
+      }
+    });
   } catch (err) {
-    // Fall back to stderr so the failure isn't silent, but only once per
-    // process to avoid log-loop amplification.
     if (!fileFallbackWarned) {
       fileFallbackWarned = true;
       console.error(`[opencode-kiro] ERROR failed to write KIRO_LOG_FILE=${filePath}:`, err);

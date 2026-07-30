@@ -506,6 +506,103 @@ describe("streamKiro", () => {
     }
   });
 
+  it("finalizes when the socket closes after authoritative terminal metadata", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: vi.fn()
+            .mockResolvedValueOnce({
+              done: false,
+              value: new TextEncoder().encode(
+                '{"content":"Complete"}' +
+                  '{"stopReason":"END_TURN"}' +
+                  '{"contextUsagePercentage":5}',
+              ),
+            })
+            .mockRejectedValueOnce(new TypeError("socket connection closed")),
+          cancel: vi.fn().mockResolvedValue(undefined),
+        }),
+      },
+    });
+    vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
+
+    const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(events.find((event) => event.type === "error")).toBeUndefined();
+    const done = events.at(-1);
+    expect(done?.type).toBe("done");
+    if (done?.type === "done") {
+      expect(done.reason).toBe("stop");
+      const text = done.message.content.find((block) => block.type === "text");
+      expect(text?.type === "text" ? text.text : "").toBe("Complete");
+    }
+  });
+
+  it("retries a socket closure when only incomplete tool input was buffered", async () => {
+    vi.useFakeTimers();
+    try {
+      const incompleteToolEvent = JSON.stringify({
+        name: "bash",
+        toolUseId: "t1",
+        input: '{"cmd":',
+      });
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          body: {
+            getReader: () => ({
+              read: vi.fn()
+                .mockResolvedValueOnce({
+                  done: false,
+                  value: new TextEncoder().encode(incompleteToolEvent),
+                })
+                .mockRejectedValueOnce(new TypeError("socket connection closed")),
+              cancel: vi.fn().mockResolvedValue(undefined),
+            }),
+          },
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          body: {
+            getReader: () => ({
+              read: vi.fn()
+                .mockResolvedValueOnce({
+                  done: false,
+                  value: new TextEncoder().encode(
+                    '{"content":"Recovered"}' +
+                      '{"stopReason":"END_TURN"}' +
+                      '{"contextUsagePercentage":5}',
+                  ),
+                })
+                .mockResolvedValueOnce({ done: true, value: undefined }),
+              cancel: vi.fn().mockResolvedValue(undefined),
+            }),
+          },
+        });
+      vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
+
+      const pendingEvents = collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1_000);
+      const events = await pendingEvents;
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(events.some((event) => event.type === "toolcall_start")).toBe(false);
+      expect(events.find((event) => event.type === "error")).toBeUndefined();
+      const done = events.at(-1);
+      expect(done?.type).toBe("done");
+      if (done?.type === "done") {
+        const text = done.message.content.find((block) => block.type === "text");
+        expect(text?.type === "text" ? text.text : "").toBe("Recovered");
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("emits a terminal error when idle cancellation follows partial text and a complete tool call", async () => {
     vi.useFakeTimers();
     try {
@@ -552,6 +649,89 @@ describe("streamKiro", () => {
       }
     } finally {
       vi.useRealTimers();
+    }
+  });
+
+  it("treats growth of a recognized incomplete event frame as idle progress", async () => {
+    vi.useFakeTimers();
+    try {
+      type ReadResult = { done: boolean; value?: Uint8Array };
+      let resolvePartialRead!: (result: ReadResult) => void;
+      let resolveCompletionRead!: (result: ReadResult) => void;
+      const partialRead = new Promise<ReadResult>((resolve) => {
+        resolvePartialRead = resolve;
+      });
+      const completionRead = new Promise<ReadResult>((resolve) => {
+        resolveCompletionRead = resolve;
+      });
+      const encoder = new TextEncoder();
+      const read = vi.fn()
+        .mockResolvedValueOnce({
+          done: false,
+          value: encoder.encode('{"content":"Partial"}'),
+        })
+        .mockReturnValueOnce(partialRead)
+        .mockReturnValueOnce(completionRead)
+        .mockResolvedValueOnce({ done: true, value: undefined });
+      const cancel = vi.fn().mockImplementation(() => {
+        resolvePartialRead({ done: true, value: undefined });
+        resolveCompletionRead({ done: true, value: undefined });
+        return Promise.resolve();
+      });
+      vi.spyOn(globalThis, "fetch").mockResolvedValueOnce({
+        ok: true,
+        body: { getReader: () => ({ read, cancel }) },
+      } as unknown as Response);
+      const model = makeModel();
+      const idleTimeout = idleTimeoutForModel(model.id);
+
+      const pendingEvents = collect(streamKiro(model, makeContext(), { apiKey: "tok" }));
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(idleTimeout - 1_000);
+      resolvePartialRead({
+        done: false,
+        value: encoder.encode('{"name":"bash","toolUseId":"t1","input":"{'),
+      });
+      await vi.advanceTimersByTimeAsync(0);
+
+      // Cross the original deadline. The retained tool-use frame has grown,
+      // so its progress must have re-armed the idle timer.
+      await vi.advanceTimersByTimeAsync(1_001);
+      expect(cancel).not.toHaveBeenCalled();
+
+      resolveCompletionRead({
+        done: false,
+        value: encoder.encode('\\"cmd\\":\\"ls\\"}","stop":true}{"contextUsagePercentage":5}'),
+      });
+      const events = await pendingEvents;
+
+      expect(cancel).not.toHaveBeenCalled();
+      expect(events.some((event) => event.type === "toolcall_end")).toBe(true);
+      expect(events.at(-1)?.type).toBe("done");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("yields to the event loop while processing a large parsed event batch", async () => {
+    const contentFrames = Array.from({ length: 512 }, () => '{"content":"x"}').join("");
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      mockFetchOk(`${contentFrames}{"contextUsagePercentage":5}`),
+    );
+
+    let eventLoopTurnRan = false;
+    const pendingEvents = collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+    setImmediate(() => {
+      eventLoopTurnRan = true;
+    });
+    const events = await pendingEvents;
+
+    expect(eventLoopTurnRan).toBe(true);
+    const done = events.at(-1);
+    expect(done?.type).toBe("done");
+    if (done?.type === "done") {
+      const text = done.message.content.find((block) => block.type === "text");
+      expect(text?.type === "text" ? text.text.length : 0).toBe(512);
     }
   });
 
