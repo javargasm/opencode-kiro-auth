@@ -589,9 +589,10 @@ export function sanitizeHistory(history: KiroHistoryEntry[]): KiroHistoryEntry[]
 /**
  * Collapse consecutive tool-use loops in history. When the agent calls
  * tools N times in sequence (ASST(toolUses) → USER(toolResults) pairs),
- * keep text only on the first assistant message and replace subsequent
- * ones with a short placeholder. This prevents the model from re-deriving
- * its preamble on every iteration, saving context tokens.
+ * keep text only on the first assistant message and clear subsequent text.
+ * Tool-only assistant messages already use an empty content string on Kiro's
+ * wire format. Do not inject a textual continuity marker here: it becomes
+ * model-visible conversation content and can be echoed as the next answer.
  */
 export function collapseAgenticLoops(history: KiroHistoryEntry[]): KiroHistoryEntry[] {
   if (history.length < 4) return history;
@@ -632,8 +633,8 @@ export function collapseAgenticLoops(history: KiroHistoryEntry[]): KiroHistoryEn
           } else {
             result.push({
               assistantResponseMessage: {
-                content: "[tool calling continues]",
-                toolUses: asst.assistantResponseMessage!.toolUses,
+                ...asst.assistantResponseMessage!,
+                content: "",
               },
             });
           }

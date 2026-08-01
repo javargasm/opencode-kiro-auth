@@ -8,7 +8,7 @@
 //
 // Files are created/appended on first write; safe to delete mid-session.
 
-import { appendFile, mkdirSync } from "node:fs";
+import { appendFile, chmodSync, mkdirSync } from "node:fs";
 import { AsyncLocalStorage } from "node:async_hooks";
 
 /** Root directory for ALL Kiro file logs (session logs, debug log, request dumps). */
@@ -34,7 +34,7 @@ function scheduleLogFlush(file: string, pending: PendingLogWrite): void {
 
     const payload = `${pending.lines.splice(0).join("\n")}\n`;
     pending.writing = true;
-    appendFile(file, payload, (error) => {
+    appendFile(file, payload, { mode: 0o600 }, (error) => {
       pending.writing = false;
       if (error) pending.onError?.(error);
       if (pending.lines.length > 0) {
@@ -86,7 +86,8 @@ export function isFileLoggingEnabled(): boolean {
 export function ensureLogDir(): void {
   if (dirEnsured) return;
   try {
-    mkdirSync(LOG_DIR, { recursive: true });
+    mkdirSync(LOG_DIR, { recursive: true, mode: 0o700 });
+    chmodSync(LOG_DIR, 0o700);
     dirEnsured = true;
   } catch {
     // Best-effort; /tmp should always be writable.

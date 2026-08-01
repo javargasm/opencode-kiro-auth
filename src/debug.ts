@@ -9,7 +9,7 @@
 
 import { mkdirSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
-import { appendLogLine, currentSessionLogFile } from "./file-logger";
+import { appendLogLine, currentSessionLogFile, isFileLoggingEnabled } from "./file-logger";
 
 export type LogLevel = "error" | "warn" | "info" | "debug";
 
@@ -31,15 +31,16 @@ function enabled(level: LogLevel): boolean {
 }
 
 function currentFilePath(): string | null {
-  // During a request, route leveled logs into that request's session file so
-  // they sit alongside the structured entries. Outside any request (startup,
-  // auth refresh) fall back to the global KIRO_LOG_FILE.
-  const sessionFile = currentSessionLogFile();
-  if (sessionFile) return sessionFile;
+  // An explicit destination is authoritative, including during requests.
+  // Otherwise request-scoped debug logs may join the structured session log,
+  // but only when full file logging was explicitly enabled.
   const raw = globalThis.process?.env?.KIRO_LOG_FILE;
-  if (!raw) return null;
-  return isAbsolute(raw) ? raw : resolve(process.cwd(), raw);
+  if (raw) return isAbsolute(raw) ? raw : resolve(process.cwd(), raw);
+  return isFileLoggingEnabled() ? currentSessionLogFile() : null;
 }
+
+/** @internal — deterministic logger-routing seam for focused tests. */
+export const _currentLogFileForTest = currentFilePath;
 
 // Track which directories we've already ensured exist so we don't stat on every
 // log line. Cleared implicitly on process exit.
@@ -49,7 +50,7 @@ function writeToFile(filePath: string, line: string): void {
   try {
     const dir = dirname(filePath);
     if (!ensuredDirs.has(dir)) {
-      mkdirSync(dir, { recursive: true });
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
       ensuredDirs.add(dir);
     }
     appendLogLine(filePath, line, (err) => {

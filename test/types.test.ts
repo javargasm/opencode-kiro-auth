@@ -60,4 +60,57 @@ describe("EventStream.result() settling (#8 — no hang on end without result)",
     stream.end(); // must NOT override the already-settled result with a rejection
     await expect(stream.result()).resolves.toBe(42);
   });
+
+  it("unblocks a bounded producer when the iterator exits early", async () => {
+    const stream = new EventStream<{ type: string }, number>(
+      (event) => event.type === "done",
+      () => 42,
+      1,
+    );
+    const iterator = stream[Symbol.asyncIterator]();
+    stream.push({ type: "delta" });
+    await expect(iterator.next()).resolves.toMatchObject({ done: false });
+
+    stream.push({ type: "queued" });
+    let capacityReleased = false;
+    const capacity = stream.waitForCapacity().then(() => {
+      capacityReleased = true;
+    });
+    await Promise.resolve();
+    expect(capacityReleased).toBe(false);
+
+    await iterator.return?.();
+    await capacity;
+    stream.push({ type: "done" });
+
+    expect(capacityReleased).toBe(true);
+    await expect(stream.result()).resolves.toBe(42);
+  });
+
+  it("does not mark a rejected terminal push complete before queueing it", async () => {
+    const stream = new EventStream<{ type: string }, number>(
+      (event) => event.type === "done",
+      () => 42,
+      1,
+    );
+    const iterator = stream[Symbol.asyncIterator]();
+    stream.push({ type: "first" });
+    await expect(iterator.next()).resolves.toMatchObject({ value: { type: "first" }, done: false });
+    stream.push({ type: "queued" });
+
+    expect(() => stream.push({ type: "done" })).toThrow("queue exceeded 1 events");
+    let settled = false;
+    const result = stream.result().then((value) => {
+      settled = true;
+      return value;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    await expect(iterator.next()).resolves.toMatchObject({ value: { type: "queued" }, done: false });
+    stream.push({ type: "done" });
+    await expect(result).resolves.toBe(42);
+    await expect(iterator.next()).resolves.toMatchObject({ value: { type: "done" }, done: false });
+    await expect(iterator.next()).resolves.toMatchObject({ done: true });
+  });
 });

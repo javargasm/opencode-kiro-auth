@@ -137,6 +137,14 @@ export interface SimpleStreamOptions {
   temperature?: number;
   maxTokens?: number;
   signal?: AbortSignal;
+  /** Absolute deadline for the complete upstream request, including headers and body. */
+  requestTimeoutMs?: number;
+  /** Maximum time spent consuming a non-success response body. */
+  errorBodyTimeoutMs?: number;
+  /** Defensive override for the maximum retained incomplete event frame. */
+  maxIncompleteFrameChars?: number;
+  /** Defensive override for total bytes accepted from one upstream response. */
+  maxResponseBytes?: number;
   apiKey?: string;
   sessionId?: string;
   /** Absolute workspace path supplied by the OpenCode process for this request. */
@@ -182,7 +190,10 @@ export type AssistantMessageEvent =
 export class EventStream<T, R = T> implements AsyncIterable<T> {
   private queue: T[] = [];
   private waiting: Array<(result: { value: T; done: false } | { value: undefined; done: true }) => void> = [];
+  private capacityWaiters = new Set<() => void>();
   private done = false;
+  private iteratorStarted = false;
+  private discardEvents = false;
   private finalResultPromise: Promise<R>;
   private resolveFinalResult!: (result: R) => void;
   private rejectFinalResult!: (reason?: unknown) => void;
@@ -190,7 +201,11 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
   private isComplete: (event: T) => boolean;
   private extractResult: (event: T) => R;
 
-  constructor(isComplete: (event: T) => boolean, extractResult: (event: T) => R) {
+  constructor(
+    isComplete: (event: T) => boolean,
+    extractResult: (event: T) => R,
+    private readonly maxQueueSize = Number.POSITIVE_INFINITY,
+  ) {
     this.isComplete = isComplete;
     this.extractResult = extractResult;
     this.finalResultPromise = new Promise<R>((resolve, reject) => {
@@ -205,16 +220,62 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 
   push(event: T): void {
     if (this.done) return;
-    if (this.isComplete(event)) {
-      this.done = true;
-      this.resultSettled = true;
-      this.resolveFinalResult(this.extractResult(event));
+    const complete = this.isComplete(event);
+    let finalResult!: R;
+    if (complete) finalResult = this.extractResult(event);
+    if (this.discardEvents) {
+      if (complete) {
+        this.done = true;
+        this.resultSettled = true;
+        this.resolveFinalResult(finalResult);
+        this.notifyCapacity();
+      }
+      return;
     }
     const waiter = this.waiting.shift();
     if (waiter) {
       waiter({ value: event, done: false });
     } else {
+      if (this.queue.length >= this.maxQueueSize) {
+        throw new Error(`Event stream queue exceeded ${this.maxQueueSize} events`);
+      }
       this.queue.push(event);
+    }
+    if (complete) {
+      this.done = true;
+      this.resultSettled = true;
+      this.resolveFinalResult(finalResult);
+      this.notifyCapacity();
+    }
+  }
+
+  private notifyCapacity(): void {
+    for (const wake of this.capacityWaiters) wake();
+    this.capacityWaiters.clear();
+  }
+
+  /** Pause an eager producer before it can overfill the bounded event queue. */
+  async waitForCapacity(reserve = 1, signal?: AbortSignal): Promise<void> {
+    const threshold = Math.max(0, this.maxQueueSize - Math.max(1, reserve));
+    while (!this.done && !this.discardEvents && this.queue.length > threshold) {
+      if (signal?.aborted) throw signal.reason ?? new Error("Event production aborted");
+      await new Promise<void>((resolve, reject) => {
+        const wake = () => {
+          cleanup();
+          resolve();
+        };
+        const onAbort = () => {
+          cleanup();
+          reject(signal?.reason ?? new Error("Event production aborted"));
+        };
+        const cleanup = () => {
+          this.capacityWaiters.delete(wake);
+          signal?.removeEventListener("abort", onAbort);
+        };
+        this.capacityWaiters.add(wake);
+        signal?.addEventListener("abort", onAbort, { once: true });
+        if (this.done || this.discardEvents || this.queue.length <= threshold) wake();
+      });
     }
   }
 
@@ -234,25 +295,47 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
       const waiter = this.waiting.shift();
       waiter!({ value: undefined, done: true });
     }
+    this.notifyCapacity();
   }
 
   async *[Symbol.asyncIterator](): AsyncIterator<T> {
-    while (true) {
-      if (this.queue.length > 0) {
-        yield this.queue.shift()!;
-      } else if (this.done) {
-        return;
-      } else {
-        const result = await new Promise<{ value: T; done: false } | { value: undefined; done: true }>(
-          (resolve) => this.waiting.push(resolve),
-        );
-        if (result.done) return;
-        yield result.value;
+    this.iteratorStarted = true;
+    try {
+      while (true) {
+        if (this.queue.length > 0) {
+          const event = this.queue.shift()!;
+          this.notifyCapacity();
+          yield event;
+        } else if (this.done) {
+          return;
+        } else {
+          const result = await new Promise<{ value: T; done: false } | { value: undefined; done: true }>(
+            (resolve) => this.waiting.push(resolve),
+          );
+          if (result.done) return;
+          yield result.value;
+        }
+      }
+    } finally {
+      // There is one logical consumer. If it exits before the terminal event,
+      // keep producing only the final result instead of deadlocking on a full
+      // queue that nobody will drain.
+      if (!this.done) {
+        this.discardEvents = true;
+        this.queue.length = 0;
+        this.notifyCapacity();
       }
     }
   }
 
   result(): Promise<R> {
+    // result()-only callers do not need deltas. Discard them so a bounded
+    // producer cannot deadlock when there is intentionally no iterator.
+    if (!this.iteratorStarted) {
+      this.discardEvents = true;
+      this.queue.length = 0;
+      this.notifyCapacity();
+    }
     return this.finalResultPromise;
   }
 }
@@ -260,7 +343,7 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 // ---- AssistantMessageEventStream (concrete stream type) -----------------
 
 export class AssistantMessageEventStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
-  constructor() {
+  constructor(maxQueueSize = Number.POSITIVE_INFINITY) {
     super(
       (event) => event.type === "done" || event.type === "error",
       (event) => {
@@ -268,6 +351,7 @@ export class AssistantMessageEventStream extends EventStream<AssistantMessageEve
         if (event.type === "error") return event.error;
         throw new Error("Unexpected event type for final result");
       },
+      maxQueueSize,
     );
   }
 }

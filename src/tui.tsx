@@ -4,13 +4,14 @@ import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plug
 import type { RGBA } from "@opentui/core";
 import { Show, createEffect, createSignal } from "solid-js";
 import { pickProviderId } from "./tui-detect";
+import { fetchVerifiedGatewayJson, readGatewayToken } from "./tui-gateway";
 
 // The TUI plugin runs in a SEPARATE process from the server plugin, so they do
 // NOT share globalThis or module state. The bar therefore:
 //   - detects the active provider via the TUI api (api.state.session), and
 //   - reads usage over HTTP from the gateway (which lives in the server
 //     process) at /dashboard/api/usage.
-const USAGE_URL = "http://127.0.0.1:7438/dashboard/api/usage";
+const GATEWAY_ORIGIN = "http://127.0.0.1:7438";
 const USAGE_REFRESH_MS = 30_000;
 const DETECT_POLL_MS = 2_000;
 const FETCH_TIMEOUT_MS = 3_000;
@@ -19,9 +20,10 @@ const LOG_FILE = "/tmp/kiro-logs/tui.log";
 let logDirOk = false;
 function log(msg: string, extra?: unknown): void {
   try {
-    if (!logDirOk) { mkdirSync("/tmp/kiro-logs", { recursive: true }); logDirOk = true; }
+    if (!/^(1|true|yes|on)$/i.test(process.env.KIRO_FILE_LOG?.trim() ?? "")) return;
+    if (!logDirOk) { mkdirSync("/tmp/kiro-logs", { recursive: true, mode: 0o700 }); logDirOk = true; }
     const e = { ts: new Date().toISOString(), msg, ...(extra !== undefined ? { data: extra } : {}) };
-    appendFileSync(LOG_FILE, JSON.stringify(e) + "\n");
+    appendFileSync(LOG_FILE, JSON.stringify(e) + "\n", { encoding: "utf8", mode: 0o600 });
   } catch { /* silent — logging must never crash the TUI */ }
 }
 
@@ -85,8 +87,13 @@ function createKiroDetector(api: TuiPluginApi) {
   check("init");
   const id = setInterval(() => check("poll"), DETECT_POLL_MS);
   (id as unknown as { unref?: () => void }).unref?.();
-  api.event.on("session.updated", () => check("session.updated"));
-  api.event.on("message.updated", () => check("message.updated"));
+  const offSession = api.event.on("session.updated", () => check("session.updated"));
+  const offMessage = api.event.on("message.updated", () => check("message.updated"));
+  api.lifecycle.onDispose(() => {
+    clearInterval(id);
+    offSession();
+    offMessage();
+  });
 
   return isKiro;
 }
@@ -94,30 +101,59 @@ function createKiroDetector(api: TuiPluginApi) {
 // Polls usage over HTTP, but only while `enabled()` is true (i.e. on kiro).
 // The gateway lazy-starts in the server process when kiro is first used, so it
 // is up by the time we detect kiro and start fetching.
-function createUsageStore(enabled: () => boolean) {
+function createUsageStore(api: TuiPluginApi, enabled: () => boolean) {
   const [u, setU] = createSignal<Usage | null>(null);
+  let activeController: AbortController | null = null;
+  let inFlight: Promise<void> | null = null;
 
   const tick = async () => {
-    if (!enabled()) return;
+    if (!enabled() || api.lifecycle.signal.aborted) return;
+    const ctrl = new AbortController();
+    activeController = ctrl;
+    const signal = AbortSignal.any([
+      ctrl.signal,
+      api.lifecycle.signal,
+      AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    ]);
     try {
-      const ctrl = new AbortController();
-      const to = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
-      const res = await fetch(USAGE_URL, { signal: ctrl.signal });
-      clearTimeout(to);
-      const data = (await res.json()) as Usage;
+      const token = readGatewayToken();
+      if (!token) throw new Error("Gateway token unavailable");
+      const data = await fetchVerifiedGatewayJson<Usage>(
+        GATEWAY_ORIGIN,
+        "/dashboard/api/usage",
+        token,
+        signal,
+      );
       log("usage", { pct: data.percentage, error: data.error });
       setU(data);
     } catch (err) {
-      log("usage-error", { error: err instanceof Error ? err.message : String(err) });
+      if (!api.lifecycle.signal.aborted) {
+        log("usage-error", { error: err instanceof Error ? err.message : String(err) });
+      }
+    } finally {
+      if (activeController === ctrl) activeController = null;
     }
   };
 
-  const id = setInterval(tick, USAGE_REFRESH_MS);
+  const scheduleTick = () => {
+    if (inFlight) return;
+    inFlight = tick().finally(() => {
+      inFlight = null;
+    });
+  };
+
+  const id = setInterval(scheduleTick, USAGE_REFRESH_MS);
   (id as unknown as { unref?: () => void }).unref?.();
 
   // Fetch immediately whenever we transition into the kiro provider.
   createEffect(() => {
-    if (enabled()) void tick();
+    if (enabled()) scheduleTick();
+    else activeController?.abort(new Error("Kiro usage polling disabled"));
+  });
+
+  api.lifecycle.onDispose(() => {
+    clearInterval(id);
+    activeController?.abort(new Error("Kiro TUI plugin disposed"));
   });
 
   return u;
@@ -157,7 +193,7 @@ const tui: TuiPlugin = async (api) => {
   log("tui-plugin-enter");
   try {
     const isKiro = createKiroDetector(api);
-    const usage = createUsageStore(isKiro);
+    const usage = createUsageStore(api, isKiro);
 
     api.slots.register({
       order: 100,

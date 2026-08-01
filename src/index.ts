@@ -1,25 +1,9 @@
-// Route ALL logs to a file — keeps OpenCode status bar clean.
-// Every Kiro file log lives under /tmp/kiro-logs/ and carries a session id in
-// its name. Per-request logs route to session-{id}.log (via AsyncLocalStorage,
-// see file-logger.ts); logs with no request context (startup, auth refresh)
-// fall back here, to the "gateway" pseudo-session.
-process.env.KIRO_LOG = process.env.KIRO_LOG || "debug";
-process.env.KIRO_LOG_FILE = process.env.KIRO_LOG_FILE || "/tmp/kiro-logs/session-gateway.log";
-
 import { randomBytes } from "node:crypto";
-import { chmod, link, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { Plugin, Hooks, PluginModule } from "@opencode-ai/plugin";
 import {
-  GATEWAY_AUTH_HEADER,
-  GATEWAY_AUTH_NONCE_HEADER,
-  GATEWAY_AUTH_TIMESTAMP_HEADER,
-  GATEWAY_CAPABILITIES,
-  GATEWAY_CHALLENGE_HEADER,
-  GATEWAY_PROTOCOL_VERSION,
-  gatewayChallengeProof,
-  gatewayRequestSignature,
   initGatewayAuth,
   OPENCODE_CWD_HEADER,
   OPENCODE_EFFORT_HEADER,
@@ -27,24 +11,33 @@ import {
   OPENCODE_REGION_HEADER,
   startGatewayServer,
 } from "./server";
+import {
+  GATEWAY_CAPABILITIES,
+  GATEWAY_CHALLENGE_HEADER,
+  GATEWAY_PROTOCOL_VERSION,
+  gatewayRequestHeaders,
+  readGatewayJson,
+  verifyGatewayChallengeProof,
+} from "./gateway-auth";
+export { gatewayRequestHeaders } from "./gateway-auth";
 import { log } from "./debug";
 import { 
   BUILDER_ID_START_URL, 
   BUILDER_ID_REGION, 
   IDC_PROBE_REGIONS,
   EXPIRES_BUFFER_MS,
+  getKiroCredentialScope,
   tryRegisterAndAuthorize, 
   pollForToken, 
   refreshKiroToken,
   startSocialLogin,
+  withKiroCredentialScope,
 } from "./oauth";
 import {
   kiroModels, 
   getCachedDynamicModels,
   findKiroModel,
-  fetchAvailableModels,
   resolveProfileArn,
-  buildModelsFromApi,
   resolveApiRegion,
   setCachedDynamicModels,
   formatModelName,
@@ -71,66 +64,152 @@ interface GatewayRecoveryOptions {
 const GATEWAY_RECOVERY_TIMEOUT_MS = 30_000;
 const GATEWAY_PROBE_TIMEOUT_MS = 1_500;
 const GATEWAY_RETRY_INTERVAL_MS = 100;
+const GATEWAY_CONFIG_CATALOG_TIMEOUT_MS = 5_000;
 
 // Module-level state is shared by every workspace loaded in one OpenCode process.
 let gatewayServer: GatewayServer | null = null;
 let gatewayMode: GatewayMode = "stopped";
 let gatewayStarting: Promise<void> | null = null;
+let gatewayStopping: Promise<void> | null = null;
 let gatewayConsumers = 0;
 let gatewayTokenPromise: Promise<string> | null = null;
 
-async function repairGatewayToken(tokenPath: string): Promise<string> {
-  const lockPath = `${tokenPath}.repair.lock`;
-  const ownerPath = `${lockPath}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
-  await writeFile(ownerPath, String(process.pid), { encoding: "utf8", flag: "wx", mode: 0o600 });
-  let ownsLock = false;
+const GATEWAY_REPAIR_LOCK_STALE_MS = 30_000;
+
+interface GatewayRepairLockOwner {
+  raw: string;
+  pid: number | null;
+  createdAt: number;
+}
+
+async function tryAcquireGatewayTokenRepairLock(lockPath: string): Promise<string | null> {
+  const owner = JSON.stringify({
+    pid: process.pid,
+    createdAt: Date.now(),
+    nonce: randomBytes(16).toString("hex"),
+  });
   try {
-    await link(ownerPath, lockPath);
-    ownsLock = true;
+    await writeFile(lockPath, owner, { encoding: "utf8", flag: "wx", mode: 0o600 });
+    return owner;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-  } finally {
-    await unlink(ownerPath).catch(() => undefined);
-  }
-
-  if (!ownsLock) {
-    for (let attempt = 0; attempt < 200; attempt++) {
-      const token = await readFile(tokenPath, "utf8").then((value) => value.trim()).catch(() => "");
-      if (token.length >= 32) return token;
-
-      const ownerPid = Number(await readFile(lockPath, "utf8").catch(() => ""));
-      if (Number.isInteger(ownerPid) && ownerPid > 0) {
-        try {
-          process.kill(ownerPid, 0);
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code === "ESRCH") {
-            throw new Error(`Stale gateway token repair lock from PID ${ownerPid}: ${lockPath}`);
-          }
-        }
-      }
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    }
-    throw new Error(`Gateway token repair is held by another active process: ${lockPath}`);
-  }
-
-  const generated = randomBytes(32).toString("hex");
-  const temporaryPath = `${tokenPath}.${process.pid}.${randomBytes(8).toString("hex")}.repair.tmp`;
-  try {
-    const current = await readFile(tokenPath, "utf8").then((value) => value.trim()).catch(() => "");
-    if (current.length >= 32) return current;
-    await writeFile(temporaryPath, generated, { encoding: "utf8", flag: "wx", mode: 0o600 });
-    await rename(temporaryPath, tokenPath);
-    await chmod(tokenPath, 0o600).catch(() => undefined);
-    return generated;
-  } finally {
-    await unlink(temporaryPath).catch(() => undefined);
-    await unlink(lockPath).catch(() => undefined);
+    return null;
   }
 }
 
+async function readGatewayTokenRepairLock(lockPath: string): Promise<GatewayRepairLockOwner | null> {
+  try {
+    const [raw, metadata] = await Promise.all([
+      readFile(lockPath, "utf8").then((value) => value.trim()),
+      lstat(lockPath),
+    ]);
+    let pid: number | null = null;
+    let createdAt = metadata.mtimeMs;
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (parsed && typeof parsed === "object") {
+        const record = parsed as { pid?: unknown; createdAt?: unknown };
+        if (Number.isInteger(record.pid) && Number(record.pid) > 0) pid = Number(record.pid);
+        if (typeof record.createdAt === "number" && Number.isFinite(record.createdAt)) {
+          createdAt = record.createdAt;
+        }
+      } else {
+        const legacyPid = Number(parsed);
+        if (Number.isInteger(legacyPid) && legacyPid > 0) pid = legacyPid;
+      }
+    } catch {
+      const legacyPid = Number(raw);
+      if (Number.isInteger(legacyPid) && legacyPid > 0) pid = legacyPid;
+    }
+    return { raw, pid, createdAt };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+function gatewayRepairLockIsStale(owner: GatewayRepairLockOwner): boolean {
+  if (Date.now() - owner.createdAt > GATEWAY_REPAIR_LOCK_STALE_MS) return true;
+  if (!owner.pid) return false;
+  try {
+    process.kill(owner.pid, 0);
+    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ESRCH";
+  }
+}
+
+async function removeGatewayTokenRepairLockIfUnchanged(
+  lockPath: string,
+  expectedOwner: string,
+): Promise<boolean> {
+  const quarantinePath = `${lockPath}.quarantine.${process.pid}.${randomBytes(8).toString("hex")}`;
+  try {
+    await rename(lockPath, quarantinePath);
+    const movedOwner = await readFile(quarantinePath, "utf8").then((value) => value.trim());
+    if (movedOwner !== expectedOwner) {
+      // The lock changed between observation and rename. Restore it only when
+      // no newer contender has already acquired the canonical path.
+      await link(quarantinePath, lockPath).catch((error) => {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      });
+      return false;
+    }
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+    throw error;
+  } finally {
+    await unlink(quarantinePath).catch(() => undefined);
+  }
+}
+
+async function repairGatewayToken(tokenPath: string): Promise<string> {
+  const lockPath = `${tokenPath}.repair.lock`;
+  for (let attempt = 0; attempt < 200; attempt++) {
+    const owner = await tryAcquireGatewayTokenRepairLock(lockPath);
+    if (owner) {
+      const generated = randomBytes(32).toString("hex");
+      const temporaryPath = `${tokenPath}.${process.pid}.${randomBytes(8).toString("hex")}.repair.tmp`;
+      try {
+        const current = await readFile(tokenPath, "utf8").then((value) => value.trim()).catch(() => "");
+        if (current.length >= 32) return current;
+        await writeFile(temporaryPath, generated, { encoding: "utf8", flag: "wx", mode: 0o600 });
+        await rename(temporaryPath, tokenPath);
+        await chmod(tokenPath, 0o600).catch(() => undefined);
+        return generated;
+      } finally {
+        await unlink(temporaryPath).catch(() => undefined);
+        await removeGatewayTokenRepairLockIfUnchanged(lockPath, owner).catch(() => undefined);
+      }
+    }
+
+    const token = await readFile(tokenPath, "utf8").then((value) => value.trim()).catch(() => "");
+    if (token.length >= 32) return token;
+
+    const observed = await readGatewayTokenRepairLock(lockPath);
+    if (!observed) continue;
+    if (gatewayRepairLockIsStale(observed)) {
+      await removeGatewayTokenRepairLockIfUnchanged(lockPath, observed.raw);
+      continue;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20 + Math.floor(Math.random() * 11)));
+  }
+  throw new Error(`Gateway token repair is held by another active process: ${lockPath}`);
+}
+
+/** @internal — deterministic regression seam for stale-lock recovery. */
+export const _repairGatewayTokenForTest = repairGatewayToken;
+
 async function loadGatewayToken(): Promise<string> {
-  const override = process.env.KIRO_GATEWAY_TOKEN?.trim();
-  if (override) return override;
+  const configuredOverride = process.env.KIRO_GATEWAY_TOKEN;
+  if (configuredOverride !== undefined) {
+    const override = configuredOverride.trim();
+    if (override.length < 32) {
+      throw new Error("KIRO_GATEWAY_TOKEN must be at least 32 characters");
+    }
+    return override;
+  }
 
   const cacheRoot = process.env.XDG_CACHE_HOME || join(homedir(), ".cache");
   const directory = join(cacheRoot, "opencode-kiro");
@@ -160,6 +239,9 @@ async function loadGatewayToken(): Promise<string> {
   return repairGatewayToken(tokenPath);
 }
 
+/** @internal — validates an explicit override without populating shared state. */
+export const _loadGatewayTokenForTest = loadGatewayToken;
+
 async function getGatewayToken(): Promise<string> {
   if (!gatewayTokenPromise) {
     gatewayTokenPromise = loadGatewayToken().catch((error) => {
@@ -174,16 +256,6 @@ function gatewayOrigin(port: number): string {
   return `http://127.0.0.1:${port}`;
 }
 
-export function gatewayRequestHeaders(gatewayToken: string): Record<string, string> {
-  const timestamp = String(Date.now());
-  const nonce = crypto.randomUUID();
-  return {
-    [GATEWAY_AUTH_HEADER]: gatewayRequestSignature(gatewayToken, timestamp, nonce),
-    [GATEWAY_AUTH_TIMESTAMP_HEADER]: timestamp,
-    [GATEWAY_AUTH_NONCE_HEADER]: nonce,
-  };
-}
-
 export async function probeGateway(
   port: number,
   gatewayToken?: string,
@@ -196,18 +268,18 @@ export async function probeGateway(
       signal: AbortSignal.timeout(timeoutMs),
     });
     if (!response.ok) return "unavailable";
-    const body = await response.json() as {
+    const body = await readGatewayJson<{
       service?: string;
       protocolVersion?: number;
       capabilities?: string[];
       ready?: boolean;
       proof?: string;
-    };
+    }>(response);
     const compatible =
       body.service === "opencode-kiro-gateway" &&
       body.protocolVersion === GATEWAY_PROTOCOL_VERSION &&
       GATEWAY_CAPABILITIES.every((capability) => body.capabilities?.includes(capability)) &&
-      (!gatewayToken || body.proof === gatewayChallengeProof(gatewayToken, challenge));
+      (!gatewayToken || verifyGatewayChallengeProof(gatewayToken, challenge, body.proof));
     if (!compatible) return "incompatible";
     return body.ready === false ? "starting" : "ready";
   } catch {
@@ -329,11 +401,49 @@ export function resolveKiroLoaderCredentials(
   }
 
   const metadata = auth.metadata ?? {};
+  const scope = typeof auth.refresh === "string"
+    ? getKiroCredentialScope(auth.refresh)
+    : {};
   return {
     accessToken: auth.access,
-    region: metadata.region || BUILDER_ID_REGION,
-    profileArn: metadata.profileArn,
+    region: metadata.region || scope.region || BUILDER_ID_REGION,
+    profileArn: metadata.profileArn || scope.profileArn,
   };
+}
+
+async function resolveKiroAuthCredentials(auth: any): Promise<GatewayCatalogCredentials | null> {
+  let imported: KiroCliCredentials | null = null;
+  if (auth?.type === "oauth" && typeof auth.refresh === "string") {
+    const { importFromKiroCli } = await import("./kiro-cli-sync");
+    imported = await importFromKiroCli();
+  }
+  return resolveKiroLoaderCredentials(auth, imported);
+}
+
+async function loadOpenCodeKiroCredentials(): Promise<GatewayCatalogCredentials | null> {
+  const parse = (raw: string): any => {
+    const record = JSON.parse(raw) as Record<string, unknown>;
+    return record?.kiro ?? record?.["kiro/"] ?? null;
+  };
+
+  let auth: any = null;
+  const inline = process.env.OPENCODE_AUTH_CONTENT;
+  if (inline) {
+    try {
+      auth = parse(inline);
+    } catch {
+      // Match OpenCode: malformed inline content falls back to auth.json.
+    }
+  }
+  if (!auth) {
+    try {
+      const dataRoot = process.env.XDG_DATA_HOME?.trim() || join(homedir(), ".local", "share");
+      auth = parse(await readFile(join(dataRoot, "opencode", "auth.json"), "utf8"));
+    } catch {
+      return null;
+    }
+  }
+  return resolveKiroAuthCredentials(auth);
 }
 
 async function loadLocalCatalogCredentials(): Promise<GatewayCatalogCredentials | null> {
@@ -356,10 +466,14 @@ export async function loadGatewayModels(
   port: number,
   gatewayToken?: string,
   credentials?: GatewayCatalogCredentials,
+  timeoutMs = 30_000,
+  cacheModels = true,
 ): Promise<KiroModel[] | null> {
   try {
     const headers: Record<string, string> = {};
-    if (gatewayToken) Object.assign(headers, gatewayRequestHeaders(gatewayToken));
+    if (gatewayToken) {
+      Object.assign(headers, gatewayRequestHeaders(gatewayToken, "GET", "/v1/models?refresh=1"));
+    }
     if (credentials) {
       headers.Authorization = `Bearer ${credentials.accessToken}`;
       headers[OPENCODE_REGION_HEADER] = credentials.region;
@@ -367,15 +481,18 @@ export async function loadGatewayModels(
     }
     const response = await fetch(`${gatewayOrigin(port)}/v1/models?refresh=1`, {
       headers,
-      signal: AbortSignal.timeout(30_000),
+      signal: AbortSignal.timeout(Math.max(1, timeoutMs)),
     });
     if (!response.ok) return null;
-    const body = await response.json() as { data?: KiroModel[]; source?: "dynamic" | "static" };
+    const body = await readGatewayJson<{ data?: KiroModel[]; source?: "dynamic" | "static" }>(
+      response,
+      1024 * 1024,
+    );
     const models = Array.isArray(body.data)
       ? body.data.filter((model) => model && typeof model.id === "string" && typeof model.name === "string")
       : [];
     if (body.source !== "dynamic") return null;
-    setCachedDynamicModels(models);
+    if (cacheModels) setCachedDynamicModels(models);
     return models;
   } catch (error) {
     log.warn("[opencode-kiro] Failed to load gateway model catalog", error);
@@ -503,11 +620,19 @@ export function kiroSessionHeaders(
 }
 
 /** Return a local-only effort header for a catalog-valid OpenCode variant. */
-export function kiroEffortHeader(input: any): Record<string, string> {
+export function kiroEffortHeader(
+  input: any,
+  scopedModels?: KiroModel[],
+): Record<string, string> {
   const selectedModel = input?.message?.model;
   const modelId = selectedModel?.modelID ?? selectedModel?.id ?? input?.model?.id;
+  const model = typeof modelId === "string"
+    ? scopedModels === undefined
+      ? findKiroModel(modelId)
+      : scopedModels.find((entry) => entry.id === modelId)
+    : undefined;
   const effort = validateNativeKiroEffort(
-    typeof modelId === "string" ? findKiroModel(modelId) : undefined,
+    model,
     selectedModel?.variant,
   );
   return effort ? { [OPENCODE_EFFORT_HEADER]: effort } : {};
@@ -516,9 +641,15 @@ export function kiroEffortHeader(input: any): Record<string, string> {
 export const KiroPlugin: Plugin = async (input) => {
   const workingDirectory = input.directory;
   let disposed = false;
+  let accountCatalogModels: KiroModel[] | undefined;
   gatewayConsumers++;
 
   async function ensureGateway(): Promise<void> {
+    if (gatewayStopping) {
+      await gatewayStopping.catch((error) => {
+        log.warn("[opencode-kiro] Previous gateway shutdown failed", error);
+      });
+    }
     if (gatewayStarting) return gatewayStarting;
     if (gatewayMode === "owned" && gatewayServer) return;
     const gatewayToken = await getGatewayToken();
@@ -567,7 +698,7 @@ export const KiroPlugin: Plugin = async (input) => {
       await ensureGateway();
       Object.assign(output.headers, {
         ...kiroSessionHeaders(input?.sessionID, workingDirectory),
-        ...kiroEffortHeader(input),
+        ...kiroEffortHeader(input, accountCatalogModels),
         ...gatewayRequestHeaders(await getGatewayToken()),
       });
     },
@@ -579,10 +710,20 @@ export const KiroPlugin: Plugin = async (input) => {
       gatewayConsumers = Math.max(0, gatewayConsumers - 1);
       if (gatewayConsumers > 0) return;
       if (gatewayStarting) await gatewayStarting.catch(() => undefined);
+      // A workspace may have attached while startup was settling.
+      if (gatewayConsumers > 0) return;
       if (gatewayMode === "owned" && gatewayServer) {
-        log.info("[opencode-kiro] Shutting down owned gateway server...");
-        await gatewayServer.stop(true);
+        const server = gatewayServer;
         gatewayServer = null;
+        gatewayMode = "stopped";
+        log.info("[opencode-kiro] Shutting down owned gateway server...");
+        const stopping = server.stop(true);
+        gatewayStopping = stopping;
+        try {
+          await stopping;
+        } finally {
+          if (gatewayStopping === stopping) gatewayStopping = null;
+        }
       }
       gatewayMode = "stopped";
     },
@@ -594,12 +735,7 @@ export const KiroPlugin: Plugin = async (input) => {
         // startup para todos los providers).
         try {
           const auth = await getAuth() as any;
-          let imported: KiroCliCredentials | null = null;
-          if (auth?.type === "oauth" && typeof auth.refresh === "string") {
-            const { importFromKiroCli } = await import("./kiro-cli-sync");
-            imported = await importFromKiroCli();
-          }
-          const credentials = resolveKiroLoaderCredentials(auth, imported);
+          const credentials = await resolveKiroAuthCredentials(auth);
           if (credentials) {
             return {
               headers: {
@@ -710,17 +846,15 @@ export const KiroPlugin: Plugin = async (input) => {
 
                 const apiRegion = resolveApiRegion(detectedRegion);
                 const arn = await resolveProfileArn(tok.accessToken, apiRegion);
-                if (arn) {
-                  try {
-                    const models = await fetchAvailableModels(tok.accessToken, apiRegion, arn);
-                    setCachedDynamicModels(buildModelsFromApi(models));
-                  } catch (e) { log.warn("Failed to precache models", e); }
-                }
 
                 return {
                   type: "success",
                   access: tok.accessToken,
-                  refresh: `${tok.refreshToken}|${result.clientId}|${result.clientSecret}|idc||`,
+                  refresh: withKiroCredentialScope(
+                    `${tok.refreshToken}|${result.clientId}|${result.clientSecret}|idc||`,
+                    detectedRegion,
+                    arn ?? undefined,
+                  ),
                   expires: Date.now() + (tok.expiresIn ?? 3600) * 1000 - EXPIRES_BUFFER_MS,
                   metadata: {
                     region: detectedRegion,
@@ -758,6 +892,11 @@ export const KiroPlugin: Plugin = async (input) => {
               imported.source || "",
               imported.tokenKey || "",
             ];
+            const packedCredential = withKiroCredentialScope(
+              packParts.join("|"),
+              region,
+              imported.profileArn,
+            );
 
             return {
               url: "",
@@ -769,7 +908,7 @@ export const KiroPlugin: Plugin = async (input) => {
                   return {
                     type: "success" as const,
                     access: imported.accessToken,
-                    refresh: packParts.join("|"),
+                    refresh: packedCredential,
                     expires: Date.now() + 3600 * 1000 - EXPIRES_BUFFER_MS,
                     metadata: { region, authMethod, profileArn: imported.profileArn }
                   };
@@ -778,7 +917,7 @@ export const KiroPlugin: Plugin = async (input) => {
                 // Otherwise try to refresh
                 try {
                   const refreshed = await refreshKiroToken(
-                    packParts.join("|"),
+                    packedCredential,
                     region,
                     authMethod as any
                   );
@@ -821,7 +960,7 @@ export const KiroPlugin: Plugin = async (input) => {
             }
 
             const region = inputs.region?.trim() || "us-east-1";
-            const packed = `${refreshToken}|||desktop||`;
+            const packed = withKiroCredentialScope(`${refreshToken}|||desktop||`, region);
 
             return {
               url: "",
@@ -853,18 +992,40 @@ export const KiroPlugin: Plugin = async (input) => {
     // cfg.provider is read by the config providers loop.
     config: async (cfg: any) => {
       const cachedModels = getCachedDynamicModels();
-      let models = cachedModels ?? kiroModels;
+      const activeCredentials = await loadOpenCodeKiroCredentials();
+      let models = activeCredentials ? kiroModels : cachedModels ?? kiroModels;
       const configuredApi = cfg.provider?.kiro?.api as string | undefined;
       const usesLocalGateway = !configuredApi || configuredApi.startsWith(`${gatewayOrigin(GATEWAY_PORT)}/`);
       if (usesLocalGateway) {
         try {
           await ensureGateway();
-          if (cachedModels === null) {
+          if (activeCredentials) {
+            const loadedModels = await loadGatewayModels(
+              GATEWAY_PORT,
+              await getGatewayToken(),
+              activeCredentials,
+              GATEWAY_CONFIG_CATALOG_TIMEOUT_MS,
+              false,
+            );
+            if (loadedModels !== null) {
+              models = loadedModels;
+              accountCatalogModels = loadedModels;
+            }
+          } else if (cachedModels === null) {
             const catalogCredentials = await loadLocalCatalogCredentials();
             const loadedModels = gatewayMode === "owned" || catalogCredentials
-              ? await loadGatewayModels(GATEWAY_PORT, await getGatewayToken(), catalogCredentials ?? undefined)
+              ? await loadGatewayModels(
+                  GATEWAY_PORT,
+                  await getGatewayToken(),
+                  catalogCredentials ?? undefined,
+                  GATEWAY_CONFIG_CATALOG_TIMEOUT_MS,
+                  !catalogCredentials,
+                )
               : null;
-            if (loadedModels !== null) models = loadedModels;
+            if (loadedModels !== null) {
+              models = loadedModels;
+              if (catalogCredentials) accountCatalogModels = loadedModels;
+            }
           }
         } catch (error) {
           log.warn("[opencode-kiro] Gateway unavailable during config; using fallback models", error);

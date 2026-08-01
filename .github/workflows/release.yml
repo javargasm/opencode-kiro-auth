@@ -30,11 +30,7 @@ jobs:
       # Node >= 24.15, which the Node 24 runner satisfies.
       - run: npm install -g npm@latest
       - run: bun install --frozen-lockfile
-      - run: bun run typecheck
-      # test:bun uses Bun.serve and needs the bun runtime; it runs locally via
-      # `bun run check` but is skipped in CI. `bun run test` covers the rest.
-      - run: bun run test
-      - run: bun run build
+      - run: bun run check
       # No NODE_AUTH_TOKEN: authentication comes from the OIDC trusted publisher
       # configured for this repo + workflow on npmjs.com. Provenance is implied
       # by trusted publishing but kept explicit for clarity.

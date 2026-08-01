@@ -1,11 +1,11 @@
-export function getDashboardHtml(): string {
+export function getDashboardHtml(nonce: string): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>KIRO_GATEWAY // TELEMETRY</title>
-  <style>
+  <style nonce="${nonce}">
     :root {
       --bg-color: #000501;
       --panel-bg: rgba(0, 20, 5, 0.4);
@@ -98,6 +98,28 @@ export function getDashboardHtml(): string {
       box-shadow: 0 0 10px var(--primary);
       animation: blink 1.5s infinite alternate;
     }
+
+    .pulse.online {
+      background-color: var(--primary);
+      box-shadow: 0 0 10px var(--primary);
+    }
+
+    .pulse:not(.online) {
+      background-color: #ff3b3b;
+      box-shadow: 0 0 10px #ff3b3b;
+    }
+
+    .subtitle { font-size: 0.8rem; color: var(--text); margin-top: 5px; }
+    .header-actions { display: flex; align-items: center; gap: 15px; }
+    .status-button { cursor: pointer; font-family: var(--font-mono); outline: none; }
+    .time-cell { color: var(--secondary); }
+    .id-prefix { opacity: 0.5; }
+    .effort-tag {
+      border-color: rgba(0, 255, 255, 0.3);
+      color: var(--secondary);
+      background: rgba(0, 255, 255, 0.05);
+    }
+    .empty-tag { opacity: 0.3; }
 
     @keyframes blink {
       0% { opacity: 0.3; }
@@ -224,16 +246,16 @@ export function getDashboardHtml(): string {
   <header>
     <div>
       <h1>KIRO_GATEWAY</h1>
-      <div style="font-size: 0.8rem; color: var(--text); margin-top: 5px;">LOCAL PROXY // TELEMETRY NODE</div>
+      <div class="subtitle">LOCAL PROXY // TELEMETRY NODE</div>
     </div>
-    <div style="display: flex; align-items: center; gap: 15px;">
-      <button id="toggle-currency" class="status-badge" style="cursor: pointer; font-family: var(--font-mono); outline: none;" onclick="toggleCurrency()">
+    <div class="header-actions">
+      <button id="toggle-currency" type="button" class="status-badge status-button">
         SHOW USD
       </button>
-      <div class="status-badge">
+      <button id="auth-status" type="button" class="status-badge status-button">
         <div class="pulse"></div>
-        SYS.ONLINE
-      </div>
+        <span id="auth-status-text">AUTH.REQUIRED</span>
+      </button>
     </div>
   </header>
 
@@ -272,12 +294,61 @@ export function getDashboardHtml(): string {
     </table>
   </div>
 
-  <script>
+  <script nonce="${nonce}">
     let lastRenderedIds = new Set();
+    let gatewayToken = '';
+    let fetchInFlight = false;
+    let authPromptPending = false;
+
+    function setAuthStatus(text, online = false) {
+      document.getElementById('auth-status-text').textContent = text;
+      const pulse = document.querySelector('#auth-status .pulse');
+      pulse.classList.toggle('online', online);
+    }
+
+    function clearGatewayToken() {
+      gatewayToken = '';
+    }
+
+    function promptForGatewayToken(message) {
+      const supplied = window.prompt(message, '');
+      if (typeof supplied !== 'string' || !supplied.trim()) {
+        setAuthStatus('AUTH.REQUIRED');
+        return false;
+      }
+
+      gatewayToken = supplied.trim();
+      setAuthStatus('AUTH.CHECKING');
+      return true;
+    }
+
+    function scheduleAuthPrompt(message) {
+      if (authPromptPending) return;
+      authPromptPending = true;
+      // Yield once so an authentication failure is painted before re-prompting.
+      setTimeout(() => {
+        authPromptPending = false;
+        if (promptForGatewayToken(message)) void fetchStats();
+      }, 0);
+    }
 
     function formatTime(timestamp) {
       const d = new Date(timestamp);
+      if (Number.isNaN(d.getTime())) return 'INVALID';
       return d.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' }) + '.' + d.getMilliseconds().toString().padStart(3, '0');
+    }
+
+    function finiteNumber(value) {
+      const number = Number(value);
+      return Number.isFinite(number) ? number : 0;
+    }
+
+    function appendCell(row, value, className) {
+      const cell = document.createElement('td');
+      if (className) cell.className = className;
+      cell.textContent = String(value);
+      row.append(cell);
+      return cell;
     }
 
     let showUsd = false;
@@ -285,64 +356,98 @@ export function getDashboardHtml(): string {
     function toggleCurrency() {
       showUsd = !showUsd;
       const btn = document.getElementById('toggle-currency');
-      btn.innerText = showUsd ? 'SHOW CREDITS' : 'SHOW USD';
+      btn.textContent = showUsd ? 'SHOW CREDITS' : 'SHOW USD';
       
       const labelCard = document.getElementById('label-credits');
-      labelCard.innerText = showUsd ? 'EST.COST (USD)' : 'EST.CREDITS';
+      labelCard.textContent = showUsd ? 'EST.COST (USD)' : 'EST.CREDITS';
       
       const headerTable = document.getElementById('header-credits');
-      headerTable.innerText = showUsd ? 'COST (USD)' : 'CREDITS';
+      headerTable.textContent = showUsd ? 'COST (USD)' : 'CREDITS';
       
       fetchStats();
     }
 
     async function fetchStats() {
+      if (fetchInFlight) return;
+      if (!gatewayToken) {
+        setAuthStatus('AUTH.REQUIRED');
+        return;
+      }
+
+      fetchInFlight = true;
       try {
-        const res = await fetch('/dashboard/api/stats');
+        const res = await fetch('/dashboard/api/stats', {
+          method: 'GET',
+          headers: { 'x-api-key': gatewayToken },
+          cache: 'no-store',
+          credentials: 'omit',
+          referrerPolicy: 'no-referrer',
+        });
+        if (res.status === 401) {
+          clearGatewayToken();
+          setAuthStatus('AUTH.REJECTED');
+          scheduleAuthPrompt('Telemetry authentication failed (401). Re-enter the local gateway token:');
+          return;
+        }
+        if (!res.ok) throw new Error('Telemetry request failed: HTTP ' + res.status);
         const data = await res.json();
+        setAuthStatus('SYS.ONLINE', true);
         
-        document.getElementById('val-requests').innerText = data.totalRequests;
-        document.getElementById('val-tokens').innerText = data.totalTokens.toLocaleString();
+        document.getElementById('val-requests').textContent = String(finiteNumber(data.totalRequests));
+        document.getElementById('val-tokens').textContent = finiteNumber(data.totalTokens).toLocaleString();
         
         if (showUsd) {
-          document.getElementById('val-credits').innerText = '$' + data.totalUsd.toFixed(1);
+          document.getElementById('val-credits').textContent = '$' + finiteNumber(data.totalUsd).toFixed(1);
         } else {
-          document.getElementById('val-credits').innerText = data.totalCredits.toFixed(1);
+          document.getElementById('val-credits').textContent = finiteNumber(data.totalCredits).toFixed(1);
         }
 
         const tbody = document.getElementById('table-body');
-        
-        // Rebuild table to keep things simple but add animation class to new ones
-        let html = '';
         const currentIds = new Set();
-        
-        data.requests.forEach(req => {
-          currentIds.add(req.id);
-          const isNew = !lastRenderedIds.has(req.id) && lastRenderedIds.size > 0;
-          
-          const effortTag = req.effort
-            ? '<span class="tag" style="border-color: rgba(0, 255, 255, 0.3); color: var(--secondary); background: rgba(0, 255, 255, 0.05);">' + req.effort.toUpperCase() + '</span>'
-            : '<span style="opacity: 0.3">-</span>';
+        const rows = Array.isArray(data.requests) ? data.requests : [];
+        const fragment = document.createDocumentFragment();
 
-          const costDisplay = showUsd
-            ? '$' + (req.usd ?? 0).toFixed(4)
-            : req.credits.toFixed(5);
+        rows.forEach(request => {
+          const id = typeof request.id === 'string' ? request.id : String(request.id ?? '');
+          currentIds.add(id);
+          const row = document.createElement('tr');
+          if (!lastRenderedIds.has(id) && lastRenderedIds.size > 0) row.classList.add('new-row');
 
-          html += \`
-            <tr class="\${isNew ? 'new-row' : ''}">
-              <td style="color: var(--secondary)">\${formatTime(req.timestamp)}</td>
-              <td><span style="opacity: 0.5">msg_</span>\${req.id.split('_').pop().substring(0,8)}</td>
-              <td class="model-name">\${req.model}</td>
-              <td><span class="tag">\${req.stream ? 'STREAM' : 'SYNC'}</span></td>
-              <td>\${effortTag}</td>
-              <td>\${req.inputTokens.toLocaleString()}</td>
-              <td>\${req.outputTokens.toLocaleString()}</td>
-              <td>\${costDisplay}</td>
-            </tr>
-          \`;
+          appendCell(row, formatTime(request.timestamp), 'time-cell');
+          const idCell = document.createElement('td');
+          const idPrefix = document.createElement('span');
+          idPrefix.className = 'id-prefix';
+          idPrefix.textContent = 'msg_';
+          idCell.append(idPrefix, document.createTextNode((id.split('_').pop() || '').slice(0, 8)));
+          row.append(idCell);
+          appendCell(row, request.model ?? '', 'model-name');
+
+          const typeCell = document.createElement('td');
+          const typeTag = document.createElement('span');
+          typeTag.className = 'tag';
+          typeTag.textContent = request.stream ? 'STREAM' : 'SYNC';
+          typeCell.append(typeTag);
+          row.append(typeCell);
+
+          const effortCell = document.createElement('td');
+          const effortTag = document.createElement('span');
+          effortTag.className = request.effort ? 'tag effort-tag' : 'empty-tag';
+          effortTag.textContent = request.effort ? String(request.effort).toUpperCase() : '-';
+          effortCell.append(effortTag);
+          row.append(effortCell);
+
+          appendCell(row, finiteNumber(request.inputTokens).toLocaleString());
+          appendCell(row, finiteNumber(request.outputTokens).toLocaleString());
+          appendCell(
+            row,
+            showUsd
+              ? '$' + finiteNumber(request.usd).toFixed(4)
+              : finiteNumber(request.credits).toFixed(5),
+          );
+          fragment.append(row);
         });
-        
-        tbody.innerHTML = html;
+
+        tbody.replaceChildren(fragment);
         lastRenderedIds = currentIds;
 
         // Remove new-row class after animation
@@ -351,12 +456,24 @@ export function getDashboardHtml(): string {
         }, 500);
 
       } catch (err) {
+        setAuthStatus('TELEMETRY.ERROR');
         console.error("Telemetry connection lost", err);
+      } finally {
+        fetchInFlight = false;
       }
     }
 
-    // Initial fetch
-    fetchStats();
+    document.getElementById('auth-status').addEventListener('click', () => {
+      scheduleAuthPrompt('Enter the local gateway token for protected telemetry:');
+    });
+
+    document.getElementById('toggle-currency').addEventListener('click', toggleCurrency);
+
+    if (gatewayToken) {
+      fetchStats();
+    } else {
+      scheduleAuthPrompt('Enter the local gateway token for protected telemetry:');
+    }
     // Poll every 1.5s
     setInterval(fetchStats, 1500);
   </script>

@@ -1,5 +1,40 @@
 # @javargasm/opencode-kiro-auth
 
+## 8.2.0
+
+### Minor Changes
+
+- Harden the local gateway, publish a loadable TUI artifact, and make long-running Kiro streams recover without duplicating consumer-visible output.
+
+  Gateway security and lifecycle:
+
+  - Bind protocol-v5 request HMACs to the HTTP method and complete path/query, retain accepted nonces for the full replay window, and verify gateway ownership with constant-time challenge proofs.
+  - Repair weak or partial gateway-token files under a bounded cross-process lock, reject tokens shorter than 32 characters, and recover safely when the current port owner exits during attachment.
+  - Enforce loopback Host and browser Origin checks, protect dashboard telemetry routes, remove the gateway OAuth-start endpoint, and bind the IdC verification page to OAuth state.
+  - Bound gateway JSON, catalog, nonce, request-body, incomplete-frame, and event-queue resources while preserving graceful shared-owner takeover.
+
+  Streaming and tool calls:
+
+  - Retry first-token, idle, transport, and retryable post-output service failures with semantic replay: already-emitted text, reasoning metadata, and canonical tool calls are suppressed while only the new suffix reaches consumers.
+  - Remove the model-visible `[tool calling continues]` history marker and preserve tool-only turns as empty assistant content with their structured tool metadata intact.
+  - Preserve request timestamps, compacted context, reasoning signatures, and terminal metadata across retries; divergent retries now fail instead of duplicating or corrupting output.
+  - Reserve capacity for parser bursts and terminal events, enqueue terminal events before settling stream results, and propagate cancellation/backpressure through the gateway SSE bridge.
+  - Normalize Anthropic stop reasons for max-token and tool-use turns and keep completed tool calls recoverable without accepting incomplete trailing tools.
+
+  Models, OAuth, and request contracts:
+
+  - Keep direct-OAuth model catalogs scoped to the active OpenCode account without replacing the shared gateway owner's catalog; persist region and profile scope across refresh-token rotation.
+  - Fetch request-scoped catalog metadata for attaching accounts so effort variants, output limits, and timeout policy come from the correct credentials.
+  - Validate Anthropic model and `max_tokens` inputs before credential refresh or upstream dispatch. Send `max_tokens` only when the live catalog advertises that field, preserving compatibility with Claude Haiku 4.5 while clamping supported models to their catalog maximum.
+  - Reject owner aliases with incompatible profile or region metadata and avoid caching request-scoped profile data globally.
+
+  Dashboard, diagnostics, and packaging:
+
+  - Render dashboard telemetry with DOM text nodes instead of `innerHTML`, use a per-response nonce CSP, and keep the prompted gateway token in memory only.
+  - Keep file logging explicitly opt-in, route diagnostics by session, serialize writes asynchronously, and create private log/token files where supported.
+  - Bundle the TUI as `dist/tui.js`, publish matching declarations, declare Bun as the runtime, and verify package exports with an artifact test.
+  - Run the same complete `bun run check` pipeline in CI and release workflows, including typecheck, Vitest, Bun gateway tests, production builds, and package-artifact validation.
+
 ## 8.1.1
 
 ### Patch Changes

@@ -1,5 +1,5 @@
 import type { Server } from "bun";
-import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { isAbsolute } from "node:path";
 import type { Message, Model, Api, Context } from "./types";
 import { streamKiro } from "./stream";
@@ -15,40 +15,44 @@ import {
   resolveApiRegion,
   resolveKiroModel,
   resolveProfileArn,
+  resetProfileArnCache,
   seedProfileArn,
   setCachedDynamicModels,
   type KiroModel,
   validateNativeKiroEffort,
 } from "./models";
-import { refreshKiroToken, startSocialLogin, BUILDER_ID_REGION } from "./oauth";
+import { refreshKiroToken, BUILDER_ID_REGION } from "./oauth";
 import { stats } from "./dashboard-stats";
 import { getDashboardHtml } from "./dashboard-ui";
+import {
+  GATEWAY_AUTH_HEADER,
+  GATEWAY_AUTH_NONCE_HEADER,
+  GATEWAY_AUTH_TIMESTAMP_HEADER,
+  GATEWAY_CAPABILITIES,
+  GATEWAY_CHALLENGE_HEADER,
+  GATEWAY_PROTOCOL_VERSION,
+  gatewayChallengeProof,
+  gatewayRequestSignature,
+} from "./gateway-auth";
+
+export {
+  GATEWAY_AUTH_HEADER,
+  GATEWAY_AUTH_NONCE_HEADER,
+  GATEWAY_AUTH_TIMESTAMP_HEADER,
+  GATEWAY_CAPABILITIES,
+  GATEWAY_CHALLENGE_HEADER,
+  GATEWAY_PROTOCOL_VERSION,
+  gatewayChallengeProof,
+  gatewayRequestSignature,
+} from "./gateway-auth";
 
 export const OPENCODE_CWD_HEADER = "x-opencode-cwd";
 export const OPENCODE_EFFORT_HEADER = "x-opencode-kiro-effort";
 export const OPENCODE_REGION_HEADER = "x-opencode-kiro-region";
 export const OPENCODE_PROFILE_ARN_HEADER = "x-opencode-kiro-profile-arn";
-export const GATEWAY_AUTH_HEADER = "x-opencode-kiro-gateway-token";
-export const GATEWAY_AUTH_TIMESTAMP_HEADER = "x-opencode-kiro-gateway-timestamp";
-export const GATEWAY_AUTH_NONCE_HEADER = "x-opencode-kiro-gateway-nonce";
-export const GATEWAY_CHALLENGE_HEADER = "x-opencode-kiro-challenge";
-export const GATEWAY_PROTOCOL_VERSION = 4;
-export const GATEWAY_CAPABILITIES = [
-  "request-workspace",
-  "dynamic-models",
-  "domain-separated-auth",
-  "standard-client-auth",
-] as const;
-
-export function gatewayChallengeProof(token: string, challenge: string): string {
-  return createHmac("sha256", token).update(`health-proof:v1:${challenge}`).digest("hex");
-}
-
-export function gatewayRequestSignature(token: string, timestamp: string, nonce: string): string {
-  return createHmac("sha256", token).update(`request-auth:v1:${timestamp}:${nonce}`).digest("hex");
-}
-
 const usedGatewayNonces = new Map<string, number>();
+const GATEWAY_AUTH_WINDOW_MS = 30_000;
+const GATEWAY_NONCE_MAX_ENTRIES = 65_536;
 
 function bearerToken(req: Request): string | undefined {
   return req.headers.get("authorization")?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim() || undefined;
@@ -76,20 +80,38 @@ function hasValidGatewayRequestAuth(req: Request, gatewayToken: string | undefin
   const nonce = req.headers.get(GATEWAY_AUTH_NONCE_HEADER) ?? "";
   const signature = req.headers.get(GATEWAY_AUTH_HEADER) ?? "";
   const timestampMs = Number(timestamp);
-  if (!Number.isFinite(timestampMs) || Math.abs(Date.now() - timestampMs) > 30_000) return false;
-  if (!nonce || usedGatewayNonces.has(nonce) || !/^[a-f0-9]{64}$/.test(signature)) return false;
+  const now = Date.now();
+  if (!Number.isFinite(timestampMs) || Math.abs(now - timestampMs) > GATEWAY_AUTH_WINDOW_MS) return false;
+  for (const [key, expiresAt] of usedGatewayNonces) {
+    if (expiresAt < now) usedGatewayNonces.delete(key);
+  }
+  if (
+    !nonce
+    || usedGatewayNonces.has(nonce)
+    || !/^[a-f0-9]{64}$/.test(signature)
+  ) return false;
 
-  const expected = Buffer.from(gatewayRequestSignature(gatewayToken, timestamp, nonce), "hex");
+  const url = new URL(req.url);
+  const path = `${url.pathname}${url.search}`;
+  const expected = Buffer.from(
+    gatewayRequestSignature(gatewayToken, timestamp, nonce, req.method, path),
+    "hex",
+  );
   const actual = Buffer.from(signature, "hex");
   if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) return false;
 
-  usedGatewayNonces.set(nonce, timestampMs);
-  if (usedGatewayNonces.size > 1_000) {
-    const cutoff = Date.now() - 30_000;
-    for (const [key, at] of usedGatewayNonces) {
-      if (at < cutoff) usedGatewayNonces.delete(key);
-    }
+  // Replay safety requires retaining every accepted nonce for its entire
+  // validity window: evicting a live entry would make that request replayable.
+  // The finite cap is the unavoidable storage/rate tradeoff (about 2,184
+  // accepted requests/second over 30s); once genuinely full, fail closed until
+  // entries expire rather than weakening replay protection.
+  if (usedGatewayNonces.size >= GATEWAY_NONCE_MAX_ENTRIES) {
+    return false;
   }
+  // Retain the nonce for its entire signature-validity window. A client clock
+  // can be ahead of ours, so pruning merely 30 seconds after receipt could
+  // otherwise make the still-valid signature replayable.
+  usedGatewayNonces.set(nonce, timestampMs + GATEWAY_AUTH_WINDOW_MS);
   return true;
 }
 
@@ -114,11 +136,13 @@ let _creds: GatewayCredentials | null = null;
 // must share ONE refresh, not fire N parallel refreshes. With rotating refresh
 // tokens (the desktop endpoint), parallel refreshes invalidate each other and
 // cause intermittent auth failures.
-let _refreshInFlight: Promise<void> | null = null;
-let _modelsRefreshInFlight: Promise<KiroModel[] | null> | null = null;
+let _credentialGeneration = 0;
+let _refreshInFlight: { generation: number; promise: Promise<void> } | null = null;
+let _modelsRefreshInFlight: { generation: number; promise: Promise<KiroModel[] | null> } | null = null;
 
 const ATTACHING_CATALOG_TTL_MS = 5 * 60_000;
 const ATTACHING_CATALOG_MAX_ENTRIES = 32;
+const ATTACHING_CATALOG_MAX_IN_FLIGHT = 8;
 const OWNER_ACCESS_TOKEN_ALIAS_MAX_ENTRIES = 8;
 interface AttachingCatalog {
   models: KiroModel[];
@@ -126,7 +150,45 @@ interface AttachingCatalog {
   expiresAt: number;
 }
 const attachingCatalogs = new Map<string, AttachingCatalog>();
+const attachingCatalogsInFlight = new Map<string, Promise<{ models: KiroModel[]; profileArn: string } | null>>();
 const ownerAccessTokenAliases = new Set<string>();
+
+function installGatewayCredentials(credentials: GatewayCredentials | null): void {
+  _credentialGeneration++;
+  _refreshInFlight = null;
+  _modelsRefreshInFlight = null;
+  resetUsageState();
+  resetProfileArnCache();
+  setCachedDynamicModels(null);
+  attachingCatalogs.clear();
+  attachingCatalogsInFlight.clear();
+  ownerAccessTokenAliases.clear();
+  _creds = credentials;
+  if (!credentials) return;
+  rememberOwnerAccessToken(credentials.accessToken);
+  if (credentials.profileArn) {
+    seedProfileArn(
+      credentials.profileArn,
+      credentials.accessToken,
+      resolveApiRegion(credentials.region),
+    );
+  }
+}
+
+async function waitWithSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) throw signal.reason ?? new Error("Request aborted");
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(signal.reason ?? new Error("Request aborted"));
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([promise, aborted]);
+  } finally {
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  }
+}
 
 function accessTokenDigest(accessToken: string): string {
   return createHash("sha256").update(accessToken).digest("hex");
@@ -169,6 +231,31 @@ function isOwnerRequest(
   return false;
 }
 
+function ownerCredentialConflict(
+  accessToken: string | undefined,
+  explicitRegion: string | undefined,
+  explicitProfileArn: string | undefined,
+): string | null {
+  if (!_creds) return null;
+  const identifiesOwner = !accessToken
+    || isOwnerAccessToken(accessToken)
+    || Boolean(explicitProfileArn && explicitProfileArn === _creds.profileArn);
+  if (!identifiesOwner) return null;
+  if (
+    explicitRegion
+    && resolveApiRegion(explicitRegion) !== resolveApiRegion(_creds.region)
+  ) {
+    return "Owner credential region does not match the active gateway account";
+  }
+  if (
+    explicitProfileArn
+    && explicitProfileArn !== _creds.profileArn
+  ) {
+    return "Owner credential profile does not match the active gateway account";
+  }
+  return null;
+}
+
 function attachingCatalogKey(accessToken: string, region: string, profileArn?: string): string {
   return createHash("sha256")
     .update(`${accessToken}\0${resolveApiRegion(region)}\0${profileArn ?? ""}`)
@@ -182,9 +269,6 @@ function rememberAttachingCatalog(
   result: { models: KiroModel[]; profileArn: string },
 ): void {
   const now = Date.now();
-  for (const [key, entry] of attachingCatalogs) {
-    if (entry.expiresAt <= now) attachingCatalogs.delete(key);
-  }
   const entry = {
     models: result.models,
     profileArn: result.profileArn,
@@ -200,13 +284,15 @@ function rememberAttachingCatalog(
   }
 }
 
-function getAttachingCatalog(accessToken: string, region: string, profileArn?: string): AttachingCatalog | undefined {
+function getAttachingCatalog(
+  accessToken: string,
+  region: string,
+  profileArn?: string,
+  allowStale = false,
+): AttachingCatalog | undefined {
   const key = attachingCatalogKey(accessToken, region, profileArn);
   const entry = attachingCatalogs.get(key);
-  if (!entry || entry.expiresAt <= Date.now()) {
-    attachingCatalogs.delete(key);
-    return undefined;
-  }
+  if (!entry || (!allowStale && entry.expiresAt <= Date.now())) return undefined;
   return entry;
 }
 
@@ -231,9 +317,7 @@ export async function initGatewayAuth(): Promise<void> {
       imported.tokenKey || "",
     ];
 
-    ownerAccessTokenAliases.clear();
-    rememberOwnerAccessToken(imported.accessToken);
-    _creds = {
+    const credentials: GatewayCredentials = {
       accessToken: imported.accessToken,
       refreshPacked: packParts.join("|"),
       region: imported.region,
@@ -241,6 +325,7 @@ export async function initGatewayAuth(): Promise<void> {
       profileArn: imported.profileArn,
       expiresAt: Date.now() + 3500 * 1000, // assume ~1h validity
     };
+    installGatewayCredentials(credentials);
 
     log.info(`[gateway-auth] Initialized (method=${imported.authMethod}, region=${imported.region})`);
 
@@ -248,21 +333,30 @@ export async function initGatewayAuth(): Promise<void> {
       try {
         log.info("[gateway-auth] Refreshing token at startup…");
         const refreshed = await refreshKiroToken(
-          _creds.refreshPacked,
-          _creds.region,
-          _creds.authMethod as any
+          credentials.refreshPacked,
+          credentials.region,
+          credentials.authMethod as any
         );
-        rememberOwnerAccessToken(_creds.accessToken);
-        _creds.accessToken = refreshed.access;
-        _creds.refreshPacked = refreshed.refresh;
-        _creds.expiresAt = refreshed.expires;
+        if (_creds === credentials) {
+          rememberOwnerAccessToken(credentials.accessToken);
+          credentials.accessToken = refreshed.access;
+          credentials.refreshPacked = refreshed.refresh;
+          credentials.expiresAt = refreshed.expires;
+        }
+        if (_creds === credentials && credentials.profileArn) {
+          seedProfileArn(credentials.profileArn, credentials.accessToken, resolveApiRegion(credentials.region));
+        }
         log.info("[gateway-auth] Token refreshed on startup successfully");
       } catch (err) {
         log.warn("[gateway-auth] Startup token refresh failed, trying with existing token", err);
       }
     }
 
-    await refreshGatewayModels();
+    // Catalog discovery can require two management calls. Do not keep /health
+    // in a "starting" state while those endpoints are slow or offline; the
+    // config hook applies a short budget and falls back to static models while
+    // this shared refresh continues in the background.
+    void refreshGatewayModels();
   } catch (err) {
     log.error("[gateway-auth] Init failed", err);
   }
@@ -274,38 +368,66 @@ export async function fetchGatewayModelsForCredentials(
   region: string,
   profileArn?: string,
   useProfileCache = false,
+  signal?: AbortSignal,
 ): Promise<{ models: KiroModel[]; profileArn: string } | null> {
   const apiRegion = resolveApiRegion(region);
   const resolvedProfileArn = profileArn
-    ?? await resolveProfileArn(accessToken, apiRegion, useProfileCache)
+    ?? await resolveProfileArn(accessToken, apiRegion, useProfileCache, signal)
     ?? undefined;
   if (!resolvedProfileArn) return null;
 
-  const apiModels = await fetchAvailableModels(accessToken, apiRegion, resolvedProfileArn);
+  const apiModels = await fetchAvailableModels(accessToken, apiRegion, resolvedProfileArn, signal);
   return { models: buildModelsFromApi(apiModels), profileArn: resolvedProfileArn };
+}
+
+async function fetchAttachingCatalog(
+  accessToken: string,
+  region: string,
+  profileArn: string | undefined,
+  signal?: AbortSignal,
+): Promise<{ models: KiroModel[]; profileArn: string } | null> {
+  const key = attachingCatalogKey(accessToken, region, profileArn);
+  let pending = attachingCatalogsInFlight.get(key);
+  if (!pending) {
+    if (attachingCatalogsInFlight.size >= ATTACHING_CATALOG_MAX_IN_FLIGHT) {
+      throw new Error("Too many concurrent attaching-account catalog requests");
+    }
+    let tracked!: Promise<{ models: KiroModel[]; profileArn: string } | null>;
+    tracked = fetchGatewayModelsForCredentials(accessToken, region, profileArn)
+      .finally(() => {
+        if (attachingCatalogsInFlight.get(key) === tracked) attachingCatalogsInFlight.delete(key);
+      });
+    pending = tracked;
+    attachingCatalogsInFlight.set(key, pending);
+  }
+  return waitWithSignal(pending, signal);
 }
 
 /** Refresh the owner's model catalog while preserving the last good cache on failure. */
 export async function refreshGatewayModels(): Promise<KiroModel[] | null> {
-  if (_modelsRefreshInFlight) return _modelsRefreshInFlight;
+  const generation = _credentialGeneration;
+  if (_modelsRefreshInFlight?.generation === generation) return _modelsRefreshInFlight.promise;
   if (!_creds?.accessToken) return getCachedDynamicModels();
+  const credentials = _creds;
 
-  _modelsRefreshInFlight = (async () => {
+  const promise = (async () => {
     try {
       const accessToken = await getAccessToken();
+      if (_credentialGeneration !== generation || _creds !== credentials) return getCachedDynamicModels();
       const result = await fetchGatewayModelsForCredentials(
         accessToken,
-        _creds!.region,
-        _creds!.profileArn,
+        credentials.region,
+        credentials.profileArn,
         true,
       );
+      if (_credentialGeneration !== generation || _creds !== credentials) return getCachedDynamicModels();
       if (!result) {
         log.info("[kiro-models.fetched] Skipping fetch, no profileArn available");
         return getCachedDynamicModels();
       }
 
-      _creds!.profileArn = result.profileArn;
-      seedProfileArn(result.profileArn);
+      credentials.profileArn = result.profileArn;
+      seedProfileArn(result.profileArn, accessToken, resolveApiRegion(credentials.region));
       setCachedDynamicModels(result.models);
       log.info(`[kiro-models.fetched] Found ${result.models.length}`);
       return result.models;
@@ -314,43 +436,64 @@ export async function refreshGatewayModels(): Promise<KiroModel[] | null> {
       return getCachedDynamicModels();
     }
   })();
+  const flight = { generation, promise };
+  _modelsRefreshInFlight = flight;
 
   try {
-    return await _modelsRefreshInFlight;
+    return await promise;
   } finally {
-    _modelsRefreshInFlight = null;
+    if (_modelsRefreshInFlight === flight) _modelsRefreshInFlight = null;
   }
 }
 
 /** Get a fresh access token, refreshing if expired (single-flight). */
-async function getAccessToken(): Promise<string> {
+async function getAccessToken(signal?: AbortSignal): Promise<string> {
   if (!_creds) throw new Error("Kiro credentials not initialized — run /login kiro");
+  const credentials = _creds;
+  const generation = _credentialGeneration;
 
-  if (Date.now() >= _creds.expiresAt) {
+  if (Date.now() >= credentials.expiresAt) {
     // Coalesce concurrent refreshes into one in-flight promise so parallel
     // requests don't each rotate (and invalidate) the refresh token.
-    if (!_refreshInFlight) {
-      const creds = _creds;
-      _refreshInFlight = (async () => {
+    if (_refreshInFlight?.generation !== generation) {
+      const promise = (async () => {
         log.info("[gateway-auth] Token expired, refreshing...");
         const refreshed = await refreshKiroToken(
-          creds.refreshPacked,
-          creds.region,
-          creds.authMethod,
+          credentials.refreshPacked,
+          credentials.region,
+          credentials.authMethod,
         );
-        rememberOwnerAccessToken(creds.accessToken);
-        creds.accessToken = refreshed.access;
-        creds.refreshPacked = refreshed.refresh;
-        creds.expiresAt = refreshed.expires;
+        if (_credentialGeneration !== generation || _creds !== credentials) return;
+        rememberOwnerAccessToken(credentials.accessToken);
+        credentials.accessToken = refreshed.access;
+        credentials.refreshPacked = refreshed.refresh;
+        credentials.expiresAt = refreshed.expires;
+        if (credentials.profileArn) {
+          seedProfileArn(credentials.profileArn, credentials.accessToken, resolveApiRegion(credentials.region));
+        }
         log.info("[gateway-auth] Token refreshed successfully");
-      })().finally(() => {
-        _refreshInFlight = null;
-      });
+      })();
+      const flight = { generation, promise };
+      _refreshInFlight = flight;
+      void promise
+        .finally(() => {
+          if (_refreshInFlight === flight) _refreshInFlight = null;
+        })
+        // `finally()` creates a distinct promise. Handle only that detached
+        // cleanup chain so the original rejection still reaches every waiter.
+        .catch(() => undefined);
     }
-    await _refreshInFlight;
+    const refresh = _refreshInFlight;
+    if (!refresh || refresh.generation !== generation) {
+      throw new Error("Kiro credential refresh was superseded");
+    }
+    await waitWithSignal(refresh.promise, signal);
   }
 
-  return _creds.accessToken;
+  if (_credentialGeneration !== generation || _creds !== credentials) {
+    throw new Error("Kiro credentials changed while processing the request");
+  }
+  return credentials.accessToken;
 }
 
 // ── Kiro account usage limits (credits) ──────────────────────────────
@@ -368,7 +511,10 @@ export interface KiroUsageLimits {
 }
 
 let _usageCache: { data: KiroUsageLimits; at: number } | null = null;
+let _usageInFlight: Promise<KiroUsageLimits> | null = null;
+let _usageAbortController: AbortController | null = null;
 const USAGE_CACHE_MS = 120_000;
+export const USAGE_REQUEST_TIMEOUT_MS = 10_000;
 
 function formatDuration(sec: number): string {
   const d = Math.floor(sec / 86400);
@@ -379,27 +525,55 @@ function formatDuration(sec: number): string {
   return m >= 1 ? `${m}m` : "<1m";
 }
 
-export async function fetchKiroUsageLimits(): Promise<KiroUsageLimits> {
+export async function fetchKiroUsageLimits(
+  options: { timeoutMs?: number } = {},
+): Promise<KiroUsageLimits> {
   if (_usageCache && Date.now() - _usageCache.at < USAGE_CACHE_MS) {
     return _usageCache.data;
   }
+  if (_usageInFlight) return _usageInFlight;
 
   if (!_creds) {
     return { percentage: 0, creditsUsed: 0, creditsTotal: 0, planTitle: null, monthlyResetsIn: null, error: "no credentials" };
   }
 
-  try {
-    const accessToken = await getAccessToken();
-    const apiRegion = resolveApiRegion(_creds.region);
+  const credentials = _creds;
+  const generation = _credentialGeneration;
+  const stale = _usageCache?.data;
+  const accountUnchanged = () => _credentialGeneration === generation && _creds === credentials;
+  const failure = (message: string): KiroUsageLimits => {
+    if (accountUnchanged() && stale) return { ...stale, error: message };
+    return {
+      percentage: 0,
+      creditsUsed: 0,
+      creditsTotal: 0,
+      planTitle: null,
+      monthlyResetsIn: null,
+      error: message,
+    };
+  };
+
+  const abortController = new AbortController();
+  _usageAbortController = abortController;
+  const timeoutSignal = AbortSignal.timeout(
+    Math.max(1, options.timeoutMs ?? USAGE_REQUEST_TIMEOUT_MS),
+  );
+  const signal = AbortSignal.any([abortController.signal, timeoutSignal]);
+
+  const pending = (async (): Promise<KiroUsageLimits> => {
+    try {
+    const accessToken = await getAccessToken(signal);
+    if (_credentialGeneration !== generation || _creds !== credentials) throw new Error("Kiro account changed");
+    const apiRegion = resolveApiRegion(credentials.region);
 
     // Resolve profileArn if missing (Builder ID social login may not have it).
-    let profileArn = _creds.profileArn;
+    let profileArn = credentials.profileArn;
     if (!profileArn) {
       const { resolveProfileArn } = await import("./models");
-      profileArn = await resolveProfileArn(accessToken, apiRegion) ?? undefined;
-      if (profileArn) {
-        _creds.profileArn = profileArn;
-        seedProfileArn(profileArn);
+      profileArn = await resolveProfileArn(accessToken, apiRegion, true, signal) ?? undefined;
+      if (profileArn && _credentialGeneration === generation && _creds === credentials) {
+        credentials.profileArn = profileArn;
+        seedProfileArn(profileArn, accessToken, apiRegion);
       }
     }
 
@@ -420,12 +594,13 @@ export async function fetchKiroUsageLimits(): Promise<KiroUsageLimits> {
         "User-Agent": "opencode-kiro",
       },
       body: JSON.stringify(body),
+      signal,
     });
 
     if (!res.ok) {
-      const out: KiroUsageLimits = { percentage: 0, creditsUsed: 0, creditsTotal: 0, planTitle: null, monthlyResetsIn: null, error: `HTTP ${res.status}` };
-      _usageCache = { data: out, at: Date.now() };
-      return out;
+      const message = `HTTP ${res.status}`;
+      if (!accountUnchanged()) throw new Error("Kiro account changed");
+      return failure(message);
     }
 
     const data: any = await res.json();
@@ -466,13 +641,33 @@ export async function fetchKiroUsageLimits(): Promise<KiroUsageLimits> {
       );
     }
 
+    if (!accountUnchanged()) throw new Error("Kiro account changed");
     _usageCache = { data: out, at: Date.now() };
     return out;
   } catch (err) {
-    const out: KiroUsageLimits = { percentage: 0, creditsUsed: 0, creditsTotal: 0, planTitle: null, monthlyResetsIn: null, error: err instanceof Error ? err.message : String(err) };
-    _usageCache = { data: out, at: Date.now() };
-    return out;
+      const message = !accountUnchanged()
+        ? "Kiro account changed"
+        : signal.aborted
+          ? "usage request timed out"
+        : err instanceof Error ? err.message : String(err);
+      return failure(message);
+    }
+  })();
+
+  _usageInFlight = pending;
+  try {
+    return await pending;
+  } finally {
+    if (_usageInFlight === pending) _usageInFlight = null;
+    if (_usageAbortController === abortController) _usageAbortController = null;
   }
+}
+
+function resetUsageState(): void {
+  _usageAbortController?.abort(new Error("Usage state reset"));
+  _usageAbortController = null;
+  _usageInFlight = null;
+  _usageCache = null;
 }
 
 /** @internal — test helper to inject credentials without Kiro CLI */
@@ -482,22 +677,28 @@ export function _seedCredentials(
   expiresAt = Date.now() + 3600_000,
   profileArn?: string,
 ) {
-  ownerAccessTokenAliases.clear();
-  _creds = {
+  installGatewayCredentials({
     accessToken: token,
     refreshPacked: "",
     region,
     authMethod: "idc",
     profileArn,
     expiresAt,
-  };
+  });
 }
 
 /** @internal — test helper to simulate a gateway owner without local credentials. */
 export function _clearCredentials(): void {
-  ownerAccessTokenAliases.clear();
-  _creds = null;
+  installGatewayCredentials(null);
 }
+
+/** @internal — deterministic replay-cache seams for gateway auth tests. */
+export function _resetGatewayNoncesForTest(): void {
+  usedGatewayNonces.clear();
+}
+
+/** @internal — avoid 1,001 loopback HTTP round trips in nonce-boundary tests. */
+export const _hasValidGatewayRequestAuthForTest = hasValidGatewayRequestAuth;
 
 /**
  * Origin allow-list for the local gateway. Server-side callers (OpenCode,
@@ -506,13 +707,34 @@ export function _clearCredentials(): void {
  * from arbitrary websites to 127.0.0.1:7438 — the gateway proxies the user's
  * Kiro credentials, so an open CORS surface means credential/quota abuse.
  */
+function isLoopbackHostname(hostname: string): boolean {
+  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  return normalized === "127.0.0.1" || normalized === "localhost" || normalized === "::1";
+}
+
 function isLocalhostOrigin(origin: string): boolean {
   try {
-    const host = new URL(origin).hostname;
-    return host === "127.0.0.1" || host === "localhost" || host === "::1" || host === "[::1]";
+    return isLoopbackHostname(new URL(origin).hostname);
   } catch {
     return false;
   }
+}
+
+function hasLoopbackRequestHost(req: Request, url: URL): boolean {
+  if (!isLoopbackHostname(url.hostname)) return false;
+  const host = req.headers.get("host");
+  if (!host) return false;
+  try {
+    return isLoopbackHostname(new URL(`http://${host}`).hostname);
+  } catch {
+    return false;
+  }
+}
+
+function anthropicStopReason(finalMsg: Pick<Extract<Message, { role: "assistant" }>, "stopReason" | "content">): "max_tokens" | "tool_use" | "end_turn" {
+  if (finalMsg.stopReason === "length") return "max_tokens";
+  if (finalMsg.content.some((block) => block.type === "toolCall")) return "tool_use";
+  return "end_turn";
 }
 
 /** True for a browser cross-origin request that must be rejected. */
@@ -542,6 +764,21 @@ function anthropicError(
       },
     },
   );
+}
+
+const DASHBOARD_RESPONSE_HEADERS = {
+  "Cache-Control": "no-store",
+  "Referrer-Policy": "no-referrer",
+  "X-Content-Type-Options": "nosniff",
+} as const;
+
+function dashboardError(status: 401 | 403, message: string): Response {
+  const response = anthropicError(status, "authentication_error", message);
+  for (const [name, value] of Object.entries(DASHBOARD_RESPONSE_HEADERS)) {
+    response.headers.set(name, value);
+  }
+  response.headers.set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'");
+  return response;
 }
 
 /**
@@ -704,6 +941,11 @@ export function startGatewayServer(
       // while thinking. Bun's default 10s idle timeout is far too short.
       idleTimeout: 255,
       async fetch(req) {
+        const url = new URL(req.url);
+        if (!hasLoopbackRequestHost(req, url)) {
+          return anthropicError(421, "invalid_request_error", "Local gateway requires a loopback Host");
+        }
+
         // Handle CORS preflight. Reflect the Origin only for localhost so a
         // remote website's preflight fails and the browser never sends the
         // real cross-origin request. Non-browser callers don't preflight.
@@ -735,23 +977,47 @@ export function startGatewayServer(
           return new Response(null, { headers });
         }
 
-        const url = new URL(req.url);
-
         // Dashboard endpoints
         if (url.pathname === "/dashboard") {
-          return new Response(getDashboardHtml(), {
-            headers: { "Content-Type": "text/html" },
+          const nonce = randomBytes(18).toString("base64");
+          return new Response(getDashboardHtml(nonce), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              ...DASHBOARD_RESPONSE_HEADERS,
+              "Content-Security-Policy": `default-src 'none'; connect-src 'self'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`,
+              "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+            },
           });
         }
         if (url.pathname === "/dashboard/api/stats") {
+          if (isDisallowedBrowserRequest(req)) {
+            return dashboardError(403, "Browser origin not allowed");
+          }
+          if (!hasValidGatewayRequestAuth(req, options.gatewayToken)) {
+            return dashboardError(401, "Invalid local gateway token");
+          }
           return new Response(JSON.stringify(stats.getStats()), {
-            headers: { "Content-Type": "application/json" },
+            headers: {
+              "Content-Type": "application/json",
+              ...DASHBOARD_RESPONSE_HEADERS,
+              "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
+            },
           });
         }
         if (url.pathname === "/dashboard/api/usage") {
+          if (isDisallowedBrowserRequest(req)) {
+            return dashboardError(403, "Browser origin not allowed");
+          }
+          if (!hasValidGatewayRequestAuth(req, options.gatewayToken)) {
+            return dashboardError(401, "Invalid local gateway token");
+          }
           const usage = await fetchKiroUsageLimits();
           return new Response(JSON.stringify(usage), {
-            headers: { "Content-Type": "application/json" },
+            headers: {
+              "Content-Type": "application/json",
+              ...DASHBOARD_RESPONSE_HEADERS,
+              "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
+            },
           });
         }
 
@@ -779,23 +1045,33 @@ export function startGatewayServer(
           if (!hasValidGatewayRequestAuth(req, options.gatewayToken)) {
             return anthropicError(401, "authentication_error", "Invalid local gateway token");
           }
+          const requestBearer = bearerToken(req);
+          const bearer = matchesGatewayToken(requestBearer, options.gatewayToken) ? undefined : requestBearer;
+          const explicitRegion = req.headers.get(OPENCODE_REGION_HEADER)?.trim() || undefined;
+          const requestRegion = explicitRegion || BUILDER_ID_REGION;
+          const requestProfileArn = req.headers.get(OPENCODE_PROFILE_ARN_HEADER)?.trim() || undefined;
+          const ownerConflict = ownerCredentialConflict(bearer, explicitRegion, requestProfileArn);
+          if (ownerConflict) {
+            return anthropicError(409, "invalid_request_error", ownerConflict);
+          }
           let dynamicModels: KiroModel[] | null;
           if (url.searchParams.get("refresh") === "1") {
-            const requestBearer = bearerToken(req);
-            const bearer = matchesGatewayToken(requestBearer, options.gatewayToken) ? undefined : requestBearer;
-            const requestRegion = req.headers.get(OPENCODE_REGION_HEADER)?.trim() || BUILDER_ID_REGION;
-            const requestProfileArn = req.headers.get(OPENCODE_PROFILE_ARN_HEADER)?.trim() || undefined;
             if (bearer && !isOwnerRequest(bearer, requestRegion, requestProfileArn)) {
+              const staleCatalog = getAttachingCatalog(bearer, requestRegion, requestProfileArn, true);
               try {
-                const result = await fetchGatewayModelsForCredentials(
+                const result = await fetchAttachingCatalog(
                   bearer,
                   requestRegion,
                   requestProfileArn,
+                  req.signal,
                 );
-                dynamicModels = result?.models ?? null;
+                dynamicModels = result?.models ?? staleCatalog?.models ?? null;
                 if (result) rememberAttachingCatalog(bearer, requestRegion, requestProfileArn, result);
               } catch {
-                return anthropicError(502, "api_error", "Kiro model catalog request failed");
+                if (!staleCatalog) {
+                  return anthropicError(502, "api_error", "Kiro model catalog request failed");
+                }
+                dynamicModels = staleCatalog.models;
               }
             } else {
               dynamicModels = await refreshGatewayModels();
@@ -811,50 +1087,6 @@ export function startGatewayServer(
           }), {
             headers: { "Content-Type": "application/json" },
           });
-        }
-
-        // ── Social sign-in (Builder ID) via PKCE ────────────────────
-        // GET /auth/login → starts the PKCE flow, redirects to app.kiro.dev.
-        // The localhost:49153 callback server handles the OAuth redirect and
-        // exchanges the authorization code for tokens asynchronously.
-        if (url.pathname === "/auth/login" && req.method === "GET") {
-          try {
-            const { signInUrl, waitForCredentials } = await startSocialLogin();
-            log.info("[gateway] Social login initiated, redirecting to Kiro sign-in");
-
-            // Fire-and-forget: wait for the callback to complete in the background
-            // and update the credential store when it does.
-            waitForCredentials()
-              .then(async (creds) => {
-                ownerAccessTokenAliases.clear();
-                _creds = {
-                  accessToken: creds.accessToken,
-                  refreshPacked: creds.refreshPacked,
-                  region: creds.region,
-                  authMethod: creds.authMethod,
-                  profileArn: creds.profileArn,
-                  expiresAt: creds.expiresAt,
-                };
-                if (creds.profileArn) {
-                  seedProfileArn(creds.profileArn);
-                }
-                await refreshGatewayModels();
-                log.info(`[gateway] Login completed (${creds.authMethod}) — credentials updated`);
-              })
-              .catch((err) => {
-                log.error("[gateway] Login failed:", err);
-              });
-
-            // Redirect the browser to the Kiro sign-in portal
-            return new Response(null, {
-              status: 302,
-              headers: { Location: signInUrl },
-            });
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            log.error("[gateway] Failed to start social login:", msg);
-            return anthropicError(500, "api_error", `Failed to start login: ${msg}`);
-          }
         }
 
         // Anthropic Messages endpoint
@@ -874,14 +1106,11 @@ export function startGatewayServer(
           const requestRegion = req.headers.get(OPENCODE_REGION_HEADER)?.trim();
           const requestProfileArn = req.headers.get(OPENCODE_PROFILE_ARN_HEADER)?.trim();
           const requestAuthRegion = requestRegion || _creds?.region || BUILDER_ID_REGION;
-          const ownerRequest = isOwnerRequest(bearer, requestAuthRegion, requestProfileArn);
-          let accessToken: string;
-          try {
-            accessToken = ownerRequest ? await getAccessToken() : bearer!;
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            return anthropicError(401, "authentication_error", `Kiro: ${msg}`);
+          const ownerConflict = ownerCredentialConflict(bearer, requestRegion, requestProfileArn);
+          if (ownerConflict) {
+            return anthropicError(409, "invalid_request_error", ownerConflict);
           }
+          const ownerRequest = isOwnerRequest(bearer, requestAuthRegion, requestProfileArn);
           let body: any;
           try {
             body = await req.json();
@@ -889,7 +1118,28 @@ export function startGatewayServer(
             return anthropicError(400, "invalid_request_error", "Bad Request: Invalid JSON body");
           }
 
-          const anthropicModelId = body.model;
+          if (!body || typeof body !== "object" || Array.isArray(body)) {
+            return anthropicError(400, "invalid_request_error", "Bad Request: JSON body must be an object");
+          }
+          if (typeof body.model !== "string" || body.model.trim().length === 0) {
+            return anthropicError(400, "invalid_request_error", "Bad Request: model must be a non-empty string");
+          }
+          if (
+            body.max_tokens !== undefined
+            && (!Number.isSafeInteger(body.max_tokens) || body.max_tokens <= 0)
+          ) {
+            return anthropicError(400, "invalid_request_error", "Bad Request: max_tokens must be a positive integer");
+          }
+
+          let accessToken: string;
+          try {
+            accessToken = ownerRequest ? await getAccessToken(req.signal) : bearer!;
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            return anthropicError(401, "authentication_error", `Kiro: ${msg}`);
+          }
+
+          const anthropicModelId = body.model.trim();
           const anthropicMessages = body.messages || [];
           const workingDirectory = req.headers.get(OPENCODE_CWD_HEADER)?.trim();
           if (workingDirectory && !isAbsolute(workingDirectory)) {
@@ -910,7 +1160,7 @@ export function startGatewayServer(
           const temperature = body.temperature ?? 0.5;
           // Anthropic requires max_tokens; streamKiro forwards it only when the
           // target catalog explicitly advertises top-level max_tokens.
-          const maxTokens = typeof body.max_tokens === "number" ? body.max_tokens : undefined;
+          const maxTokens = body.max_tokens as number | undefined;
 
           // Bind this request to its own session log file. Derived once and
           // reused for streamKiro below. From here on, every log.*() in this
@@ -942,34 +1192,46 @@ export function startGatewayServer(
             let attachingCatalog = bearer && !ownerRequest
               ? getAttachingCatalog(bearer, requestAuthRegion, requestProfileArn)
               : undefined;
+            const staleAttachingCatalog = bearer && !ownerRequest
+              ? getAttachingCatalog(bearer, requestAuthRegion, requestProfileArn, true)
+              : undefined;
             const requestsNativeEffort = Boolean(
               req.headers.get(OPENCODE_EFFORT_HEADER)
               || body.output_config?.effort
               || body.reasoning_effort,
             );
+            const requestsCatalogMaxTokens = typeof maxTokens === "number" && maxTokens > 0;
             if (
               bearer
               && !ownerRequest
               && !attachingCatalog
-              && (!globalCatalogModel || requestsNativeEffort)
+              && (!globalCatalogModel || requestsNativeEffort || requestsCatalogMaxTokens)
             ) {
               try {
-                const result = await fetchGatewayModelsForCredentials(
+                const result = await fetchAttachingCatalog(
                   bearer,
                   requestAuthRegion,
                   requestProfileArn,
+                  req.signal,
                 );
                 if (!result) {
-                  return anthropicError(502, "api_error", "Kiro profile is unavailable for this account");
+                  if (!staleAttachingCatalog) {
+                    return anthropicError(502, "api_error", "Kiro profile is unavailable for this account");
+                  }
+                  attachingCatalog = staleAttachingCatalog;
+                } else {
+                  rememberAttachingCatalog(bearer, requestAuthRegion, requestProfileArn, result);
+                  attachingCatalog = getAttachingCatalog(bearer, requestAuthRegion, requestProfileArn);
                 }
-                rememberAttachingCatalog(bearer, requestAuthRegion, requestProfileArn, result);
-                attachingCatalog = getAttachingCatalog(bearer, requestAuthRegion, requestProfileArn);
               } catch (error) {
                 log.warn(
                   "[gateway] Attaching account catalog refresh failed",
                   error instanceof Error ? error.message : String(error),
                 );
-                return anthropicError(502, "api_error", "Kiro account catalog refresh failed");
+                if (!staleAttachingCatalog) {
+                  return anthropicError(502, "api_error", "Kiro account catalog refresh failed");
+                }
+                attachingCatalog = staleAttachingCatalog;
               }
             }
             const profileArn = requestProfileArn
@@ -1013,6 +1275,8 @@ export function startGatewayServer(
 
             log.info(`[gateway] → ${kiroEndpoint} model=${anthropicModelId} region=${apiRegion} stream=${streamRequested}`);
 
+            const upstreamController = new AbortController();
+            const upstreamSignal = AbortSignal.any([req.signal, upstreamController.signal]);
             const kiroStream = streamKiro(piModel, context, {
               apiKey: accessToken,
               modelMetadata: catalogModel ?? (bearer ? piModel as KiroModel : undefined),
@@ -1027,6 +1291,7 @@ export function startGatewayServer(
               workingDirectory: workingDirectory || undefined,
               profileArn,
               cacheProfileArn: ownerRequest,
+              signal: upstreamSignal,
             });
 
             if (streamRequested) {
@@ -1037,12 +1302,14 @@ export function startGatewayServer(
               try {
                 firstResult = await iter.next();
               } catch (err) {
+                upstreamController.abort(err);
                 const msg = err instanceof Error ? err.message : String(err);
                 log.error("[gateway] Stream failed before first event:", msg);
                 return anthropicError(502, "api_error", `Kiro: ${msg}`);
               }
 
               if (firstResult.done) {
+                upstreamController.abort(new Error("Kiro stream ended before producing events"));
                 return anthropicError(502, "api_error", "Kiro: stream ended without producing events");
               }
 
@@ -1057,6 +1324,7 @@ export function startGatewayServer(
                   if (next.done) break;
                   bufferedEvents.push(next.value);
                 } catch (err) {
+                  upstreamController.abort(err);
                   const msg = err instanceof Error ? err.message : String(err);
                   log.error("[gateway] Stream failed during buffering:", msg);
                   return anthropicError(502, "api_error", `Kiro: ${msg}`);
@@ -1067,12 +1335,42 @@ export function startGatewayServer(
               const errorEvent = bufferedEvents.find((e) => e.type === "error");
               if (errorEvent) {
                 const errMsg = errorEvent.error?.errorMessage || errorEvent.reason || "Unknown Kiro error";
+                upstreamController.abort(new Error(errMsg));
                 log.error("[gateway] Kiro stream error:", errMsg);
                 return anthropicError(502, "api_error", `Kiro: ${errMsg}`);
               }
 
-              const streamResponse = new ReadableStream({
-                async start(controller) {
+              let sseCancelled = false;
+              let resumeBackpressure: (() => void) | null = null;
+              let stopSseHeartbeat = () => {};
+              const wakeBackpressure = () => {
+                const resume = resumeBackpressure;
+                resumeBackpressure = null;
+                resume?.();
+              };
+
+              const streamResponse = new ReadableStream<string>({
+                start(controller) {
+                  void (async () => {
+                  const waitForCapacity = async () => {
+                    while (!sseCancelled && !upstreamSignal.aborted && (controller.desiredSize ?? 1) <= 0) {
+                      await new Promise<void>((resolve) => {
+                        resumeBackpressure = resolve;
+                        if (sseCancelled || upstreamSignal.aborted || (controller.desiredSize ?? 1) > 0) {
+                          wakeBackpressure();
+                        }
+                      });
+                    }
+                    if (sseCancelled || upstreamSignal.aborted) {
+                      throw upstreamSignal.reason ?? new Error("SSE client disconnected");
+                    }
+                  };
+                  const enqueue = (chunk: string) => {
+                    if (sseCancelled || upstreamSignal.aborted) {
+                      throw upstreamSignal.reason ?? new Error("SSE client disconnected");
+                    }
+                    controller.enqueue(chunk);
+                  };
                   // Heartbeat: streamKiro retries internally on idle / first-token
                   // timeouts (idle 60s + backoff, up to ~4 min) without pushing any
                   // events. With no traffic the SSE connection looks frozen to the
@@ -1089,12 +1387,18 @@ export function startGatewayServer(
                       pingTimer = null;
                     }
                   };
+                  stopSseHeartbeat = stopHeartbeat;
                   const startHeartbeat = () => {
                     pingTimer = setInterval(() => {
                       // Only ping after a real gap — no noise during normal streaming.
-                      if (Date.now() - lastActivity < PING_INTERVAL_MS) return;
+                      if (
+                        sseCancelled
+                        || upstreamSignal.aborted
+                        || (controller.desiredSize ?? 1) <= 0
+                        || Date.now() - lastActivity < PING_INTERVAL_MS
+                      ) return;
                       try {
-                        controller.enqueue("event: ping\ndata: {\"type\":\"ping\"}\n\n");
+                        enqueue("event: ping\ndata: {\"type\":\"ping\"}\n\n");
                       } catch {
                         // Controller already closed — stop pinging.
                         stopHeartbeat();
@@ -1103,7 +1407,7 @@ export function startGatewayServer(
                   };
                   try {
                     const msgId = `msg_${crypto.randomUUID()}`;
-                    controller.enqueue(
+                    enqueue(
                       "event: message_start\ndata: " +
                       JSON.stringify({
                         type: "message_start",
@@ -1132,7 +1436,7 @@ export function startGatewayServer(
 
                     const closeActiveBlock = () => {
                       if (activeBlockType !== null) {
-                        controller.enqueue(
+                        enqueue(
                           "event: content_block_stop\ndata: " +
                           JSON.stringify({
                             type: "content_block_stop",
@@ -1148,7 +1452,7 @@ export function startGatewayServer(
                       closeActiveBlock();
 
                       activeBlockType = type;
-                      controller.enqueue(
+                      enqueue(
                         "event: content_block_start\ndata: " +
                         JSON.stringify({
                           type: "content_block_start",
@@ -1170,7 +1474,7 @@ export function startGatewayServer(
                         if (block?.type === "thinking" && block.redactedContent) {
                           closeActiveBlock();
                           activeBlockType = "redacted_thinking";
-                          controller.enqueue(
+                          enqueue(
                             "event: content_block_start\ndata: " +
                             JSON.stringify({
                               type: "content_block_start",
@@ -1184,7 +1488,7 @@ export function startGatewayServer(
                         }
                       } else if (event.type === "thinking_delta") {
                         ensureBlockStarted("thinking");
-                        controller.enqueue(
+                        enqueue(
                           "event: content_block_delta\ndata: " +
                           JSON.stringify({
                             type: "content_block_delta",
@@ -1197,7 +1501,7 @@ export function startGatewayServer(
                         );
                       } else if (event.type === "thinking_signature") {
                         ensureBlockStarted("thinking");
-                        controller.enqueue(
+                        enqueue(
                           "event: content_block_delta\ndata: " +
                           JSON.stringify({
                             type: "content_block_delta",
@@ -1221,7 +1525,7 @@ export function startGatewayServer(
                           titleTextBuffer += event.delta;
                           return;
                         }
-                        controller.enqueue(
+                        enqueue(
                           "event: content_block_delta\ndata: " +
                           JSON.stringify({
                             type: "content_block_delta",
@@ -1238,7 +1542,7 @@ export function startGatewayServer(
                         const tc = event.partial.content[event.contentIndex];
                         if (tc && tc.type === "toolCall") {
                           activeBlockType = "tool_use";
-                          controller.enqueue(
+                          enqueue(
                             "event: content_block_start\ndata: " +
                             JSON.stringify({
                               type: "content_block_start",
@@ -1253,7 +1557,7 @@ export function startGatewayServer(
                           );
                         }
                       } else if (event.type === "toolcall_delta") {
-                        controller.enqueue(
+                        enqueue(
                           "event: content_block_delta\ndata: " +
                           JSON.stringify({
                             type: "content_block_delta",
@@ -1269,11 +1573,13 @@ export function startGatewayServer(
 
                     // Replay all buffered events
                     for (const ev of bufferedEvents) {
+                      await waitForCapacity();
                       processEvent(ev);
                     }
 
                     // Continue with remaining events
                     for await (const event of { [Symbol.asyncIterator]: () => iter }) {
+                      await waitForCapacity();
                       processEvent(event);
                     }
 
@@ -1282,7 +1588,8 @@ export function startGatewayServer(
                     // turns; normal chat streamed its deltas live above.
                     if (isTitleTurn && titleTextBuffer.length > 0) {
                       const cleanTitle = stripTitleMarkdown(titleTextBuffer);
-                      controller.enqueue(
+                      await waitForCapacity();
+                      enqueue(
                         "event: content_block_delta\ndata: " +
                         JSON.stringify({
                           type: "content_block_delta",
@@ -1300,7 +1607,8 @@ export function startGatewayServer(
                     // partial content was already streamed, so emit an Anthropic
                     // `error` SSE event instead of a silent `end_turn`.
                     if (finalMsg.stopReason === "error" || finalMsg.errorMessage) {
-                      controller.enqueue(
+                      await waitForCapacity();
+                      enqueue(
                         "event: error\ndata: " +
                         JSON.stringify({
                           type: "error",
@@ -1313,10 +1621,7 @@ export function startGatewayServer(
                       controller.close();
                       return;
                     }
-                    let finishReason = "end_turn";
-                    if (finalMsg.content.some((b: any) => b.type === "toolCall")) {
-                      finishReason = "tool_use";
-                    }
+                    const finishReason = anthropicStopReason(finalMsg);
 
                     const inputTokens = finalMsg.usage?.input ?? 0;
                     const outputTokens = finalMsg.usage?.output ?? 0;
@@ -1341,7 +1646,8 @@ export function startGatewayServer(
                     // Do NOT "fix" this by moving it back to message_start — the
                     // count isn't known yet there. Left documented in case a
                     // strict client ever expects input_tokens up front.
-                    controller.enqueue(
+                    await waitForCapacity();
+                    enqueue(
                       "event: message_delta\ndata: " +
                       JSON.stringify({
                         type: "message_delta",
@@ -1356,28 +1662,49 @@ export function startGatewayServer(
                       }) + "\n\n"
                     );
 
-                    controller.enqueue("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+                    enqueue("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
                     controller.close();
                   } catch (err) {
                     log.error("[gateway] Stream error:", err);
-                    controller.enqueue(
-                      "event: error\ndata: " +
-                      JSON.stringify({
-                        type: "error",
-                        error: {
-                          type: "api_error",
-                          message: err instanceof Error ? err.message : String(err)
-                        }
-                      }) + "\n\n"
-                    );
-                    controller.close();
+                    upstreamController.abort(err);
+                    if (!sseCancelled) {
+                      try {
+                        enqueue(
+                          "event: error\ndata: " +
+                          JSON.stringify({
+                            type: "error",
+                            error: {
+                              type: "api_error",
+                              message: err instanceof Error ? err.message : String(err)
+                            }
+                          }) + "\n\n"
+                        );
+                        controller.close();
+                      } catch {
+                        // The client already disconnected; cancellation owns cleanup.
+                      }
+                    }
                   } finally {
                     // Always tear down the heartbeat — on success, error, or
                     // client disconnect — so the interval can't outlive the stream.
                     stopHeartbeat();
                   }
-                }
-              });
+                  })();
+                },
+                pull() {
+                  wakeBackpressure();
+                },
+                async cancel(reason) {
+                  sseCancelled = true;
+                  stopSseHeartbeat();
+                  wakeBackpressure();
+                  const abortError = reason instanceof Error
+                    ? reason
+                    : new Error(reason === undefined ? "SSE client disconnected" : String(reason));
+                  upstreamController.abort(abortError);
+                  await iter.return?.().catch(() => undefined);
+                },
+              }, { highWaterMark: 1 });
 
               return new Response(streamResponse, {
                 headers: {
@@ -1428,10 +1755,7 @@ export function startGatewayServer(
                 }
               }
 
-              let finishReason = "end_turn";
-              if (finalMsg.content.some((b: any) => b.type === "toolCall")) {
-                finishReason = "tool_use";
-              }
+              const finishReason = anthropicStopReason(finalMsg);
 
               const msgId = `msg_${crypto.randomUUID()}`;
               

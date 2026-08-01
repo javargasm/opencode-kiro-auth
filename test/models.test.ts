@@ -151,7 +151,10 @@ describe("Kiro model catalog", () => {
       effortRequestField: "output_config",
       supportsThinkingConfig: true,
       supportsMaxTokens: true,
+      reasoningHidden: true,
     });
+    expect(kiroModels.find((model) => model.id === "claude-opus-4-7")?.reasoningHidden).toBe(true);
+    expect(kiroModels.find((model) => model.id === "claude-opus-5")?.reasoningHidden).toBeUndefined();
   });
 
   it("formatModelName resolves pretty name from kiroModels by id", () => {

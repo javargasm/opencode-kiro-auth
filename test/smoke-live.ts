@@ -45,7 +45,7 @@ console.log(`🔑 Credentials loaded: region=${region} → apiRegion=${apiRegion
 console.log(`🔗 Endpoint: ${baseUrl}`);
 console.log(`🧑 Profile: ${profileArn}`);
 
-seedProfileArn(profileArn);
+seedProfileArn(profileArn, accessToken, apiRegion);
 
 // ---- Helpers ----
 const ts = Date.now();

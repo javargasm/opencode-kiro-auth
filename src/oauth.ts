@@ -8,9 +8,9 @@
 //   3. Desktop — manual refresh token import from Kiro IDE.
 
 import { log } from "./debug";
-import { resolveApiRegion, fetchAvailableModels, buildModelsFromApi, setCachedDynamicModels } from "./models";
+import { resolveApiRegion } from "./models";
 import { createServer, type Server as HttpServer } from "node:http";
-import { randomBytes, createHash } from "node:crypto";
+import { randomBytes, createHash, timingSafeEqual } from "node:crypto";
 
 export const BUILDER_ID_START_URL = "https://view.awsapps.com/start";
 export const BUILDER_ID_REGION = "us-east-1";
@@ -38,6 +38,36 @@ export const IDC_PROBE_REGIONS = [
 
 /** 5-minute safety buffer subtracted from real token expiry. */
 export const EXPIRES_BUFFER_MS = 5 * 60 * 1000;
+
+export function withKiroCredentialScope(
+  refreshPacked: string,
+  region: string,
+  profileArn?: string,
+): string {
+  const parts = refreshPacked.split("|").slice(0, 6);
+  while (parts.length < 6) parts.push("");
+  return [
+    ...parts,
+    encodeURIComponent(region.trim()),
+    encodeURIComponent(profileArn?.trim() ?? ""),
+  ].join("|");
+}
+
+export function getKiroCredentialScope(
+  refreshPacked: string,
+): { region?: string; profileArn?: string } {
+  const parts = refreshPacked.split("|");
+  const decode = (value: string | undefined): string | undefined => {
+    if (!value) return undefined;
+    try {
+      return decodeURIComponent(value).trim() || undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  return { region: decode(parts[6]), profileArn: decode(parts[7]) };
+}
+export const SOCIAL_LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
 
 export interface KiroCredentials {
   refresh: string;
@@ -74,15 +104,17 @@ interface TokenResponse {
 export function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
   if (signal?.aborted) return Promise.reject(signal.reason ?? new Error("Login cancelled"));
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(resolve, ms);
-    signal?.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(timer);
-        reject(signal.reason ?? new Error("Login cancelled"));
-      },
-      { once: true },
-    );
+    const cleanup = () => signal?.removeEventListener("abort", onAbort);
+    const onAbort = () => {
+      clearTimeout(timer);
+      cleanup();
+      reject(signal?.reason ?? new Error("Login cancelled"));
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
 
@@ -201,6 +233,7 @@ export async function refreshKiroToken(
   // parts[3] is the authMethod (matching the third arg)
   const source = parts[4] ?? "";
   const tokenKey = parts[5] ?? "";
+  const scopeSuffix = parts.length > 6 ? `|${parts.slice(6).join("|")}` : "";
 
   if (!refreshToken || !region) {
     throw new Error("Refresh token or region is missing — re-login required");
@@ -225,7 +258,7 @@ export async function refreshKiroToken(
       expiresIn?: number;
     };
 
-    const newPacked = `${data.refreshToken}|||${authMethod}|${source}|${tokenKey}`;
+    const newPacked = `${data.refreshToken}|||${authMethod}|${source}|${tokenKey}${scopeSuffix}`;
 
     if (source === "kiro-cli-db" && tokenKey) {
       const { saveKiroCliCredentials } = await import("./kiro-cli-sync");
@@ -270,7 +303,7 @@ export async function refreshKiroToken(
     expiresIn?: number;
   };
 
-  const newPacked = `${data.refreshToken}|${clientId}|${clientSecret}|${authMethod}|${source}|${tokenKey}`;
+  const newPacked = `${data.refreshToken}|${clientId}|${clientSecret}|${authMethod}|${source}|${tokenKey}${scopeSuffix}`;
 
   if (source === "kiro-cli-db" && tokenKey) {
     const { saveKiroCliCredentials } = await import("./kiro-cli-sync");
@@ -310,6 +343,13 @@ const SOCIAL_REDIRECT_URI = `http://localhost:${SOCIAL_REDIRECT_PORT}`;
 
 function generateRandomState(): string {
   return randomBytes(16).toString("base64url");
+}
+
+function oauthStatesEqual(candidate: string | null, expected: string): boolean {
+  if (candidate === null) return false;
+  const actualBytes = Buffer.from(candidate);
+  const expectedBytes = Buffer.from(expected);
+  return actualBytes.length === expectedBytes.length && timingSafeEqual(actualBytes, expectedBytes);
 }
 
 function generateCodeVerifier(): string {
@@ -471,7 +511,7 @@ interface SocialTokenResponse {
  * Enterprise IdC delegation page: polls /idc-verify until the device
  * verification URL is ready, then does a 3→2→1 countdown and redirects.
  */
-function oauthIdcDelegationPage(): string {
+function oauthIdcDelegationPage(state: string): string {
   const ghostSvg = `<svg width="56" height="56" viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg">
     <path d="M50 5C28.5 5 11 22.5 11 44v36c0 2.8 1.2 5.4 3.2 7.2 2 1.8 4.7 2.6 7.4 2.2l3.4-.5c3.2-.5 6.5.4 9 2.5l2.2 1.8c2.4 2 5.4 3 8.5 3h10.6c3.1 0 6.1-1.1 8.5-3l2.2-1.8c2.5-2.1 5.8-3 9-2.5l3.4.5c2.7.4 5.4-.4 7.4-2.2 2-1.8 3.2-4.4 3.2-7.2V44C89 22.5 71.5 5 50 5z" fill="white"/>
     <circle cx="37" cy="45" r="7" fill="#0a0a0a"/>
@@ -538,7 +578,10 @@ function oauthIdcDelegationPage(): string {
             circ=163.36;
 
         function poll(){
-          fetch('/idc-verify').then(function(r){return r.json()}).then(function(d){
+          fetch('/idc-verify?state='+encodeURIComponent(${JSON.stringify(state)})).then(function(r){
+            if(!r.ok)throw new Error('IdC verification state rejected');
+            return r.json();
+          }).then(function(d){
             if(d.url){
               spinner.style.display='none';
               cd.style.display='block';
@@ -598,11 +641,19 @@ function startCallbackServer(
       try {
         const url = new URL(req.url ?? "", SOCIAL_REDIRECT_URI);
 
-        // /idc-verify endpoint: returns the device verification URL when ready.
+        // /idc-verify is bound to this OAuth flow's cryptographic state. The
+        // browser learns it only after the callback itself validates the state.
         if (url.pathname === "/idc-verify") {
+          if (req.method !== "GET" || !oauthStatesEqual(url.searchParams.get("state"), expectedState)) {
+            res.writeHead(403, {
+              "Content-Type": "application/json",
+              "Cache-Control": "no-store",
+            });
+            res.end(JSON.stringify({ error: "Invalid OAuth state" }));
+            return;
+          }
           res.writeHead(200, {
             "Content-Type": "application/json",
-            "Access-Control-Allow-Origin": "*",
             "Cache-Control": "no-store",
           });
           res.end(JSON.stringify({ url: idcVerifyUrl }));
@@ -624,7 +675,7 @@ function startCallbackServer(
           return;
         }
 
-        if (state !== expectedState) {
+        if (!oauthStatesEqual(state, expectedState)) {
           res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
           res.end(oauthCallbackPage("error", "State mismatch", "The OAuth state parameter did not match. Please try logging in again."));
           return;
@@ -632,7 +683,7 @@ function startCallbackServer(
 
         res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
         if (isIdcDelegation) {
-          res.end(oauthIdcDelegationPage());
+          res.end(oauthIdcDelegationPage(expectedState));
         } else {
           res.end(oauthCallbackPage("success", "Request approved", "OPENCODE-KIRO has been given requested permissions."));
         }
@@ -684,7 +735,9 @@ function startCallbackServer(
  * Returns the sign-in URL immediately and a promise that resolves with the
  * credentials once the flow completes (regardless of social or IdC path).
  */
-export async function startSocialLogin(): Promise<{
+export async function startSocialLogin(
+  options: { timeoutMs?: number } = {},
+): Promise<{
   signInUrl: string;
   waitForCredentials: () => Promise<{
     accessToken: string;
@@ -702,10 +755,20 @@ export async function startSocialLogin(): Promise<{
 
   const callbackServer = await startCallbackServer(state);
   const signInUrl = buildSocialSignInURL(callbackServer.redirectUri, challenge, state);
+  const timeoutMs = Math.max(1, options.timeoutMs ?? SOCIAL_LOGIN_TIMEOUT_MS);
+  let timedOut = false;
+  const loginTimer = setTimeout(() => {
+    timedOut = true;
+    callbackServer.cancelWait();
+    if (callbackServer.server.listening) callbackServer.server.close();
+  }, timeoutMs);
+  loginTimer.unref?.();
 
   const waitForCredentials = async () => {
     try {
       const result = await callbackServer.waitForCode();
+      clearTimeout(loginTimer);
+      if (timedOut) throw new Error(`Social sign-in timed out after ${timeoutMs}ms`);
 
       // ── IdC delegation ──────────────────────────────────────────
       // Kiro portal redirected with issuer_url + idc_region instead
@@ -757,13 +820,6 @@ export async function startSocialLogin(): Promise<{
           const resolved = await resolveProfileArn(tok.accessToken, apiRegion);
           if (resolved) {
             profileArn = resolved;
-            try {
-              const apiModels = await fetchAvailableModels(tok.accessToken, apiRegion, profileArn);
-              setCachedDynamicModels(buildModelsFromApi(apiModels));
-              log.info(`[social-login] IdC: fetched and cached ${apiModels.length} models`);
-            } catch (err) {
-              log.warn(`[social-login] IdC: failed to fetch models: ${err}`);
-            }
           }
         } catch (err) {
           log.warn(`[social-login] IdC: failed to resolve profileArn: ${err}`);
@@ -772,7 +828,11 @@ export async function startSocialLogin(): Promise<{
         return {
           accessToken: tok.accessToken,
           refreshToken: tok.refreshToken,
-          refreshPacked: `${tok.refreshToken}|${regResult.clientId}|${regResult.clientSecret}|idc`,
+          refreshPacked: withKiroCredentialScope(
+            `${tok.refreshToken}|${regResult.clientId}|${regResult.clientSecret}|idc`,
+            detectedRegion,
+            profileArn,
+          ),
           profileArn,
           region: detectedRegion,
           authMethod: "idc" as const,
@@ -811,29 +871,22 @@ export async function startSocialLogin(): Promise<{
         throw new Error("Token exchange returned no tokens");
       }
 
-      // Social flow returns profileArn — fetch and cache models immediately.
-      if (data.profileArn) {
-        try {
-          const apiRegion = resolveApiRegion(BUILDER_ID_REGION);
-          const apiModels = await fetchAvailableModels(data.accessToken, apiRegion, data.profileArn);
-          setCachedDynamicModels(buildModelsFromApi(apiModels));
-          log.info(`[social-login] Fetched and cached ${apiModels.length} models`);
-        } catch (err) {
-          log.warn(`[social-login] Failed to fetch models: ${err}`);
-        }
-      }
-
       return {
         accessToken: data.accessToken,
         refreshToken: data.refreshToken,
-        refreshPacked: `${data.refreshToken}|||social`,
+        refreshPacked: withKiroCredentialScope(
+          `${data.refreshToken}|||social`,
+          BUILDER_ID_REGION,
+          data.profileArn,
+        ),
         profileArn: data.profileArn,
         region: BUILDER_ID_REGION,
         authMethod: "social" as const,
         expiresAt: Date.now() + (data.expiresIn ?? 3600) * 1000 - EXPIRES_BUFFER_MS,
       };
     } finally {
-      callbackServer.server.close();
+      clearTimeout(loginTimer);
+      if (callbackServer.server.listening) callbackServer.server.close();
     }
   };
 

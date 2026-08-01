@@ -191,7 +191,7 @@ async function main() {
   const apiRegion = resolveApiRegion(imported.region);
   const runtimeUrl = `https://runtime.${apiRegion}.kiro.dev/`;
   if (imported.profileArn) {
-    seedProfileArn(imported.profileArn);
+    seedProfileArn(imported.profileArn, fresh.access, apiRegion);
     console.log("✓ ProfileArn seeded:", imported.profileArn.substring(0, 50) + "…");
   }
 

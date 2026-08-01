@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { normalizeImageFormat, convertImagesToKiro } from "../src/transform";
+import {
+  collapseAgenticLoops,
+  convertImagesToKiro,
+  normalizeImageFormat,
+  type KiroHistoryEntry,
+} from "../src/transform";
 
 describe("normalizeImageFormat (#15)", () => {
   it("maps common raster types", () => {
@@ -37,5 +42,60 @@ describe("convertImagesToKiro (#15 — omit unsupported formats)", () => {
   it("normalizes jpg → jpeg on the wire format", () => {
     const { images } = convertImagesToKiro([{ mimeType: "image/jpg", data: "abcd" }]);
     expect(images[0]!.format).toBe("jpeg");
+  });
+});
+
+describe("collapseAgenticLoops", () => {
+  it("clears repeated assistant prose without injecting model-visible marker text", () => {
+    const history: KiroHistoryEntry[] = [
+      {
+        assistantResponseMessage: {
+          content: "I will inspect the first file.",
+          toolUses: [{ name: "read", toolUseId: "call-1", input: { path: "a.ts" } }],
+        },
+      },
+      {
+        userInputMessage: {
+          content: "Tool results provided.",
+          origin: "KIRO_CLI",
+          userInputMessageContext: {
+            toolResults: [{
+              content: [{ text: "first" }],
+              status: "success",
+              toolUseId: "call-1",
+            }],
+          },
+        },
+      },
+      {
+        assistantResponseMessage: {
+          content: "I will inspect the second file.",
+          toolUses: [{ name: "read", toolUseId: "call-2", input: { path: "b.ts" } }],
+        },
+      },
+      {
+        userInputMessage: {
+          content: "Tool results provided.",
+          origin: "KIRO_CLI",
+          userInputMessageContext: {
+            toolResults: [{
+              content: [{ text: "second" }],
+              status: "success",
+              toolUseId: "call-2",
+            }],
+          },
+        },
+      },
+    ];
+
+    const collapsed = collapseAgenticLoops(history);
+
+    expect(collapsed[0]?.assistantResponseMessage?.content)
+      .toBe("I will inspect the first file.");
+    expect(collapsed[2]?.assistantResponseMessage).toMatchObject({
+      content: "",
+      toolUses: [{ name: "read", toolUseId: "call-2", input: { path: "b.ts" } }],
+    });
+    expect(JSON.stringify(collapsed)).not.toContain("[tool calling continues]");
   });
 });

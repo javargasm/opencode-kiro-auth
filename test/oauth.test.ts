@@ -22,10 +22,14 @@ import {
   tryRegisterAndAuthorize,
   pollForToken,
   refreshKiroToken,
+  startSocialLogin,
   EXPIRES_BUFFER_MS,
+  getKiroCredentialScope,
+  withKiroCredentialScope,
   type DeviceAuthResponse,
 } from "../src/oauth";
 import { saveKiroCliCredentials } from "../src/kiro-cli-sync";
+import { fetchAvailableModels, setCachedDynamicModels } from "../src/models";
 
 // ── Test helpers ────────────────────────────────────────────────────
 
@@ -362,6 +366,26 @@ describe("refreshKiroToken", () => {
       expect(saveKiroCliCredentials).not.toHaveBeenCalled();
     });
 
+    it("preserves account region and profile scope across token rotation", async () => {
+      spyFetch().mockResolvedValue(
+        mockResp({ json: { accessToken: "newAT", refreshToken: "newRT", expiresIn: 3600 } }),
+      );
+      const profileArn = "arn:aws:codewhisperer:eu-west-1:123:profile/test";
+      const packed = withKiroCredentialScope(
+        "rt|cid|csec|idc|src|key",
+        "eu-west-1",
+        profileArn,
+      );
+
+      const result = await refreshKiroToken(packed, "eu-west-1", "idc");
+
+      expect(getKiroCredentialScope(result.refresh)).toEqual({
+        region: "eu-west-1",
+        profileArn,
+      });
+      expect(result.refresh.startsWith("newRT|cid|csec|idc|src|key|")).toBe(true);
+    });
+
     it("writes back to the kiro-cli DB when the credential came from it", async () => {
       spyFetch().mockResolvedValue(
         mockResp({ json: { accessToken: "newAT", refreshToken: "newRT", expiresIn: 3600 } }),
@@ -388,5 +412,62 @@ describe("refreshKiroToken", () => {
         "Token refresh failed: 401 bad",
       );
     });
+  });
+});
+
+describe("startSocialLogin", () => {
+  it("returns social credentials without replacing the process catalog", async () => {
+    const nativeFetch = globalThis.fetch.bind(globalThis);
+    vi.mocked(fetchAvailableModels).mockClear();
+    vi.mocked(setCachedDynamicModels).mockClear();
+    const login = await startSocialLogin({ timeoutMs: 1_000 });
+    const state = new URL(login.signInUrl).searchParams.get("state");
+    spyFetch().mockResolvedValueOnce(mockResp({
+      json: {
+        accessToken: "social-access-token",
+        refreshToken: "social-refresh-token",
+        profileArn: "arn:aws:codewhisperer:us-east-1:123:profile/social",
+        expiresIn: 3600,
+      },
+    }));
+
+    const callback = await nativeFetch(
+      `http://localhost:49153/oauth/callback?code=approved-code&state=${encodeURIComponent(state!)}`,
+    );
+    expect(callback.status).toBe(200);
+    await expect(login.waitForCredentials()).resolves.toMatchObject({
+      accessToken: "social-access-token",
+      profileArn: "arn:aws:codewhisperer:us-east-1:123:profile/social",
+    });
+    expect(fetchAvailableModels).not.toHaveBeenCalled();
+    expect(setCachedDynamicModels).not.toHaveBeenCalled();
+  });
+
+  it("binds /idc-verify to OAuth state without wildcard CORS", async () => {
+    const login = await startSocialLogin({ timeoutMs: 100 });
+    const state = new URL(login.signInUrl).searchParams.get("state");
+    expect(state).toBeTruthy();
+
+    const missing = await fetch("http://localhost:49153/idc-verify");
+    expect(missing.status).toBe(403);
+    expect(missing.headers.get("access-control-allow-origin")).toBeNull();
+
+    const wrong = await fetch("http://localhost:49153/idc-verify?state=wrong");
+    expect(wrong.status).toBe(403);
+
+    const accepted = await fetch(`http://localhost:49153/idc-verify?state=${encodeURIComponent(state!)}`);
+    expect(accepted.status).toBe(200);
+    expect(accepted.headers.get("access-control-allow-origin")).toBeNull();
+    expect(await accepted.json()).toEqual({ url: null });
+
+    await expect(login.waitForCredentials()).rejects.toThrow("timed out");
+  });
+
+  it("times out an abandoned callback and releases the callback port", async () => {
+    const first = await startSocialLogin({ timeoutMs: 10 });
+    await expect(first.waitForCredentials()).rejects.toThrow("timed out");
+
+    const second = await startSocialLogin({ timeoutMs: 10 });
+    await expect(second.waitForCredentials()).rejects.toThrow("timed out");
   });
 });

@@ -1,6 +1,6 @@
 {
   "name": "@javargasm/opencode-kiro-auth",
-  "version": "8.1.1",
+  "version": "8.2.0",
   "description": "Kiro provider plugin for OpenCode: AWS Builder ID / Identity Center login and Anthropic-compatible local gateway for CodeWhisperer streaming.",
   "type": "module",
   "license": "MIT",
@@ -36,7 +36,7 @@
     },
     "./tui": {
       "types": "./dist/tui.d.ts",
-      "default": "./dist/tui.tsx"
+      "default": "./dist/tui.js"
     }
   },
   "oc-plugin": [
@@ -50,13 +50,15 @@
   "scripts": {
     "clean": "rm -rf dist",
     "build:js": "bun build src/index.ts --outdir dist --target node --format esm --external '@opencode-ai/*'",
+    "build:tui": "bun ./build-tui.ts",
     "build:types": "tsc -p tsconfig.build.json",
-    "build": "bun run clean && bun run build:js && bun run build:types && cp src/tui.tsx dist/tui.tsx",
+    "build": "bun run clean && bun run build:js && bun run build:tui && bun run build:types",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:bun": "bun test test/gateway.test.ts",
+    "test:artifact": "bun run build && bun test ./test/tui-artifact.bun.ts",
     "test:watch": "vitest",
-    "check": "bun run typecheck && bun run test && bun run test:bun",
+    "check": "bun run typecheck && bun run test && bun run test:bun && bun run test:artifact",
     "changeset": "changeset",
     "version": "changeset version",
     "prepack": "bun run build",
@@ -84,6 +86,6 @@
     "provenance": true
   },
   "engines": {
-    "node": ">=20"
+    "bun": ">=1.1.0"
   }
 }

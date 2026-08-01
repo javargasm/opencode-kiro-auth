@@ -58,7 +58,16 @@ import {
 
 const FIRST_TOKEN_TIMEOUT_DEFAULT_MS = 90_000;
 const IDLE_TIMEOUT_MS = 60_000;
+export const REQUEST_TIMEOUT_DEFAULT_MS = 10 * 60_000;
+export const ERROR_BODY_TIMEOUT_MS = 10_000;
+export const MAX_ERROR_BODY_BYTES = 256 * 1024;
+export const MAX_INCOMPLETE_FRAME_CHARS = 8 * 1024 * 1024;
+export const MAX_STREAM_RESPONSE_BYTES = 64 * 1024 * 1024;
 const STREAM_EVENT_YIELD_INTERVAL = 128;
+const STREAM_EVENT_QUEUE_SIZE = 256;
+// One content frame can synchronously emit seven parser events. Reserve room
+// for that burst plus tool/parser finalization and the terminal events.
+const STREAM_EVENT_PUSH_RESERVE = 16;
 const MAX_RETRIES = 3;
 const MAX_RETRY_DELAY_MS = 10_000;
 
@@ -72,12 +81,23 @@ const TRANSIENT_MAX_DELAY_MS = 15_000;
 
 const CONTEXT_TRUNCATION_MAX_RETRIES = 3;
 const CONTEXT_TRUNCATION_DROP_RATIO = 0.3;
+const CONTEXT_TRUNCATION_SEED_ENTRIES = 2;
+const CONTEXT_TRUNCATION_RECENT_ENTRIES = 2;
+const TOOL_RESULT_RETRY_SHRINK_RATIO = 0.5;
+const TOOL_RESULT_RETRY_MIN_CHARS = 512;
 
 const TOO_BIG_PATTERNS = ["CONTENT_LENGTH_EXCEEDS_THRESHOLD", "Input is too long"];
 const NON_RETRYABLE_BODY_PATTERNS = ["MONTHLY_REQUEST_COUNT", "Improperly formed"];
 const CAPACITY_PATTERN = "INSUFFICIENT_MODEL_CAPACITY";
 const RECOVERABLE_POST_OUTPUT_SERVICE_EXCEPTION =
   "ServiceException: Encountered an unexpected error when processing the request, please try again.";
+const RECOVERABLE_POST_OUTPUT_STREAM_ERROR_TYPES = new Set([
+  "ServiceException",
+  "ThrottlingException",
+  "InternalServerException",
+  "RequestTimeoutException",
+  "ModelStreamErrorException",
+]);
 
 function exponentialBackoff(attempt: number, baseMs: number, maxMs: number): number {
   return Math.min(baseMs * 2 ** attempt, maxMs);
@@ -103,8 +123,159 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function abortReason(signal: AbortSignal): unknown {
+  return signal.reason ?? new DOMException("The operation was aborted", "AbortError");
+}
+
+async function readWithSignal<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) throw abortReason(signal);
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(abortReason(signal));
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([promise, aborted]);
+  } finally {
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  }
+}
+
+export async function readResponseTextLimited(
+  response: Response,
+  options: { signal?: AbortSignal; timeoutMs?: number; maxBytes?: number } = {},
+): Promise<string> {
+  const timeoutSignal = AbortSignal.timeout(Math.max(1, options.timeoutMs ?? ERROR_BODY_TIMEOUT_MS));
+  const signal = options.signal
+    ? AbortSignal.any([options.signal, timeoutSignal])
+    : timeoutSignal;
+  const maxBytes = Math.max(1, options.maxBytes ?? MAX_ERROR_BODY_BYTES);
+  const reader = response.body?.getReader();
+
+  // Test doubles and synthetic responses may expose text() without a body.
+  if (!reader) {
+    const text = await readWithSignal(response.text(), signal);
+    if (new TextEncoder().encode(text).byteLength > maxBytes) {
+      throw new Error(`Kiro API error body exceeded ${maxBytes} bytes`);
+    }
+    return text;
+  }
+
+  const decoder = new TextDecoder();
+  let totalBytes = 0;
+  let text = "";
+  try {
+    while (true) {
+      const { done, value } = await readWithSignal(reader.read(), signal);
+      if (done) return text + decoder.decode();
+      totalBytes += value.byteLength;
+      if (totalBytes > maxBytes) {
+        throw new Error(`Kiro API error body exceeded ${maxBytes} bytes`);
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+  } catch (error) {
+    await reader.cancel(error).catch(() => undefined);
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 function isRecoverablePostOutputServiceException(error: string | null): boolean {
   return error === RECOVERABLE_POST_OUTPUT_SERVICE_EXCEPTION;
+}
+
+function isRecoverablePostOutputStreamError(error: string | null): boolean {
+  if (!error) return false;
+  const separator = error.indexOf(":");
+  const type = separator >= 0 ? error.slice(0, separator) : error;
+  return RECOVERABLE_POST_OUTPUT_STREAM_ERROR_TYPES.has(type.trim());
+}
+
+/**
+ * Drop complete old user/assistant turns without removing Kiro's mandatory
+ * synthetic seed pair or the most recent turn. The recent assistant entry can
+ * own tool uses whose results live in currentMessage, so dropping it would turn
+ * an otherwise oversized request into REQUEST_BODY_INVALID.
+ */
+function dropOldestHistoryTurnsForRetry(history: KiroHistoryEntry[]): number {
+  const removable = history.length
+    - CONTEXT_TRUNCATION_SEED_ENTRIES
+    - CONTEXT_TRUNCATION_RECENT_ENTRIES;
+  const maxEvenRemovable = removable - (removable % 2);
+  if (maxEvenRemovable < 2) return 0;
+
+  const desired = Math.max(2, Math.floor(removable * CONTEXT_TRUNCATION_DROP_RATIO));
+  const completeTurnCount = Math.ceil(desired / 2) * 2;
+  const dropCount = Math.min(maxEvenRemovable, completeTurnCount);
+  history.splice(CONTEXT_TRUNCATION_SEED_ENTRIES, dropCount);
+
+  // The first retained user entry can contain toolResults for the assistant
+  // entry immediately before the removed range. That assistant no longer
+  // exists, so retaining those results makes the retry malformed. Keep the
+  // user/assistant alternation but turn this boundary entry into a continuity
+  // marker with no orphan result ids.
+  const boundaryUser = history[CONTEXT_TRUNCATION_SEED_ENTRIES]?.userInputMessage;
+  const boundaryContext = boundaryUser?.userInputMessageContext;
+  if (boundaryContext?.toolResults?.length) {
+    delete boundaryContext.toolResults;
+    if (Object.keys(boundaryContext).length === 0) {
+      delete boundaryUser!.userInputMessageContext;
+    }
+    if (boundaryUser!.content.trim() === "Tool results provided.") {
+      boundaryUser!.content = "Earlier tool interaction omitted during context truncation.";
+    }
+  }
+  return dropCount;
+}
+
+function toolResultContentText(result: KiroToolResult): string {
+  return result.content
+    .map((block) => "text" in block ? block.text : JSON.stringify(block.json))
+    .join("\n");
+}
+
+function truncateToolResultForRetry(text: string, limit: number): string {
+  if (text.length <= limit) return text;
+  const marker = "\n... [TRUNCATED FOR CONTEXT RETRY] ...\n";
+  if (limit <= marker.length) return text.slice(0, limit);
+  const retained = limit - marker.length;
+  const start = Math.ceil(retained / 2);
+  const end = Math.floor(retained / 2);
+  return `${text.slice(0, start)}${marker}${text.slice(text.length - end)}`;
+}
+
+/** Preserve every tool-result id while progressively reducing bulky payloads. */
+function compactCurrentToolResultsForRetry(
+  toolResults: KiroToolResult[],
+): { beforeChars: number; afterChars: number } {
+  const texts = toolResults.map(toolResultContentText);
+  const beforeChars = texts.reduce((sum, text) => sum + text.length, 0);
+  if (beforeChars === 0 || toolResults.length === 0) {
+    return { beforeChars, afterChars: beforeChars };
+  }
+
+  const targetTotal = Math.max(
+    toolResults.length * TOOL_RESULT_RETRY_MIN_CHARS,
+    Math.floor(beforeChars * TOOL_RESULT_RETRY_SHRINK_RATIO),
+  );
+  const perResultLimit = Math.max(
+    TOOL_RESULT_RETRY_MIN_CHARS,
+    Math.floor(targetTotal / toolResults.length),
+  );
+
+  for (let i = 0; i < toolResults.length; i++) {
+    const text = texts[i]!;
+    if (text.length <= perResultLimit) continue;
+    toolResults[i]!.content = [{ text: truncateToolResultForRetry(text, perResultLimit) }];
+  }
+
+  const afterChars = toolResults.reduce(
+    (sum, result) => sum + toolResultContentText(result).length,
+    0,
+  );
+  return { beforeChars, afterChars };
 }
 
 function yieldToEventLoop(): Promise<void> {
@@ -115,12 +286,14 @@ function findModel(modelId: string): KiroModel | undefined {
   return findKiroModel(modelId);
 }
 
-export function firstTokenTimeoutForModel(modelId: string): number {
-  return findModel(modelId)?.firstTokenTimeout ?? FIRST_TOKEN_TIMEOUT_DEFAULT_MS;
+export function firstTokenTimeoutForModel(modelId: string, scopedModel?: KiroModel): number {
+  return scopedModel?.firstTokenTimeout
+    ?? findModel(modelId)?.firstTokenTimeout
+    ?? FIRST_TOKEN_TIMEOUT_DEFAULT_MS;
 }
 
-export function idleTimeoutForModel(modelId: string): number {
-  return findModel(modelId)?.idleTimeout ?? IDLE_TIMEOUT_MS;
+export function idleTimeoutForModel(modelId: string, scopedModel?: KiroModel): number {
+  return scopedModel?.idleTimeout ?? findModel(modelId)?.idleTimeout ?? IDLE_TIMEOUT_MS;
 }
 
 /**
@@ -191,7 +364,7 @@ export const HIDDEN_REASONING_COUNTDOWN_MS = 2000;
 function emitHiddenReasoningLate(
 	output: AssistantMessage,
 	stream: AssistantMessageEventStream,
-): void {
+): ThinkingContent {
 	const contentIndex = output.content.length;
 	const block: ThinkingContent = {
 		type: "thinking",
@@ -212,6 +385,7 @@ function emitHiddenReasoningLate(
 		content: "",
 		partial: output,
 	});
+	return block;
 }
 
 // ---- profileArn cache moved to models.ts -------------------------------
@@ -242,11 +416,7 @@ interface KiroToolCallState {
   input: string;
 }
 
-function emitToolCall(
-  state: KiroToolCallState,
-  output: AssistantMessage,
-  stream: AssistantMessageEventStream,
-): boolean {
+function parseToolCall(state: KiroToolCallState): ToolCall | null {
   if (!state.input.trim()) state.input = "{}";
 
   let args: Record<string, unknown>;
@@ -259,16 +429,153 @@ function emitToolCall(
     log.info(
       `failed to parse tool input for "${state.name}" (${state.toolUseId}): ${e instanceof Error ? e.message : String(e)}`,
     );
+    return null;
+  }
+
+  return { type: "toolCall", id: state.toolUseId, name: state.name, arguments: args };
+}
+
+function emitToolCall(
+  toolCall: ToolCall,
+  output: AssistantMessage,
+  stream: AssistantMessageEventStream,
+): void {
+  const contentIndex = output.content.length;
+  output.content.push(toolCall);
+  stream.push({ type: "toolcall_start", contentIndex, partial: output });
+  stream.push({ type: "toolcall_delta", contentIndex, delta: JSON.stringify(toolCall.arguments), partial: output });
+  stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });
+}
+
+type ReplaySegmentType =
+  | "content"
+  | "reasoning"
+  | "reasoningSignature"
+  | "redactedReasoning"
+  | "toolCall";
+
+interface ReplaySegment {
+  type: ReplaySegmentType;
+  data: string;
+}
+
+function appendReplayText(
+  transcript: ReplaySegment[],
+  type: "content" | "reasoning",
+  data: string,
+): void {
+  if (!data) return;
+  const last = transcript[transcript.length - 1];
+  if (last?.type === type) {
+    last.data += data;
+  } else {
+    transcript.push({ type, data });
+  }
+}
+
+function appendReplayAtomic(
+  transcript: ReplaySegment[],
+  type: Exclude<ReplaySegmentType, "content" | "reasoning">,
+  data: string,
+): void {
+  // Tool calls are semantic and must match exactly (after canonicalization).
+  // Signatures and redacted blobs are opaque, generation-specific values: only
+  // their position/type participates in replay matching. Keeping them out of
+  // the transcript also avoids retaining an unnecessary second copy.
+  transcript.push({ type, data: type === "toolCall" ? data : "" });
+}
+
+function canonicalReplayValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalReplayValue);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([key, entry]) => [key, canonicalReplayValue(entry)]),
+    );
+  }
+  return value;
+}
+
+function toolCallReplayKey(toolCall: ToolCall): string {
+  return JSON.stringify(canonicalReplayValue({
+    name: toolCall.name,
+    arguments: toolCall.arguments,
+  }));
+}
+
+/**
+ * Verifies that a retried response first replays the semantic prefix already
+ * delivered to the consumer. Matching prefix data is suppressed; only a
+ * suffix beyond that prefix may be emitted. This is deliberately stricter
+ * than blind string deduplication: a divergent retry fails instead of
+ * corrupting the response with duplicated or reordered blocks.
+ */
+class SemanticReplayGate {
+  private segmentIndex = 0;
+  private charOffset = 0;
+
+  constructor(private readonly expected: ReplaySegment[]) {}
+
+  isComplete(): boolean {
+    return this.segmentIndex >= this.expected.length;
+  }
+
+  pendingDescription(): string {
+    const segment = this.expected[this.segmentIndex];
+    return segment
+      ? `${segment.type} segment ${this.segmentIndex + 1}/${this.expected.length}`
+      : "none";
+  }
+
+  consumeText(type: "content" | "reasoning", data: string): string {
+    let remaining = data;
+    while (remaining.length > 0 && !this.isComplete()) {
+      const segment = this.expected[this.segmentIndex]!;
+      if (segment.type !== type) this.throwDivergence(type, segment);
+
+      const expectedRemainder = segment.data.slice(this.charOffset);
+      const compareLength = Math.min(remaining.length, expectedRemainder.length);
+      if (remaining.slice(0, compareLength) !== expectedRemainder.slice(0, compareLength)) {
+        this.throwDivergence(type, segment);
+      }
+
+      remaining = remaining.slice(compareLength);
+      this.charOffset += compareLength;
+      if (this.charOffset === segment.data.length) {
+        this.segmentIndex++;
+        this.charOffset = 0;
+      }
+
+      // A single semantic event cannot validly cross a different event type in
+      // the recorded transcript. Treat that as divergence rather than emit a
+      // potentially duplicated/reordered suffix.
+      if (remaining.length > 0 && !this.isComplete()) {
+        const next = this.expected[this.segmentIndex]!;
+        if (next.type !== type) this.throwDivergence(type, next);
+      }
+    }
+    return remaining;
+  }
+
+  /** Returns true when this is new suffix data that should be emitted. */
+  consumeAtomic(type: Exclude<ReplaySegmentType, "content" | "reasoning">, data: string): boolean {
+    if (this.isComplete()) return true;
+    const segment = this.expected[this.segmentIndex]!;
+    const semanticValueMismatch = type === "toolCall" && segment.data !== data;
+    if (this.charOffset !== 0 || segment.type !== type || semanticValueMismatch) {
+      this.throwDivergence(type, segment);
+    }
+    this.segmentIndex++;
     return false;
   }
 
-  const contentIndex = output.content.length;
-  const toolCall: ToolCall = { type: "toolCall", id: state.toolUseId, name: state.name, arguments: args };
-  output.content.push(toolCall);
-  stream.push({ type: "toolcall_start", contentIndex, partial: output });
-  stream.push({ type: "toolcall_delta", contentIndex, delta: JSON.stringify(args), partial: output });
-  stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });
-  return true;
+  private throwDivergence(type: ReplaySegmentType, expected: ReplaySegment): never {
+    throw new Error(
+      `Kiro retry response diverged while replaying partial output: expected ${expected.type}, received ${type}` +
+      ` (segment ${this.segmentIndex + 1}/${this.expected.length}, offset ${this.charOffset})`,
+    );
+  }
 }
 
 // ---- conversationId stability -----------------------------------------
@@ -316,7 +623,13 @@ export function streamKiro(
   context: Context,
   options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
-  const stream = new AssistantMessageEventStream();
+  const stream = new AssistantMessageEventStream(STREAM_EVENT_QUEUE_SIZE);
+  const deadlineSignal = AbortSignal.timeout(
+    Math.max(1, options?.requestTimeoutMs ?? REQUEST_TIMEOUT_DEFAULT_MS),
+  );
+  const signal = options?.signal
+    ? AbortSignal.any([options.signal, deadlineSignal])
+    : deadlineSignal;
   // One log file per session — groups every turn (request/response/error)
   // regardless of which client (OpenCode, Claude Code, …) drove it.
   const fileLog = createSessionLogger(options?.logSessionId ?? options?.sessionId);
@@ -347,6 +660,8 @@ export function streamKiro(
     // error path can cancel it, preventing a stray late shim from
     // firing after the stream ended.
     let hiddenShimTimer: ReturnType<typeof setTimeout> | null = null;
+    let hiddenShimBlock: ThinkingContent | null = null;
+    let startEmitted = false;
 
     try {
       const accessToken = options?.apiKey;
@@ -359,6 +674,7 @@ export function streamKiro(
         accessToken,
         regionFromEndpoint(endpoint),
         options?.cacheProfileArn !== false,
+        signal,
       );
       const kiroModelId = resolveKiroModel(model.id);
       const nativeEffort = options?.nativeEffort;
@@ -419,10 +735,23 @@ export function streamKiro(
       // available. Computed ONCE here so retries of this turn — and every
       // later turn of the same conversation — reuse the same id.
       const conversationId = resolveConversationId(options?.sessionId);
+      // A retry must send the same model-visible prompt. In particular, do not
+      // regenerate the context timestamp after a long partial-output timeout:
+      // semantic replay depends on asking Kiro the exact same question.
+      const requestTimestamp = new Date();
       let retryCount = 0;
+      const replayTranscript: ReplaySegment[] = [];
+      let replayGate: SemanticReplayGate | null = null;
+      let retainedCompactedHistory: KiroHistoryEntry[] | undefined;
+      let retainedCompactedToolResults: KiroToolResult[] | undefined;
+      let retainedContextTruncationAttempt = 0;
+      let thinkingParser = thinkingEnabled
+        ? new ThinkingTagParser(output, stream)
+        : null;
+      let textBlockIndex: number | null = null;
 
       while (retryCount <= MAX_RETRIES) {
-        if (options?.signal?.aborted) throw options.signal.reason;
+        if (signal.aborted) throw abortReason(signal);
 
         const normalized = normalizeMessages(context.messages);
         // NOTE: systemPrompt is NOT passed to buildHistory. It contains the
@@ -431,24 +760,28 @@ export function streamKiro(
         // the following assistant response — triggering THINKING_SIGNATURE_INVALID.
         // The thinking directive only belongs in the current message (or seed).
         const {
-          history,
+          history: rebuiltHistory,
           systemPrepended: _systemPrepended,
           currentMsgStartIdx,
         } = buildHistory(normalized, kiroModelId);
+        const history: KiroHistoryEntry[] = retainedCompactedHistory ?? rebuiltHistory;
 
         // Inject the synthetic system seed pair at the start of history.
         // The real Kiro CLI always sends this as the first history entries.
-        const seedInstruction = SYSTEM_SEED_INSTRUCTION.replace("{{modelId}}", kiroModelId);
-        const seedPair: KiroHistoryEntry[] = [
-          { userInputMessage: { content: seedInstruction, origin: "KIRO_CLI" } },
-          { assistantResponseMessage: { content: SYSTEM_SEED_ACK } },
-        ];
-        history.unshift(...seedPair);
+        if (!retainedCompactedHistory) {
+          const seedInstruction = SYSTEM_SEED_INSTRUCTION.replace("{{modelId}}", kiroModelId);
+          const seedPair: KiroHistoryEntry[] = [
+            { userInputMessage: { content: seedInstruction, origin: "KIRO_CLI" } },
+            { assistantResponseMessage: { content: SYSTEM_SEED_ACK } },
+          ];
+          history.unshift(...seedPair);
+        }
 
         const currentMessages = normalized.slice(currentMsgStartIdx);
         const firstMsg = currentMessages[0];
         let currentContent = "";
-        const currentToolResults: KiroToolResult[] = [];
+        const currentToolResults: KiroToolResult[] = retainedCompactedToolResults ?? [];
+        const rebuildCurrentToolResults = retainedCompactedToolResults === undefined;
         let currentImages: KiroImage[] | undefined;
 
         if (firstMsg?.role === "assistant") {
@@ -485,7 +818,10 @@ export function streamKiro(
             }
           }
           const hasReasoning = armReasoningText.length > 0 || armRedactedContent !== undefined;
-          if (armContent || armToolUses.length > 0 || hasReasoning) {
+          if (
+            retainedCompactedHistory === undefined
+            && (armContent || armToolUses.length > 0 || hasReasoning)
+          ) {
             const last = history[history.length - 1];
             const reasoningContent = armRedactedContent !== undefined
               ? { redactedContent: armRedactedContent }
@@ -522,11 +858,13 @@ export function streamKiro(
             const m = currentMessages[i];
             if (m?.role === "toolResult") {
               const trm = m as ToolResultMessage;
-              currentToolResults.push({
-                content: [convertToolResultContent(getContentText(m))],
-                status: trm.isError ? "error" : "success",
-                toolUseId: toKiroToolUseId(trm.toolCallId),
-              });
+              if (rebuildCurrentToolResults) {
+                currentToolResults.push({
+                  content: [convertToolResultContent(getContentText(m))],
+                  status: trm.isError ? "error" : "success",
+                  toolUseId: toKiroToolUseId(trm.toolCallId),
+                });
+              }
               if (Array.isArray(trm.content)) {
                 for (const c of trm.content) {
                   if (c.type === "image") toolResultImages.push(c as ImageContent);
@@ -545,11 +883,13 @@ export function streamKiro(
           for (const m of currentMessages) {
             if (m?.role === "toolResult") {
               const trm = m as ToolResultMessage;
-              currentToolResults.push({
-                content: [convertToolResultContent(getContentText(m))],
-                status: trm.isError ? "error" : "success",
-                toolUseId: toKiroToolUseId(trm.toolCallId),
-              });
+              if (rebuildCurrentToolResults) {
+                currentToolResults.push({
+                  content: [convertToolResultContent(getContentText(m))],
+                  status: trm.isError ? "error" : "success",
+                  toolUseId: toKiroToolUseId(trm.toolCallId),
+                });
+              }
               if (Array.isArray(trm.content)) {
                 for (const c of trm.content) {
                   if (c.type === "image") toolResultImages.push(c as ImageContent);
@@ -571,7 +911,7 @@ export function streamKiro(
         }
 
         // Wrap content in the Kiro CLI format: context entry + user message.
-        const now = new Date();
+        const now = requestTimestamp;
         const tzOffset = -now.getTimezoneOffset();
         const tzSign = tzOffset >= 0 ? "+" : "-";
         const tzH = String(Math.floor(Math.abs(tzOffset) / 60)).padStart(2, "0");
@@ -670,16 +1010,26 @@ export function streamKiro(
           }
         }
 
-        // Forward max_tokens only when the catalog advertises the top-level
-        // field. Thinking support alone does not imply max_tokens support.
-        if (supportsMaxTokens && typeof options?.maxTokens === "number" && options.maxTokens > 0) {
-          const capped = Math.min(
-            Math.max(Math.floor(options.maxTokens), 1024),
-            model.maxTokens || 64_000,
-          );
-          request.additionalModelRequestFields = request.additionalModelRequestFields || {};
-          request.additionalModelRequestFields.max_tokens = capped;
-          log.debug("maxTokens.set", { maxTokens: capped, model: model.id });
+        // The live catalog is authoritative: only models that advertise the
+        // top-level field accept it. Others (notably Claude Haiku 4.5) reject
+        // the field but work normally when it is omitted.
+        if (options?.maxTokens !== undefined) {
+          if (!Number.isSafeInteger(options.maxTokens) || options.maxTokens <= 0) {
+            throw new Error("maxTokens must be a positive integer");
+          }
+          const modelOutputLimit = Number.isSafeInteger(model.maxTokens) && model.maxTokens > 0
+            ? model.maxTokens
+            : undefined;
+          if (supportsMaxTokens) {
+            const bounded = modelOutputLimit
+              ? Math.min(options.maxTokens, modelOutputLimit)
+              : options.maxTokens;
+            request.additionalModelRequestFields = request.additionalModelRequestFields || {};
+            request.additionalModelRequestFields.max_tokens = bounded;
+            log.debug("maxTokens.set", { maxTokens: bounded, model: model.id });
+          } else {
+            log.debug("maxTokens.omitted", { maxTokens: options.maxTokens, model: model.id });
+          }
         }
 
         // NOTE: Do NOT set additionalModelRequestFields.thinking here.
@@ -699,19 +1049,23 @@ export function streamKiro(
         // This covers the 25-30s server-side deliberation window on
         // Claude 4.7 without polluting fast responses with an empty
         // thinking block.
-        stream.push({ type: "start", partial: output });
-        if (reasoningHidden && thinkingEnabled && hiddenShimTimer === null) {
+        if (!startEmitted) {
+          stream.push({ type: "start", partial: output });
+          startEmitted = true;
+        }
+        if (reasoningHidden && thinkingEnabled && hiddenShimTimer === null && hiddenShimBlock === null) {
           hiddenShimTimer = setTimeout(() => {
             hiddenShimTimer = null;
-            emitHiddenReasoningLate(output, stream);
+            hiddenShimBlock = emitHiddenReasoningLate(output, stream);
           }, HIDDEN_REASONING_COUNTDOWN_MS);
         }
 
         let response!: Response;
         let capacityRetryCount = 0;
         let transientRetryCount = 0;
-        let contextTruncationAttempt = 0;
+        let contextTruncationAttempt: number = retainedContextTruncationAttempt;
         while (true) {
+          await stream.waitForCapacity(STREAM_EVENT_PUSH_RESERVE, signal);
           const osName = resolveOS();
           const ua = `aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17975 os/${osName} lang/rust/1.92.0 md/appVersion-2.15.0 app/AmazonQ-For-CLI`;
           const xAmzUa = `aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17975 os/${osName} lang/rust/1.92.0 m/F app/AmazonQ-For-CLI`;
@@ -735,7 +1089,11 @@ export function streamKiro(
           if (isFileLoggingEnabled()) {
             try {
               ensureLogDir();
-              require("fs").writeFileSync(`${LOG_DIR}/session-${fileLog.sessionId}.last-request.json`, requestBody);
+              require("fs").writeFileSync(
+                `${LOG_DIR}/session-${fileLog.sessionId}.last-request.json`,
+                requestBody,
+                { mode: 0o600 },
+              );
             } catch {}
           }
 
@@ -767,10 +1125,10 @@ export function streamKiro(
                 "Cache-Control": "no-cache",
               },
               body: requestBody,
-              signal: options?.signal,
+              signal,
             });
           } catch (error) {
-            if (options?.signal?.aborted) throw options.signal.reason ?? error;
+            if (signal.aborted) throw abortReason(signal);
 
             const message = errorMessage(error);
             if (retryCount < MAX_RETRIES) {
@@ -786,7 +1144,7 @@ export function streamKiro(
                 `network error before response: ${message} — retrying in ${delayMs}ms ` +
                 `(${retryCount}/${MAX_RETRIES})`,
               );
-              await abortableDelay(delayMs, options?.signal);
+              await abortableDelay(delayMs, signal);
               continue;
             }
 
@@ -797,9 +1155,13 @@ export function streamKiro(
 
           let errText = "";
           try {
-            errText = await response.text();
-          } catch {
-            errText = "";
+            errText = await readResponseTextLimited(response, {
+              signal,
+              timeoutMs: options?.errorBodyTimeoutMs,
+            });
+          } catch (error) {
+            if (signal.aborted) throw abortReason(signal);
+            errText = `[error body unavailable: ${errorMessage(error)}]`;
           }
           log.debug("response.error", {
             status: response.status,
@@ -827,7 +1189,7 @@ export function streamKiro(
             log.info(
               `INSUFFICIENT_MODEL_CAPACITY — retrying in ${delayMs}ms (${capacityRetryCount}/${CAPACITY_MAX_RETRIES})`,
             );
-            await abortableDelay(delayMs, options?.signal);
+            await abortableDelay(delayMs, signal);
             continue;
           }
 
@@ -835,16 +1197,27 @@ export function streamKiro(
             throw new Error(`Kiro API error: ${errText || response.statusText}`);
           }
           if (isTooBigError(response.status, errText)) {
-            if (contextTruncationAttempt < CONTEXT_TRUNCATION_MAX_RETRIES && history.length > 0) {
-              contextTruncationAttempt++;
-              const dropCount = Math.max(1, Math.floor(history.length * CONTEXT_TRUNCATION_DROP_RATIO));
+            if (contextTruncationAttempt < CONTEXT_TRUNCATION_MAX_RETRIES) {
               const before = history.length;
-              history.splice(0, dropCount);
+              const droppedEntries = dropOldestHistoryTurnsForRetry(history);
+              const compactedResults = compactCurrentToolResultsForRetry(currentToolResults);
+              const resultsCompacted = compactedResults.afterChars < compactedResults.beforeChars;
+              if (droppedEntries === 0 && !resultsCompacted) {
+                throw new Error(`Kiro API error: context_length_exceeded (${response.status} ${errText})`);
+              }
+
+              contextTruncationAttempt++;
+              retainedCompactedHistory = history;
+              retainedCompactedToolResults = currentToolResults;
+              retainedContextTruncationAttempt = contextTruncationAttempt;
               log.info(
                 `context too large — truncated history from ${before} to ${history.length} entries ` +
+                `(preserved seed/recent turns; dropped ${droppedEntries}), compacted current tool results ` +
+                `from ${compactedResults.beforeChars} to ${compactedResults.afterChars} chars ` +
                 `(attempt ${contextTruncationAttempt}/${CONTEXT_TRUNCATION_MAX_RETRIES})`,
               );
-              // Rebuild request with truncated history and retry
+              // The request references both arrays, so their in-place changes
+              // are reflected when requestBody is rebuilt on the next loop.
               request.conversationState.history = history.length > 0 ? history : undefined;
               continue;
             }
@@ -862,7 +1235,7 @@ export function streamKiro(
               `transient error ${response.status} — retrying in ${delayMs}ms ` +
               `(${transientRetryCount}/${TRANSIENT_MAX_RETRIES})`,
             );
-            await abortableDelay(delayMs, options?.signal);
+            await abortableDelay(delayMs, signal);
             continue;
           }
           if (response.status === 401) {
@@ -911,24 +1284,49 @@ export function streamKiro(
         let serverStopReason: string | null = null;
         let chunkSeq = 0;
         let eventSeq = 0;
+        let totalResponseBytes = 0;
+        const maxResponseBytes = Math.max(1, options?.maxResponseBytes ?? MAX_STREAM_RESPONSE_BYTES);
+        const maxIncompleteFrameChars = Math.max(
+          1,
+          options?.maxIncompleteFrameChars ?? MAX_INCOMPLETE_FRAME_CHARS,
+        );
 
-        // ThinkingTagParser runs unconditionally when thinking is
-        // enabled. Defensive against providers that intermittently
-        // leak `<thinking>...</thinking>` tags despite declaring
-        // `reasoningHidden` (Claude Opus 4.7's adaptive-thinking
-        // policy is advisory, not binding).
-        const thinkingParser = thinkingEnabled
-          ? new ThinkingTagParser(output, stream)
-          : null;
-        let textBlockIndex: number | null = null;
-        let emittedToolCalls = 0;
-        let sawAnyToolCalls = false;
+        // ThinkingTagParser and textBlockIndex intentionally live across outer
+        // retries. When a post-output retry replays the raw prefix, the replay
+        // gate suppresses it and only the new suffix enters this retained parser
+        // state. This also preserves an inline thinking tag split by a timeout.
+        let emittedToolCalls = output.content.filter((block) => block.type === "toolCall").length;
+        let sawAnyToolCalls = emittedToolCalls > 0;
         let currentToolCall: KiroToolCallState | null = null;
         let endedAtCompletedToolUse = false;
-        const flushToolCall = () => {
-          if (!currentToolCall) return;
-          if (emitToolCall(currentToolCall, output, stream)) emittedToolCalls++;
+        const consumeReplayText = (type: "content" | "reasoning", data: string): string => {
+          if (!replayGate) return data;
+          const suffix = replayGate.consumeText(type, data);
+          if (replayGate.isComplete()) replayGate = null;
+          return suffix;
+        };
+        const consumeReplayAtomic = (
+          type: Exclude<ReplaySegmentType, "content" | "reasoning">,
+          data: string,
+        ): boolean => {
+          if (!replayGate) return true;
+          const shouldEmit = replayGate.consumeAtomic(type, data);
+          if (replayGate.isComplete()) replayGate = null;
+          return shouldEmit;
+        };
+        const flushToolCall = (): boolean => {
+          if (!currentToolCall) return false;
+          const state = currentToolCall;
           currentToolCall = null;
+          const toolCall = parseToolCall(state);
+          if (!toolCall) return false;
+          const replayKey = toolCallReplayKey(toolCall);
+          if (consumeReplayAtomic("toolCall", replayKey)) {
+            emitToolCall(toolCall, output, stream);
+            appendReplayAtomic(replayTranscript, "toolCall", replayKey);
+            emittedToolCalls++;
+          }
+          return true;
         };
 
         /**
@@ -947,7 +1345,7 @@ export function streamKiro(
 
         let idleTimer: ReturnType<typeof setTimeout> | null = null;
         let idleCancelled = false;
-        const idleTimeoutMs = idleTimeoutForModel(model.id);
+        const idleTimeoutMs = idleTimeoutForModel(model.id, options?.modelMetadata);
         const resetIdle = () => {
           if (idleTimer) clearTimeout(idleTimer);
           idleTimer = setTimeout(() => {
@@ -963,6 +1361,7 @@ export function streamKiro(
         const FIRST_TOKEN_SENTINEL = Symbol("firstTokenTimeout");
         type ReadResult = { done: boolean; value?: Uint8Array };
 
+        try {
         while (true) {
           let readResult: ReadResult;
           try {
@@ -974,7 +1373,7 @@ export function streamKiro(
                 new Promise<typeof FIRST_TOKEN_SENTINEL>((resolve) => {
                   firstTokenTimer = setTimeout(
                     () => resolve(FIRST_TOKEN_SENTINEL),
-                    firstTokenTimeoutForModel(model.id),
+                    firstTokenTimeoutForModel(model.id, options?.modelMetadata),
                   );
                 }),
               ]);
@@ -996,7 +1395,7 @@ export function streamKiro(
               readResult = (await reader.read()) as ReadResult;
             }
           } catch (error) {
-            if (options?.signal?.aborted) throw options.signal.reason ?? error;
+            if (signal.aborted) throw abortReason(signal);
             if (idleCancelled) break;
 
             transportError = errorMessage(error);
@@ -1011,6 +1410,11 @@ export function streamKiro(
           }
 
           const { done, value } = readResult;
+          totalResponseBytes += value?.byteLength ?? 0;
+          if (totalResponseBytes > maxResponseBytes) {
+            await reader.cancel().catch(() => undefined);
+            throw new Error(`Kiro API response exceeded ${maxResponseBytes} bytes`);
+          }
           const bufferedBeforeRead = buffer.length;
           const decoded = done ? decoder.decode() : decoder.decode(value, { stream: true });
           buffer += decoded;
@@ -1025,6 +1429,10 @@ export function streamKiro(
           }
           const { events, remaining } = parseKiroEvents(buffer);
           buffer = remaining;
+          if (buffer.length > maxIncompleteFrameChars) {
+            await reader.cancel().catch(() => undefined);
+            throw new Error(`Kiro API incomplete event frame exceeded ${maxIncompleteFrameChars} characters`);
+          }
 
           // Reset on complete events or growth of a parser-retained incomplete
           // event. Arbitrary framing/keepalive bytes are discarded by the
@@ -1037,6 +1445,7 @@ export function streamKiro(
 
           const debugEvents = log.isDebug();
           for (let eventIndex = 0; eventIndex < events.length; eventIndex++) {
+            await stream.waitForCapacity(STREAM_EVENT_PUSH_RESERVE, signal);
             const event = events[eventIndex]!;
             const sequence = eventSeq++;
             if (debugEvents) log.debug("stream.event", { seq: sequence, event });
@@ -1063,6 +1472,8 @@ export function streamKiro(
                 cancelHiddenShim();
                 if (!output.responseId) output.responseId = crypto.randomUUID();
                 if (event.data.redactedContent !== undefined) {
+                  if (!consumeReplayAtomic("redactedReasoning", event.data.redactedContent)) break;
+                  appendReplayAtomic(replayTranscript, "redactedReasoning", event.data.redactedContent);
                   const contentIndex = output.content.length;
                   const block: ThinkingContent = {
                     type: "thinking",
@@ -1075,25 +1486,48 @@ export function streamKiro(
                   stream.push({ type: "thinking_end", contentIndex, content: "", partial: output });
                   break;
                 }
-                const lastIsThinking =
+                const hadThinkingBlock =
                   output.content.length > 0 &&
                   output.content[output.content.length - 1]?.type === "thinking";
                 // A signature-only frame (no reasoning text) with no open
                 // thinking block has nothing to attach to — skip it instead of
                 // emitting a stray empty thinking block.
-                if (!event.data.text && !lastIsThinking) break;
+                let reasoningSuffix = "";
+                if (event.data.text) {
+                  totalContent += event.data.text;
+                  reasoningSuffix = consumeReplayText("reasoning", event.data.text);
+                  if (reasoningSuffix) appendReplayText(replayTranscript, "reasoning", reasoningSuffix);
+                }
+                // A signature-only frame normally requires an existing native
+                // thinking block. During semantic replay the block may no
+                // longer be last (text from the first attempt follows it), but
+                // the signature still has to pass through the replay gate so
+                // the subsequent content segment stays aligned.
+                const canProcessSignature = replayGate !== null
+                  || hadThinkingBlock
+                  || reasoningSuffix.length > 0;
+                const emitSignature = event.data.signature && canProcessSignature
+                  ? consumeReplayAtomic("reasoningSignature", event.data.signature)
+                  : false;
+                if (emitSignature && event.data.signature) {
+                  appendReplayAtomic(replayTranscript, "reasoningSignature", event.data.signature);
+                }
+                if (!reasoningSuffix && !emitSignature) break;
+
+                const lastIsThinking =
+                  output.content.length > 0 &&
+                  output.content[output.content.length - 1]?.type === "thinking";
                 if (!lastIsThinking) {
                   output.content.push({ type: "thinking", thinking: "" });
                   stream.push({ type: "thinking_start", contentIndex: output.content.length - 1, partial: output });
                 }
                 const contentIndex = output.content.length - 1;
                 const tc = output.content[contentIndex] as ThinkingContent;
-                if (event.data.text) {
-                  tc.thinking += event.data.text;
-                  totalContent += event.data.text;
-                  stream.push({ type: "thinking_delta", contentIndex, delta: event.data.text, partial: output });
+                if (reasoningSuffix) {
+                  tc.thinking += reasoningSuffix;
+                  stream.push({ type: "thinking_delta", contentIndex, delta: reasoningSuffix, partial: output });
                 }
-                if (event.data.signature) {
+                if (emitSignature && event.data.signature) {
                   tc.thinkingSignature = event.data.signature;
                   stream.push({
                     type: "thinking_signature",
@@ -1114,8 +1548,10 @@ export function streamKiro(
                 // Cancel the deferred shim — real content arrived in
                 // time, no breadcrumb needed.
                 cancelHiddenShim();
+                const contentSuffix = consumeReplayText("content", event.data);
+                if (!contentSuffix) break;
                 if (thinkingParser) {
-                  thinkingParser.processChunk(event.data);
+                  thinkingParser.processChunk(contentSuffix);
                 } else {
                   if (textBlockIndex === null) {
                     textBlockIndex = output.content.length;
@@ -1124,15 +1560,16 @@ export function streamKiro(
                   }
                   const block = output.content[textBlockIndex] as TextContent | undefined;
                   if (block) {
-                    block.text += event.data;
+                    block.text += contentSuffix;
                     stream.push({
                       type: "text_delta",
                       contentIndex: textBlockIndex,
-                      delta: event.data,
+                      delta: contentSuffix,
                       partial: output,
                     });
                   }
                 }
+                appendReplayText(replayTranscript, "content", contentSuffix);
                 break;
               }
               case "toolUse": {
@@ -1148,9 +1585,7 @@ export function streamKiro(
                 currentToolCall.input += tc.input || "";
                 if (tc.input) totalContent += tc.input;
                 if (tc.stop) {
-                  const emittedBeforeStop = emittedToolCalls;
-                  flushToolCall();
-                  endedAtCompletedToolUse = emittedToolCalls > emittedBeforeStop;
+                  endedAtCompletedToolUse = flushToolCall();
                 }
                 break;
               }
@@ -1161,10 +1596,7 @@ export function streamKiro(
               }
               case "toolUseStop": {
                 if (event.data.stop) {
-                  const emittedBeforeStop = emittedToolCalls;
-                  flushToolCall();
-                  endedAtCompletedToolUse = currentToolCall === null
-                    && (endedAtCompletedToolUse || emittedToolCalls > emittedBeforeStop);
+                  endedAtCompletedToolUse = flushToolCall() || endedAtCompletedToolUse;
                 }
                 break;
               }
@@ -1205,14 +1637,32 @@ export function streamKiro(
           }
           if (done) break;
         }
+        } finally {
+          if (idleTimer) {
+            clearTimeout(idleTimer);
+            idleTimer = null;
+          }
+        }
 
-        if (idleTimer) clearTimeout(idleTimer);
+        // A clean EOF is also a valid boundary for a complete tool frame. Flush
+        // it before checking whether a retry reproduced the prior prefix. Error
+        // paths intentionally retain the old behavior and never publish a tool
+        // whose stop boundary was not observed.
+        if (!firstTokenTimedOut && !idleCancelled && !streamError && !transportError && currentToolCall) {
+          await stream.waitForCapacity(STREAM_EVENT_PUSH_RESERVE, signal);
+          endedAtCompletedToolUse = flushToolCall() || endedAtCompletedToolUse;
+        }
+
+        if (replayGate && !replayGate.isComplete() && !streamError && !transportError) {
+          transportError = `retry ended before replaying ${replayGate.pendingDescription()}`;
+        }
 
         const authoritativeStopReason = mapKiroStopReason(serverStopReason);
-        const terminalOutputIsComplete = authoritativeStopReason !== null
+        const terminalOutputIsComplete = replayGate === null
+          && authoritativeStopReason !== null
           && currentToolCall === null
           && (authoritativeStopReason !== "toolUse" || emittedToolCalls > 0);
-        if (transportError && terminalOutputIsComplete) {
+        if ((transportError || idleCancelled) && terminalOutputIsComplete) {
           // Kiro sometimes closes the HTTP body after sending its authoritative
           // terminal metadata but before fetch observes a clean EOF. At that
           // point the turn is complete; surfacing the later socket reset would
@@ -1222,6 +1672,7 @@ export function streamKiro(
             stopReason: serverStopReason,
           });
           transportError = null;
+          idleCancelled = false;
         }
 
         if (isRecoverablePostOutputServiceException(streamError)) {
@@ -1246,16 +1697,12 @@ export function streamKiro(
         }
 
         if (firstTokenTimedOut || idleCancelled || streamError || transportError) {
-          // Once any output reached the consumer, a reset-and-retry would
-          // DUPLICATE it: SSE deltas already sent can't be retracted. Only a
-          // first-token timeout is guaranteed to have produced nothing, so it's
-          // the only case where reset+retry is always safe.
-          // Incomplete tool JSON is accumulated in totalContent before the tool
-          // call is validated/emitted. It is safe to retry that case because no
-          // semantic output reached the consumer yet; output.content tracks the
-          // blocks that were actually surfaced.
-          const alreadyStreamed = output.content.length > 0;
-          if (!alreadyStreamed && retryCount < MAX_RETRIES) {
+          const alreadyStreamed = output.content.some((block) => block !== hiddenShimBlock);
+          const recoverableAfterPartial = firstTokenTimedOut
+            || idleCancelled
+            || transportError !== null
+            || isRecoverablePostOutputStreamError(streamError);
+          if ((!alreadyStreamed || recoverableAfterPartial) && retryCount < MAX_RETRIES) {
             retryCount++;
             const delayMs = exponentialBackoff(retryCount - 1, 1000, MAX_RETRY_DELAY_MS);
             const streamErrDesc = firstTokenTimedOut
@@ -1272,7 +1719,8 @@ export function streamKiro(
               attempt: retryCount,
             });
             log.info(
-              `stream ${streamErrDesc} — retrying (${retryCount}/${MAX_RETRIES})`,
+              `stream ${streamErrDesc} — retrying${alreadyStreamed ? " with semantic replay" : ""} ` +
+              `(${retryCount}/${MAX_RETRIES})`,
             );
             // Cancel the pending shim BEFORE the backoff delay so
             // the timer can't fire mid-wait (exponential backoff
@@ -1280,10 +1728,25 @@ export function streamKiro(
             // HIDDEN_REASONING_COUNTDOWN_MS). The retry re-arms a
             // fresh timer on the next `start`.
             cancelHiddenShim();
-            await abortableDelay(delayMs, options?.signal);
-            // Safe to reset — nothing was emitted to the consumer yet.
-            output.content = [];
-            textBlockIndex = null;
+            await abortableDelay(delayMs, signal);
+            if (alreadyStreamed) {
+              // Snapshot every semantic segment already accepted. The next
+              // attempt must replay this prefix exactly; matching events are
+              // suppressed and only a new suffix reaches the consumer.
+              replayGate = new SemanticReplayGate(
+                replayTranscript.map((segment) => ({ ...segment })),
+              );
+            } else {
+              // Nothing semantic reached the consumer, so discard any parser
+              // buffer (for example a split `<thinking` prefix) and restart.
+              output.content = hiddenShimBlock ? [hiddenShimBlock] : [];
+              textBlockIndex = null;
+              replayTranscript.length = 0;
+              replayGate = null;
+              thinkingParser = thinkingEnabled
+                ? new ThinkingTagParser(output, stream)
+                : null;
+            }
             continue;
           }
           // Either we already streamed partial output (can't retract) or we're
@@ -1310,15 +1773,51 @@ export function streamKiro(
           log.info("stream first-token timeout after partial output — finalizing with partial content");
         }
 
-        // Stream ended cleanly. Cancel the deferred shim — either
-        // content/tool calls already cancelled it, or nothing arrived
-        // and the timer may still be pending (below-threshold
-        // response). Either way, we don't want a late shim to fire
-        // after `done`.
+        // Stream ended cleanly. Cancel the deferred shim before either retrying
+        // or finalizing so it cannot fire during backoff or after `done`.
         cancelHiddenShim();
 
-        if (currentToolCall && emitToolCall(currentToolCall, output, stream)) emittedToolCalls++;
+        if (currentToolCall) {
+          await stream.waitForCapacity(STREAM_EVENT_PUSH_RESERVE, signal);
+          flushToolCall();
+        }
+        const hasText = output.content.some((block) => block.type === "text" && block.text.length > 0);
+        if (!hasText && !sawAnyToolCalls) {
+          if (retryCount < MAX_RETRIES) {
+            retryCount++;
+            const delayMs = exponentialBackoff(retryCount - 1, 1000, MAX_RETRY_DELAY_MS);
+            const alreadyStreamed = output.content.some((block) => block !== hiddenShimBlock);
+            log.info(
+              `empty response — retrying${alreadyStreamed ? " with semantic replay" : ""} ` +
+              `(${retryCount}/${MAX_RETRIES})`,
+            );
+            await abortableDelay(delayMs, signal);
+            if (alreadyStreamed) {
+              // Reasoning-only output is consumer-visible, not semantically
+              // empty. Preserve output/parser state and gate the retried prefix
+              // exactly like a retry after a transport failure.
+              replayGate = new SemanticReplayGate(
+                replayTranscript.map((segment) => ({ ...segment })),
+              );
+            } else {
+              output.content = hiddenShimBlock ? [hiddenShimBlock] : [];
+              textBlockIndex = null;
+              replayTranscript.length = 0;
+              replayGate = null;
+              thinkingParser = thinkingEnabled
+                ? new ThinkingTagParser(output, stream)
+                : null;
+            }
+            continue;
+          }
+          log.info(`empty response persisted after ${MAX_RETRIES} retries`);
+        }
+
+        // Finalize inline reasoning only after deciding not to retry. Finalizing
+        // an unterminated tag emits thinking_end, after which a retry must not
+        // append further deltas to that block.
         if (thinkingParser) {
+          await stream.waitForCapacity(STREAM_EVENT_PUSH_RESERVE, signal);
           thinkingParser.finalize();
           textBlockIndex = thinkingParser.getTextBlockIndex();
         }
@@ -1326,6 +1825,7 @@ export function streamKiro(
         if (textBlockIndex !== null) {
           const block = output.content[textBlockIndex] as TextContent | undefined;
           if (block) {
+            await stream.waitForCapacity(2, signal);
             stream.push({
               type: "text_end",
               contentIndex: textBlockIndex,
@@ -1348,30 +1848,6 @@ export function streamKiro(
           output.usage.cost.total = meteringCredits;
         }
 
-        const textBlock =
-          textBlockIndex !== null
-            ? (output.content[textBlockIndex] as TextContent | undefined)
-            : undefined;
-        const hasText = !!textBlock && textBlock.text.length > 0;
-        if (!hasText && !sawAnyToolCalls) {
-          if (retryCount < MAX_RETRIES) {
-            retryCount++;
-            const delayMs = exponentialBackoff(retryCount - 1, 1000, MAX_RETRY_DELAY_MS);
-            log.info(`empty response — retrying (${retryCount}/${MAX_RETRIES})`);
-            // Cancel the pending shim BEFORE the backoff delay so
-            // it can't fire mid-wait. Retry re-arms a fresh timer.
-            cancelHiddenShim();
-            output.content = [];
-            textBlockIndex = null;
-            await abortableDelay(delayMs, options?.signal);
-            continue;
-          }
-          log.info(`empty response persisted after ${MAX_RETRIES} retries`);
-          // No retries left — cancel any pending shim so it doesn't
-          // fire after the empty-response path returns.
-          cancelHiddenShim();
-        }
-
         // Stop reason classification.
         // Prefer Kiro's authoritative metadataEvent — the real wire format
         // sends {"stopReason":"TOOL_USE"|"END_TURN"|"MAX_TOKENS"} as its own
@@ -1391,6 +1867,7 @@ export function streamKiro(
           output.stopReason = emittedToolCalls > 0 ? "toolUse" : "stop";
         }
 
+        await stream.waitForCapacity(1, signal);
         stream.push({
           type: "done",
           reason: output.stopReason as "stop" | "length" | "toolUse",
@@ -1434,6 +1911,7 @@ export function streamKiro(
         clearTimeout(hiddenShimTimer);
         hiddenShimTimer = null;
       }
+      await stream.waitForCapacity(1);
       stream.push({ type: "error", reason: output.stopReason, error: output });
       stream.end();
     }

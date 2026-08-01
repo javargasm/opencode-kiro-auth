@@ -7,9 +7,13 @@ import {
   OPENCODE_PROFILE_ARN_HEADER,
   OPENCODE_REGION_HEADER,
   gatewayChallengeProof,
+  gatewayRequestSignature,
+  fetchKiroUsageLimits,
   refreshGatewayModels,
   startGatewayServer,
   _clearCredentials,
+  _hasValidGatewayRequestAuthForTest,
+  _resetGatewayNoncesForTest,
   _seedCredentials,
 } from "../src/server";
 import {
@@ -24,6 +28,7 @@ import {
 } from "../src/index";
 import {
   buildModelsFromApi,
+  getCachedDynamicModels,
   resetProfileArnCache,
   resolveKiroModel,
   setCachedDynamicModels,
@@ -36,12 +41,31 @@ vi.mock("../src/stream", () => ({
 }));
 
 const mockRefresh = vi.fn();
+const mockStartSocialLogin = vi.fn();
+const mockTryRegisterAndAuthorize = vi.fn();
+const mockPollForToken = vi.fn();
 // bun's test runner doesn't support the factory's importOriginal arg, so mock
 // only the three exports server.ts imports from oauth.
 vi.mock("../src/oauth", () => ({
   refreshKiroToken: (...args: any[]) => mockRefresh(...args),
-  startSocialLogin: () => Promise.reject(new Error("startSocialLogin not mocked in gateway tests")),
+  startSocialLogin: (...args: any[]) => mockStartSocialLogin(...args),
+  tryRegisterAndAuthorize: (...args: any[]) => mockTryRegisterAndAuthorize(...args),
+  pollForToken: (...args: any[]) => mockPollForToken(...args),
+  getKiroCredentialScope: (packed: string) => {
+    const parts = packed.split("|");
+    return {
+      region: parts[6] ? decodeURIComponent(parts[6]) : undefined,
+      profileArn: parts[7] ? decodeURIComponent(parts[7]) : undefined,
+    };
+  },
+  withKiroCredentialScope: (packed: string, region: string, profileArn?: string) => {
+    const parts = packed.split("|").slice(0, 6);
+    while (parts.length < 6) parts.push("");
+    return [...parts, encodeURIComponent(region), encodeURIComponent(profileArn ?? "")].join("|");
+  },
   BUILDER_ID_REGION: "us-east-1",
+  IDC_PROBE_REGIONS: ["us-east-1"],
+  EXPIRES_BUFFER_MS: 60_000,
 }));
 
 function okStream() {
@@ -73,7 +97,43 @@ function catalogModel(id: string, name = id): KiroModel {
 describe("Local HTTP Gateway Server (Anthropic Protocol)", () => {
   beforeEach(() => {
     mockStreamKiro.mockReset();
+    mockRefresh.mockReset();
+    mockStartSocialLogin.mockReset();
+    mockTryRegisterAndAuthorize.mockReset();
+    mockPollForToken.mockReset();
+    _resetGatewayNoncesForTest();
     _seedCredentials("test-token");
+  });
+
+  it("keeps nonce replay protection while accepting the 1001st valid request", () => {
+    const token = "nonce-boundary-gateway-token-long";
+    const makeRequest = (nonce: string) => {
+      const timestamp = String(Date.now());
+      return new Request("http://127.0.0.1:7438/dashboard/api/stats", {
+        headers: {
+          "x-opencode-kiro-gateway-token": gatewayRequestSignature(
+            token,
+            timestamp,
+            nonce,
+            "GET",
+            "/dashboard/api/stats",
+          ),
+          "x-opencode-kiro-gateway-timestamp": timestamp,
+          "x-opencode-kiro-gateway-nonce": nonce,
+        },
+      });
+    };
+
+    const duplicate = makeRequest("duplicate-nonce");
+    expect(_hasValidGatewayRequestAuthForTest(duplicate, token)).toBe(true);
+    expect(_hasValidGatewayRequestAuthForTest(duplicate, token)).toBe(false);
+
+    _resetGatewayNoncesForTest();
+    for (let index = 0; index < 1_001; index++) {
+      expect(_hasValidGatewayRequestAuthForTest(makeRequest(`nonce-${index}`), token)).toBe(true);
+    }
+    expect(_hasValidGatewayRequestAuthForTest(makeRequest("nonce-0"), token)).toBe(false);
+    expect(_hasValidGatewayRequestAuthForTest(makeRequest("nonce-1000"), token)).toBe(false);
   });
 
   it("uses the current CLI token when saved OpenCode auth points to the same credential row", () => {
@@ -153,6 +213,33 @@ describe("Local HTTP Gateway Server (Anthropic Protocol)", () => {
     await server.stop(true);
   });
 
+  it("rejects a usage-route HMAC replayed against the messages route", async () => {
+    const gatewayToken = "route-bound-test-token";
+    mockStreamKiro.mockImplementation(okStream);
+    const server = await startGatewayServer(0, { gatewayToken });
+    const usageHeaders = gatewayRequestHeaders(
+      gatewayToken,
+      "GET",
+      "/dashboard/api/usage",
+    );
+
+    try {
+      const response = await fetch(`http://127.0.0.1:${server.port}/v1/messages`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...usageHeaders },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-6",
+          messages: [{ role: "user", content: "Hello" }],
+        }),
+      });
+
+      expect(response.status).toBe(401);
+      expect(mockStreamKiro).not.toHaveBeenCalled();
+    } finally {
+      await server.stop(true);
+    }
+  });
+
   it("accepts the gateway token from standard Anthropic client headers", async () => {
     const gatewayToken = "generic-client-gateway-token";
     _seedCredentials("owner-kiro-access-token");
@@ -193,6 +280,235 @@ describe("Local HTTP Gateway Server (Anthropic Protocol)", () => {
     });
     expect(mockStreamKiro).not.toHaveBeenCalled();
     await server.stop(true);
+  });
+
+  it("requires gateway authentication for usage telemetry", async () => {
+    const gatewayToken = "usage-route-gateway-token";
+    const profileArn = "arn:aws:codewhisperer:us-east-1:123:profile/usage";
+    _seedCredentials("usage-access-token", "us-east-1", Date.now() + 60_000, profileArn);
+    const server = await startGatewayServer(0, { gatewayToken });
+    const nativeFetch = globalThis.fetch;
+    const upstream = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
+      usageBreakdownList: [{ currentUsage: 2, usageLimit: 10 }],
+    }), { status: 200, headers: { "Content-Type": "application/json" } }));
+
+    try {
+      const rejected = await nativeFetch(`http://127.0.0.1:${server.port}/dashboard/api/usage`);
+      expect(rejected.status).toBe(401);
+      expect(upstream).not.toHaveBeenCalled();
+
+      const accepted = await nativeFetch(`http://127.0.0.1:${server.port}/dashboard/api/usage`, {
+        headers: { "x-api-key": gatewayToken },
+      });
+      expect(accepted.status).toBe(200);
+      expect(await accepted.json()).toMatchObject({ percentage: 20, creditsUsed: 2, creditsTotal: 10 });
+
+      const hmacAccepted = await nativeFetch(`http://127.0.0.1:${server.port}/dashboard/api/usage`, {
+        headers: gatewayRequestHeaders(gatewayToken, "GET", "/dashboard/api/usage"),
+      });
+      expect(hmacAccepted.status).toBe(200);
+      expect(await hmacAccepted.json()).toMatchObject({ percentage: 20, creditsUsed: 2, creditsTotal: 10 });
+      expect(upstream).toHaveBeenCalledTimes(1);
+    } finally {
+      upstream.mockRestore();
+      await server.stop(true);
+    }
+  });
+
+  it("protects dashboard stats with auth, browser-origin, and loopback Host checks", async () => {
+    const gatewayToken = "dashboard-stats-gateway-token-long";
+    const server = await startGatewayServer(0, { gatewayToken });
+    const origin = `http://127.0.0.1:${server.port}`;
+    try {
+      expect((await fetch(`${origin}/dashboard/api/stats`)).status).toBe(401);
+      expect((await fetch(`${origin}/dashboard/api/stats`, {
+        headers: { "x-api-key": gatewayToken, Origin: "https://evil.example" },
+      })).status).toBe(403);
+      expect((await fetch(`${origin}/dashboard/api/stats`, {
+        headers: { "x-api-key": gatewayToken },
+      })).status).toBe(200);
+      expect((await fetch(`${origin}/dashboard/api/stats`, {
+        headers: { "x-api-key": gatewayToken, Host: "gateway.attacker.example" },
+      })).status).toBe(421);
+      expect((await fetch(`${origin}/health`, {
+        headers: { Host: "localhost" },
+      })).status).toBe(200);
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  it("keeps dashboard telemetry token-free, memory-only, and safe for untrusted stats", async () => {
+    const gatewayToken = "dashboard-html-secret-that-must-not-be-embedded";
+    const server = await startGatewayServer(0, { gatewayToken });
+    const origin = `http://127.0.0.1:${server.port}`;
+    try {
+      const response = await fetch(`${origin}/dashboard`);
+      expect(response.status).toBe(200);
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      expect(response.headers.get("referrer-policy")).toBe("no-referrer");
+      const csp = response.headers.get("content-security-policy") ?? "";
+      expect(csp).toContain("connect-src 'self'");
+      expect(csp).not.toContain("'unsafe-inline'");
+      const nonce = csp.match(/script-src 'nonce-([^']+)'/)?.[1];
+      expect(nonce).toBeTruthy();
+
+      const html = await response.text();
+      expect(html).toContain(`<script nonce="${nonce}">`);
+      expect(html).toContain(`<style nonce="${nonce}">`);
+      expect(html).toContain("headers: { 'x-api-key': gatewayToken }");
+      expect(html).toContain("res.status === 401");
+      expect(html).toContain("clearGatewayToken()");
+      expect(html).toContain("document.createElement('td')");
+      expect(html).toContain("tbody.replaceChildren(fragment)");
+      expect(html).not.toContain("sessionStorage");
+      expect(html).not.toContain("innerHTML");
+      expect(html).not.toMatch(/\s(?:style|onclick)=/);
+      expect(html).not.toContain(gatewayToken);
+      expect(html).not.toMatch(/[?&](?:token|api[-_]?key)=/i);
+
+      expect((await fetch(`${origin}/dashboard/api/stats`)).status).toBe(401);
+      expect((await fetch(`${origin}/dashboard/api/stats`, {
+        headers: { "x-api-key": gatewayToken },
+      })).status).toBe(200);
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  it("does not replace the owner catalog when direct IdC login completes", async () => {
+    const ownerModel = catalogModel("owner-catalog-model");
+    const profileArn = "arn:aws:codewhisperer:us-east-1:123:profile/idc-login";
+    setCachedDynamicModels([ownerModel]);
+    mockTryRegisterAndAuthorize.mockResolvedValue({
+      oidcEndpoint: "https://oidc.us-east-1.amazonaws.com",
+      clientId: "client-id",
+      clientSecret: "client-secret",
+      devAuth: {
+        verificationUriComplete: "https://device.example/verify",
+        userCode: "ABCD-EFGH",
+      },
+    });
+    mockPollForToken.mockResolvedValue({
+      accessToken: "idc-login-access-token",
+      refreshToken: "idc-login-refresh-token",
+      expiresIn: 3600,
+    });
+    const managementFetch = vi.spyOn(globalThis, "fetch").mockImplementation((async (_url, init) => {
+      const target = new Headers(init?.headers).get("X-Amz-Target");
+      if (target?.endsWith("ListAvailableProfiles")) {
+        return new Response(JSON.stringify({
+          profiles: [{ arn: profileArn, profileType: "KIRO", status: "ACTIVE" }],
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return new Response(JSON.stringify({
+        models: [{ modelId: "other-account-model", modelName: "Other Account Model" }],
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }) as typeof fetch);
+    const hooks = await KiroPlugin({ directory: "/tmp/private-workspace", client: {} } as any);
+
+    try {
+      const idcMethod = (hooks.auth as any).methods[1];
+      const authorization = await idcMethod.authorize({
+        sso_url: "https://company.awsapps.com/start",
+        sso_region: "us-east-1",
+      });
+      const result = await authorization.callback();
+
+      expect(result).toMatchObject({
+        type: "success",
+        access: "idc-login-access-token",
+        metadata: { profileArn },
+      });
+      expect(managementFetch).toHaveBeenCalledTimes(1);
+      expect(getCachedDynamicModels()).toEqual([ownerModel]);
+    } finally {
+      managementFetch.mockRestore();
+      setCachedDynamicModels(null);
+      resetProfileArnCache(true);
+      await hooks.dispose?.();
+    }
+  });
+
+  it("does not expose a gateway OAuth start route", async () => {
+    const server = await startGatewayServer(0, { gatewayToken: "auth-login-gateway-token-long-enough" });
+    try {
+      const unauthenticated = await fetch(`http://127.0.0.1:${server.port}/auth/login`);
+      const crossOrigin = await fetch(`http://127.0.0.1:${server.port}/auth/login`, {
+        headers: { Origin: "https://evil.example" },
+      });
+      expect(unauthenticated.status).toBe(404);
+      expect(crossOrigin.status).toBe(404);
+      expect(mockStartSocialLogin).not.toHaveBeenCalled();
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  it("shares one bounded upstream usage request across concurrent callers", async () => {
+    _seedCredentials(
+      "usage-access-token",
+      "us-east-1",
+      Date.now() + 60_000,
+      "arn:aws:codewhisperer:us-east-1:123:profile/usage",
+    );
+    const hangingFetch = ((_input: string | URL | Request, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal as AbortSignal;
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      })) as typeof fetch;
+    const upstream = vi.spyOn(globalThis, "fetch").mockImplementation(hangingFetch);
+
+    try {
+      const [first, second] = await Promise.all([
+        fetchKiroUsageLimits({ timeoutMs: 20 }),
+        fetchKiroUsageLimits({ timeoutMs: 20 }),
+      ]);
+      expect(upstream).toHaveBeenCalledTimes(1);
+      expect(first.error).toContain("timed out");
+      expect(second).toEqual(first);
+    } finally {
+      upstream.mockRestore();
+    }
+  });
+
+  it("does not return the previous account's stale usage after credentials change", async () => {
+    const profileArn = "arn:aws:codewhisperer:us-east-1:123:profile/old-usage";
+    const now = Date.now();
+    const dateSpy = vi.spyOn(Date, "now").mockReturnValue(now);
+    let rejectOldRequest!: (reason: unknown) => void;
+    const oldRequest = new Promise<Response>((_resolve, reject) => {
+      rejectOldRequest = reject;
+    });
+    const upstream = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        usageBreakdownList: [{ currentUsage: 8, usageLimit: 10 }],
+      }), { status: 200, headers: { "Content-Type": "application/json" } }))
+      .mockReturnValueOnce(oldRequest);
+
+    try {
+      _seedCredentials("old-account-token", "us-east-1", now + 10 * 60_000, profileArn);
+      expect((await fetchKiroUsageLimits()).creditsUsed).toBe(8);
+
+      dateSpy.mockReturnValue(now + 120_001);
+      const pending = fetchKiroUsageLimits();
+      await Promise.resolve();
+      _seedCredentials(
+        "new-account-token",
+        "us-east-1",
+        now + 10 * 60_000,
+        "arn:aws:codewhisperer:us-east-1:456:profile/new-usage",
+      );
+      rejectOldRequest(new Error("Usage state reset"));
+
+      const result = await pending;
+      expect(result.creditsUsed).toBe(0);
+      expect(result.creditsTotal).toBe(0);
+      expect(result.error).toContain("account changed");
+    } finally {
+      dateSpy.mockRestore();
+      upstream.mockRestore();
+    }
   });
 
   it("attaches a second controller to a compatible gateway and takes over after owner shutdown", async () => {
@@ -331,6 +647,78 @@ describe("Local HTTP Gateway Server (Anthropic Protocol)", () => {
     await server.stop(true);
   });
 
+  it("configures the active OAuth account catalog without replacing the owner catalog", async () => {
+    const gatewayToken = "oauth-config-gateway-token-32-chars";
+    const profileArn = "arn:aws:codewhisperer:eu-west-1:222:profile/ACTIVE";
+    const ownerModel = catalogModel("owner-only-model");
+    const accountModel = catalogModel("account-only-model", "Account Model");
+    const originalAuthContent = process.env.OPENCODE_AUTH_CONTENT;
+    const originalGatewayToken = process.env.KIRO_GATEWAY_TOKEN;
+    process.env.KIRO_GATEWAY_TOKEN = gatewayToken;
+    process.env.OPENCODE_AUTH_CONTENT = JSON.stringify({
+      kiro: {
+        type: "oauth",
+        access: "active-oauth-access",
+        refresh: [
+          "refresh-token",
+          "client-id",
+          "client-secret",
+          "idc",
+          "",
+          "",
+          encodeURIComponent("eu-west-1"),
+          encodeURIComponent(profileArn),
+        ].join("|"),
+        expires: Date.now() + 60_000,
+      },
+    });
+    setCachedDynamicModels([ownerModel]);
+
+    const serveSpy = vi.spyOn(Bun, "serve").mockImplementation((() => {
+      throw new Error("EADDRINUSE");
+    }) as typeof Bun.serve);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation((async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/health")) {
+        const challenge = new Headers(init?.headers).get(GATEWAY_CHALLENGE_HEADER)!;
+        return Response.json({
+          service: "opencode-kiro-gateway",
+          protocolVersion: GATEWAY_PROTOCOL_VERSION,
+          capabilities: GATEWAY_CAPABILITIES,
+          ready: true,
+          proof: gatewayChallengeProof(gatewayToken, challenge),
+        });
+      }
+      if (url.endsWith("/v1/models?refresh=1")) {
+        const headers = new Headers(init?.headers);
+        expect(headers.get("authorization")).toBe("Bearer active-oauth-access");
+        expect(headers.get(OPENCODE_REGION_HEADER)).toBe("eu-west-1");
+        expect(headers.get(OPENCODE_PROFILE_ARN_HEADER)).toBe(profileArn);
+        return Response.json({ object: "list", source: "dynamic", data: [accountModel] });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }) as typeof fetch);
+    const hooks = await KiroPlugin({ directory: "/tmp/oauth-catalog", client: {} } as any);
+
+    try {
+      const cfg: any = {};
+      await hooks.config?.(cfg);
+
+      expect(cfg.provider.kiro.models[accountModel.id]).toMatchObject({ name: "Account Model" });
+      expect(cfg.provider.kiro.models[ownerModel.id]).toBeUndefined();
+      expect(getCachedDynamicModels()).toEqual([ownerModel]);
+    } finally {
+      await hooks.dispose?.();
+      fetchSpy.mockRestore();
+      serveSpy.mockRestore();
+      setCachedDynamicModels(null);
+      if (originalAuthContent === undefined) delete process.env.OPENCODE_AUTH_CONTENT;
+      else process.env.OPENCODE_AUTH_CONTENT = originalAuthContent;
+      if (originalGatewayToken === undefined) delete process.env.KIRO_GATEWAY_TOKEN;
+      else process.env.KIRO_GATEWAY_TOKEN = originalGatewayToken;
+    }
+  });
+
   it("preserves an authoritative empty account catalog instead of advertising static models", async () => {
     const gatewayToken = "empty-catalog-test-token";
     _seedCredentials("");
@@ -346,6 +734,26 @@ describe("Local HTTP Gateway Server (Anthropic Protocol)", () => {
 
     setCachedDynamicModels(null);
     await server.stop(true);
+  });
+
+  it("bounds model discovery so callers can fall back while refresh continues", async () => {
+    const slow = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      async fetch() {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        return Response.json({ object: "list", source: "dynamic", data: [] });
+      },
+    });
+
+    try {
+      const startedAt = Date.now();
+      const models = await loadGatewayModels(slow.port!, undefined, undefined, 10);
+      expect(models).toBeNull();
+      expect(Date.now() - startedAt).toBeLessThan(90);
+    } finally {
+      await slow.stop(true);
+    }
   });
 
   it("projects catalog-native variants and merges existing model settings", () => {
@@ -468,6 +876,62 @@ describe("Local HTTP Gateway Server (Anthropic Protocol)", () => {
     expect(allowedHeaders).toContain("anthropic-version");
     expect(response.headers.get("Access-Control-Allow-Origin")).toBe("http://localhost:3000");
     await server.stop(true);
+  });
+
+  it("rejects invalid model and max_tokens fields before refreshing credentials", async () => {
+    _seedCredentials("expired-token", "us-east-1", Date.now() - 1);
+    mockRefresh.mockRejectedValue(new Error("must not refresh"));
+    const server = await startGatewayServer(0);
+
+    try {
+      for (const body of [
+        {},
+        { model: 42 },
+        { model: "   " },
+        { model: "claude-sonnet-4-6", max_tokens: 0 },
+        { model: "claude-sonnet-4-6", max_tokens: 1.5 },
+        { model: "claude-sonnet-4-6", max_tokens: "100" },
+      ]) {
+        const response = await fetch(`http://127.0.0.1:${server.port}/v1/messages`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: "Bearer expired-token" },
+          body: JSON.stringify({ messages: [{ role: "user", content: "Hello" }], ...body }),
+        });
+        expect(response.status).toBe(400);
+        expect((await response.json() as any).error.type).toBe("invalid_request_error");
+      }
+      expect(mockRefresh).not.toHaveBeenCalled();
+      expect(mockStreamKiro).not.toHaveBeenCalled();
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  it("allows max_tokens for a model whose catalog requires the field to be omitted", async () => {
+    const model = { ...catalogModel("fixed-output-model"), maxTokens: 8_192 };
+    setCachedDynamicModels([model]);
+    mockStreamKiro.mockImplementation(okStream);
+    const server = await startGatewayServer(0);
+
+    try {
+      const response = await fetch(`http://127.0.0.1:${server.port}/v1/messages`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer test-token" },
+        body: JSON.stringify({
+          model: model.id,
+          max_tokens: 100,
+          messages: [{ role: "user", content: "Hello" }],
+        }),
+      });
+      expect(response.status).toBe(200);
+      expect((mockStreamKiro.mock.calls[0] as any[])[2]).toMatchObject({
+        maxTokens: 100,
+        modelMetadata: model,
+      });
+    } finally {
+      setCachedDynamicModels(null);
+      await server.stop(true);
+    }
   });
 
   it("rejects a spoofed listener that cannot prove the shared gateway secret", async () => {
@@ -624,12 +1088,14 @@ describe("Local HTTP Gateway Server (Anthropic Protocol)", () => {
     const nativeFetch = globalThis.fetch;
     const now = Date.now();
     const dateSpy = vi.spyOn(Date, "now").mockReturnValue(now);
+    let managementAvailable = true;
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(((
       input: Parameters<typeof fetch>[0],
       init?: Parameters<typeof fetch>[1],
     ) => {
       const url = String(input);
       if (url.startsWith("http://127.0.0.1:")) return nativeFetch(input, init);
+      if (!managementAvailable) return Promise.reject(new Error("catalog unavailable"));
       const target = new Headers(init?.headers).get("X-Amz-Target");
       if (target === "AmazonCodeWhispererService.ListAvailableProfiles") {
         return Promise.resolve({
@@ -659,7 +1125,7 @@ describe("Local HTTP Gateway Server (Anthropic Protocol)", () => {
       const response = await nativeFetch(`http://127.0.0.1:${server.port}/v1/models?refresh=1`, {
         headers: {
           Authorization: "Bearer attacher-token",
-          ...gatewayRequestHeaders(gatewayToken),
+          ...gatewayRequestHeaders(gatewayToken, "GET", "/v1/models?refresh=1"),
           "x-opencode-kiro-region": "eu-west-1",
           "x-opencode-kiro-profile-arn": "arn:aws:codewhisperer:eu-west-1:2:profile/ATTACHER",
         },
@@ -671,6 +1137,7 @@ describe("Local HTTP Gateway Server (Anthropic Protocol)", () => {
       expect(fetchSpy.mock.calls[0]?.[0]).toContain("https://management.eu-central-1.kiro.dev/");
 
       dateSpy.mockReturnValue(now + 5 * 60_000 + 1);
+      managementAvailable = false;
       mockStreamKiro.mockImplementation(okStream);
       const message = await nativeFetch(`http://127.0.0.1:${server.port}/v1/messages`, {
         method: "POST",
@@ -691,6 +1158,68 @@ describe("Local HTTP Gateway Server (Anthropic Protocol)", () => {
       });
     } finally {
       dateSpy.mockRestore();
+      fetchSpy.mockRestore();
+      setCachedDynamicModels(null);
+      await server.stop(true);
+    }
+  });
+
+  it("fetches attaching catalog metadata for positive max_tokens even when owner has the model", async () => {
+    const gatewayToken = "max-token-account-catalog-token-long";
+    const modelId = "shared-model-1-0";
+    setCachedDynamicModels([{ ...catalogModel(modelId), supportsMaxTokens: false }]);
+    const server = await startGatewayServer(0, { gatewayToken });
+    const nativeFetch = globalThis.fetch;
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(((
+      input: Parameters<typeof fetch>[0],
+      init?: Parameters<typeof fetch>[1],
+    ) => {
+      if (String(input).startsWith("http://127.0.0.1:")) return nativeFetch(input, init);
+      const target = new Headers(init?.headers).get("X-Amz-Target");
+      if (target === "AmazonCodeWhispererService.ListAvailableProfiles") {
+        return Promise.resolve(Response.json({ profiles: [{
+          arn: "arn:aws:codewhisperer:us-east-1:2:profile/ATTACHER",
+          profileType: "KIRO",
+          status: "ACTIVE",
+        }] }));
+      }
+      return Promise.resolve(Response.json({ models: [{
+        modelId: "shared-model-1.0",
+        modelName: "Attacher Shared Model",
+        additionalModelRequestFieldsSchema: {
+          properties: { max_tokens: { type: "integer" } },
+        },
+      }] }));
+    }) as any);
+    mockStreamKiro.mockImplementation(okStream);
+
+    try {
+      const response = await nativeFetch(`http://127.0.0.1:${server.port}/v1/messages`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer attaching-max-token-account",
+          ...gatewayRequestHeaders(gatewayToken),
+          [OPENCODE_REGION_HEADER]: "us-east-1",
+        },
+        body: JSON.stringify({
+          model: modelId,
+          max_tokens: 4096,
+          messages: [{ role: "user", content: "Hello" }],
+        }),
+      });
+
+      expect(response.status).toBe(200);
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
+      expect((mockStreamKiro.mock.calls[0] as any[])[2]).toMatchObject({
+        apiKey: "attaching-max-token-account",
+        maxTokens: 4096,
+        modelMetadata: {
+          name: "Attacher Shared Model",
+          supportsMaxTokens: true,
+        },
+      });
+    } finally {
       fetchSpy.mockRestore();
       setCachedDynamicModels(null);
       await server.stop(true);
@@ -839,6 +1368,59 @@ describe("Local HTTP Gateway Server (Anthropic Protocol)", () => {
     expect(contextArg.messages[0].content).toBe("Hello");
 
     await server.stop(true);
+  });
+
+  it("aborts Kiro generation when the SSE HTTP request is aborted", async () => {
+    let signal: AbortSignal | undefined;
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+
+    mockStreamKiro.mockImplementation((_model, _context, options) => {
+      signal = options.signal;
+      signal!.addEventListener("abort", release, { once: true });
+      return {
+        async *[Symbol.asyncIterator]() {
+          yield { type: "text_delta", delta: "hello" };
+          await held;
+        },
+        async result() {
+          return {
+            role: "assistant",
+            content: [{ type: "text", text: "hello" }],
+            usage: { input: 1, output: 1 },
+            stopReason: signal?.aborted ? "aborted" : "stop",
+          };
+        },
+      };
+    });
+
+    const server = await startGatewayServer(0);
+    const clientController = new AbortController();
+    try {
+      const response = await fetch(`http://127.0.0.1:${server.port}/v1/messages`, {
+        method: "POST",
+        signal: clientController.signal,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-6",
+          messages: [{ role: "user", content: "hello" }],
+          stream: true,
+        }),
+      });
+      expect(response.status).toBe(200);
+      const reader = response.body!.getReader();
+      await reader.read();
+      expect(signal?.aborted).toBe(false);
+
+      clientController.abort(new Error("test client disconnected"));
+      for (let attempt = 0; attempt < 50 && !signal?.aborted; attempt++) {
+        await Bun.sleep(10);
+      }
+      expect(signal?.aborted).toBe(true);
+    } finally {
+      release?.();
+      await server.stop(true);
+    }
   });
 
   it("streams opaque reasoning as an Anthropic redacted_thinking block", async () => {
@@ -1112,6 +1694,54 @@ describe("Local HTTP Gateway Server (Anthropic Protocol)", () => {
     await server.stop(true);
   });
 
+  it("maps Anthropic stop reasons consistently in streaming and JSON modes", async () => {
+    const server = await startGatewayServer(0);
+    const toolCall = { type: "toolCall", id: "toolu_stop", name: "read", arguments: { path: "x" } };
+    const cases = [
+      { stopReason: "length", content: [toolCall], expected: "max_tokens" },
+      { stopReason: "toolUse", content: [toolCall], expected: "tool_use" },
+      { stopReason: "stop", content: [{ type: "text", text: "done" }], expected: "end_turn" },
+    ];
+
+    try {
+      for (const stream of [true, false]) {
+        for (const testCase of cases) {
+          mockStreamKiro.mockImplementation(() => ({
+            async *[Symbol.asyncIterator]() {
+              yield { type: "start" };
+            },
+            async result() {
+              return {
+                role: "assistant",
+                content: testCase.content,
+                usage: { input: 1, output: 1 },
+                stopReason: testCase.stopReason,
+              };
+            },
+          }));
+
+          const response = await fetch(`http://127.0.0.1:${server.port}/v1/messages`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              model: "claude-sonnet-4-6",
+              messages: [{ role: "user", content: "stop reason" }],
+              stream,
+            }),
+          });
+          expect(response.status).toBe(200);
+          if (stream) {
+            expect(await response.text()).toContain(`\"stop_reason\":\"${testCase.expected}\"`);
+          } else {
+            expect((await response.json() as any).stop_reason).toBe(testCase.expected);
+          }
+        }
+      }
+    } finally {
+      await server.stop(true);
+    }
+  });
+
   it("should record effort level and support lifetime metrics past MAX_HISTORY", async () => {
     const { stats } = await import("../src/dashboard-stats");
     
@@ -1327,6 +1957,45 @@ describe("Gateway bug fixes (#2, #3, #7, #13)", () => {
     await server.stop(true);
   });
 
+  it("delivers refresh rejection to waiters without an unhandled cleanup rejection", async () => {
+    _seedCredentials("expired-rejected-token", "us-east-1", Date.now() - 1000);
+    let rejectRefresh!: (reason: unknown) => void;
+    mockRefresh.mockImplementation(() => new Promise((_resolve, reject) => {
+      rejectRefresh = reject;
+    }));
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    const server = await startGatewayServer(0);
+
+    try {
+      const pendingResponses = Promise.all(Array.from({ length: 2 }, () =>
+        fetch(`http://127.0.0.1:${server.port}/v1/messages`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: "claude-sonnet-4-6",
+            messages: [{ role: "user", content: "hi" }],
+          }),
+        })));
+      for (let attempt = 0; attempt < 50 && mockRefresh.mock.calls.length === 0; attempt++) {
+        await Bun.sleep(1);
+      }
+      // Give both request handlers a chance to observe the shared pending
+      // refresh before rejecting it.
+      await Bun.sleep(10);
+      rejectRefresh(new Error("refresh rejected for test"));
+      const responses = await pendingResponses;
+      expect(responses.map((response) => response.status)).toEqual([401, 401]);
+      expect(mockRefresh).toHaveBeenCalledTimes(1);
+      await Bun.sleep(0);
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+      await server.stop(true);
+    }
+  });
+
   it("routes a pre-refresh owner bearer through the refreshed owner token", async () => {
     setCachedDynamicModels(null);
     _seedCredentials("owner-token-before-refresh", "us-east-1", Date.now() - 1000);
@@ -1354,6 +2023,87 @@ describe("Gateway bug fixes (#2, #3, #7, #13)", () => {
     expect(mockRefresh).toHaveBeenCalledTimes(1);
     expect((mockStreamKiro.mock.calls[1] as any[])[2]?.apiKey).toBe("owner-token-after-refresh");
     await server.stop(true);
+  });
+
+  it("rejects an old owner alias with an explicit mismatched normalized region", async () => {
+    _seedCredentials("owner-token-before-conflict", "us-east-1", Date.now() - 1000);
+    mockRefresh.mockResolvedValue({
+      access: "owner-token-after-conflict",
+      refresh: "rt2|||idc||",
+      expires: Date.now() + 3600_000,
+    });
+    mockStreamKiro.mockImplementation(okStream);
+    const server = await startGatewayServer(0);
+    try {
+      const refreshed = await fetch(`http://127.0.0.1:${server.port}/v1/messages`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "claude-sonnet-4-6", messages: [{ role: "user", content: "refresh" }] }),
+      });
+      expect(refreshed.status).toBe(200);
+
+      const conflict = await fetch(`http://127.0.0.1:${server.port}/v1/messages`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer owner-token-before-conflict",
+          [OPENCODE_REGION_HEADER]: "eu-west-1",
+        },
+        body: JSON.stringify({ model: "claude-sonnet-4-6", messages: [{ role: "user", content: "conflict" }] }),
+      });
+      expect(conflict.status).toBe(409);
+      expect(await conflict.json()).toMatchObject({ error: { message: expect.stringContaining("region") } });
+      expect(mockStreamKiro).toHaveBeenCalledTimes(1);
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  it("rejects owner profile conflicts on models before catalog calls", async () => {
+    const ownerProfile = "arn:aws:codewhisperer:eu-west-1:1:profile/OWNER";
+    _seedCredentials("owner-model-token", "eu-west-1", Date.now() + 60_000, ownerProfile);
+    const server = await startGatewayServer(0);
+    const nativeFetch = globalThis.fetch;
+    const managementFetch = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("must not fetch catalog"));
+    try {
+      const response = await nativeFetch(`http://127.0.0.1:${server.port}/v1/models?refresh=1`, {
+        headers: {
+          Authorization: "Bearer owner-model-token",
+          [OPENCODE_REGION_HEADER]: "eu-central-1",
+          [OPENCODE_PROFILE_ARN_HEADER]: "arn:aws:codewhisperer:eu-west-1:1:profile/OTHER",
+        },
+      });
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({ error: { message: expect.stringContaining("profile") } });
+      expect(managementFetch).not.toHaveBeenCalled();
+    } finally {
+      managementFetch.mockRestore();
+      await server.stop(true);
+    }
+  });
+
+  it("accepts an explicitly equivalent normalized owner region", async () => {
+    _seedCredentials("equivalent-region-owner", "eu-west-1", Date.now() + 60_000);
+    mockStreamKiro.mockImplementation(okStream);
+    const server = await startGatewayServer(0);
+    try {
+      const response = await fetch(`http://127.0.0.1:${server.port}/v1/messages`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer equivalent-region-owner",
+          [OPENCODE_REGION_HEADER]: "eu-central-1",
+        },
+        body: JSON.stringify({ model: "claude-sonnet-4-6", messages: [{ role: "user", content: "ok" }] }),
+      });
+      expect(response.status).toBe(200);
+      expect((mockStreamKiro.mock.calls[0] as any[])[2]).toMatchObject({
+        apiKey: "equivalent-region-owner",
+        cacheProfileArn: true,
+      });
+    } finally {
+      await server.stop(true);
+    }
   });
 
   it("routes a rotated owner bearer by stable profile identity", async () => {

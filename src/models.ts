@@ -7,6 +7,7 @@
 
 import { log } from "./debug";
 import type { KiroNativeEffort, ThinkingLevel } from "./types";
+import { createHash } from "node:crypto";
 
 /** Canonical Kiro API IDs (dot form) accepted by the server. */
 export const KIRO_MODEL_IDS = new Set<string>([
@@ -280,6 +281,7 @@ export const kiroModels: KiroModel[] = [
     effortRequestField: "output_config",
     supportsThinkingConfig: true,
     supportsMaxTokens: true,
+    reasoningHidden: true,
   },
   {
     ...KIRO_DEFAULTS,
@@ -525,16 +527,36 @@ function normalizeSupportedEfforts(nativeEfforts: KiroNativeEffort[] | undefined
   return normalized.length > 0 ? [...new Set(normalized)] : undefined;
 }
 
-let cachedProfileArn: string | null = null;
+const cachedProfileArns = new Map<string, string>();
+const PROFILE_ARN_CACHE_MAX_ENTRIES = 64;
 let profileArnSkipResolution = false;
 
+function profileCacheKey(accessToken: string, apiRegion: string): string {
+  return createHash("sha256").update(`${accessToken}\0${apiRegion}`).digest("hex");
+}
+
+function cacheProfileArn(key: string, arn: string): void {
+  cachedProfileArns.delete(key);
+  cachedProfileArns.set(key, arn);
+  while (cachedProfileArns.size > PROFILE_ARN_CACHE_MAX_ENTRIES) {
+    const oldest = cachedProfileArns.keys().next().value;
+    if (!oldest) break;
+    cachedProfileArns.delete(oldest);
+  }
+}
+
+function managementSignal(signal?: AbortSignal): AbortSignal {
+  const timeout = AbortSignal.timeout(10_000);
+  return signal ? AbortSignal.any([signal, timeout]) : timeout;
+}
+
 export function resetProfileArnCache(skipResolution = false): void {
-  cachedProfileArn = null;
+  cachedProfileArns.clear();
   profileArnSkipResolution = skipResolution;
 }
 
-export function seedProfileArn(arn: string): void {
-  cachedProfileArn = arn;
+export function seedProfileArn(arn: string, accessToken: string, apiRegion: string): void {
+  cacheProfileArn(profileCacheKey(accessToken, apiRegion), arn);
 }
 
 /**
@@ -546,16 +568,19 @@ export async function resolveProfileArn(
   accessToken: string,
   apiRegion: string,
   useCache = true,
+  signal?: AbortSignal,
 ): Promise<string | null> {
   if (profileArnSkipResolution) return null;
-  if (useCache && cachedProfileArn !== null) return cachedProfileArn;
+  const cacheKey = profileCacheKey(accessToken, apiRegion);
+  const cached = cachedProfileArns.get(cacheKey);
+  if (useCache && cached !== undefined) return cached;
 
   const endpoint = `https://management.${apiRegion}.kiro.dev/`;
   const resp = await fetch(endpoint, {
     method: "POST",
     headers: kiroManagementHeaders(accessToken, KIRO_MANAGEMENT_TARGET.listAvailableProfiles),
     body: "{}",
-    signal: AbortSignal.timeout(10_000),
+    signal: managementSignal(signal),
   });
   if (!resp || !resp.ok) return null;
 
@@ -567,7 +592,7 @@ export async function resolveProfileArn(
   const arn = kiroProfile?.arn ?? profiles[0]?.arn ?? null;
   
   if (arn && useCache) {
-    cachedProfileArn = arn;
+    cacheProfileArn(cacheKey, arn);
   }
   return arn;
 }
@@ -581,6 +606,7 @@ export async function fetchAvailableModels(
   accessToken: string,
   apiRegion: string,
   profileArn: string,
+  signal?: AbortSignal,
 ): Promise<KiroApiModel[]> {
   const url = `https://management.${apiRegion}.kiro.dev/?origin=${KIRO_CLI_ORIGIN}&profileArn=${encodeURIComponent(
     profileArn,
@@ -613,7 +639,7 @@ export async function fetchAvailableModels(
       method,
       headers: kiroManagementHeaders(accessToken, target),
       body: JSON.stringify({ origin: KIRO_CLI_ORIGIN, profileArn }),
-      signal: AbortSignal.timeout(10_000),
+      signal: managementSignal(signal),
     });
   } catch (error) {
     logError(error);
@@ -730,6 +756,7 @@ export function buildModelsFromApi(apiModels: KiroApiModel[]): KiroModel[] {
       ...(effortRequestField ? { effortRequestField } : {}),
       ...(supportsMaxTokens ? { supportsMaxTokens } : {}),
       ...(supportsThinkingConfig ? { supportsThinkingConfig } : {}),
+      ...(staticModel?.reasoningHidden ? { reasoningHidden: true } : {}),
     };
   });
 }
