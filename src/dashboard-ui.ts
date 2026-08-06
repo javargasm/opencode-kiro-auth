@@ -172,6 +172,91 @@ export function getDashboardHtml(nonce: string): string {
       text-shadow: 0 0 10px rgba(0, 255, 65, 0.4);
     }
 
+    .credit-usage-card {
+      background: var(--panel-bg);
+      border: 1px solid var(--border);
+      padding: 0.7rem 1rem;
+      margin-top: 1rem;
+      margin-bottom: 0;
+      display: grid;
+      grid-template-columns: minmax(145px, auto) minmax(140px, 1fr) auto;
+      align-items: center;
+      gap: 0.75rem;
+    }
+
+    .credit-usage-header,
+    .credit-usage-footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+    }
+
+    .credit-usage-percent {
+      color: var(--text);
+      font-size: 0.8rem;
+      font-weight: bold;
+    }
+
+    .credit-bar {
+      height: 0.6rem;
+      margin: 0;
+      border: 1px solid var(--border);
+      background: rgba(0, 255, 65, 0.08);
+      overflow: hidden;
+    }
+
+    .credit-bar-fill {
+      width: 0;
+      height: 100%;
+      background: var(--primary);
+      box-shadow: 0 0 12px var(--primary);
+      transition: width 0.3s ease, background-color 0.3s ease, box-shadow 0.3s ease;
+    }
+
+    .credit-bar-fill[data-level="warning"] {
+      background: #ffd166;
+      box-shadow: 0 0 12px #ffd166;
+    }
+
+    .credit-bar-fill[data-level="critical"] {
+      background: #ff3b3b;
+      box-shadow: 0 0 12px #ff3b3b;
+    }
+
+    .credit-usage-footer {
+      color: var(--text);
+      font-size: 0.7rem;
+      text-transform: uppercase;
+      flex-wrap: wrap;
+      white-space: nowrap;
+    }
+
+    .credit-usage-footer strong {
+      color: var(--secondary);
+      font-size: 0.85rem;
+    }
+
+    .credit-plan {
+      color: var(--secondary);
+      margin-left: auto;
+      min-width: 0;
+      max-width: 180px;
+      overflow-wrap: anywhere;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    @media (max-width: 600px) {
+      body { padding: 1rem; }
+      header { align-items: flex-start; flex-direction: column; gap: 1rem; }
+      .header-actions { width: 100%; justify-content: space-between; }
+      .credit-usage-card { grid-template-columns: 1fr; gap: 0.5rem; }
+      .credit-plan { flex-basis: 100%; margin-left: 0; }
+      th, td { padding: 0.7rem; }
+    }
+
     .table-container {
       background: var(--panel-bg);
       border: 1px solid var(--border);
@@ -252,10 +337,10 @@ export function getDashboardHtml(nonce: string): string {
       <button id="toggle-currency" type="button" class="status-badge status-button">
         SHOW USD
       </button>
-      <button id="auth-status" type="button" class="status-badge status-button">
+      <div id="auth-status" class="status-badge">
         <div class="pulse"></div>
-        <span id="auth-status-text">AUTH.REQUIRED</span>
-      </button>
+        <span id="auth-status-text">AUTH.CHECKING</span>
+      </div>
     </div>
   </header>
 
@@ -294,42 +379,38 @@ export function getDashboardHtml(nonce: string): string {
     </table>
   </div>
 
+  <footer class="credit-usage-card" aria-labelledby="credit-usage-label">
+    <div class="credit-usage-header">
+      <div class="metric-label" id="credit-usage-label">ACCOUNT.CREDITS</div>
+      <div class="credit-usage-percent" id="credit-usage-percent">--%</div>
+    </div>
+    <div
+      class="credit-bar"
+      id="credit-bar"
+      role="progressbar"
+      aria-label="Account credit usage"
+      aria-valuemin="0"
+      aria-valuemax="100"
+      aria-valuenow="0"
+    >
+      <div class="credit-bar-fill" id="credit-bar-fill"></div>
+    </div>
+    <div class="credit-usage-footer">
+      <span><strong id="credit-used">0</strong> USED</span>
+      <span><strong id="credit-total">0</strong> TOTAL</span>
+      <span class="credit-plan" id="credit-plan">USAGE.UNAVAILABLE</span>
+    </div>
+  </footer>
+
   <script nonce="${nonce}">
     let lastRenderedIds = new Set();
-    let gatewayToken = '';
     let fetchInFlight = false;
-    let authPromptPending = false;
+    let usageFetchInFlight = false;
 
     function setAuthStatus(text, online = false) {
       document.getElementById('auth-status-text').textContent = text;
       const pulse = document.querySelector('#auth-status .pulse');
       pulse.classList.toggle('online', online);
-    }
-
-    function clearGatewayToken() {
-      gatewayToken = '';
-    }
-
-    function promptForGatewayToken(message) {
-      const supplied = window.prompt(message, '');
-      if (typeof supplied !== 'string' || !supplied.trim()) {
-        setAuthStatus('AUTH.REQUIRED');
-        return false;
-      }
-
-      gatewayToken = supplied.trim();
-      setAuthStatus('AUTH.CHECKING');
-      return true;
-    }
-
-    function scheduleAuthPrompt(message) {
-      if (authPromptPending) return;
-      authPromptPending = true;
-      // Yield once so an authentication failure is painted before re-prompting.
-      setTimeout(() => {
-        authPromptPending = false;
-        if (promptForGatewayToken(message)) void fetchStats();
-      }, 0);
     }
 
     function formatTime(timestamp) {
@@ -343,12 +424,34 @@ export function getDashboardHtml(nonce: string): string {
       return Number.isFinite(number) ? number : 0;
     }
 
+    function clampPercent(value) {
+      return Math.max(0, Math.min(100, finiteNumber(value)));
+    }
+
     function appendCell(row, value, className) {
       const cell = document.createElement('td');
       if (className) cell.className = className;
       cell.textContent = String(value);
       row.append(cell);
       return cell;
+    }
+
+    function updateCreditUsage(data) {
+      const used = finiteNumber(data.creditsUsed);
+      const total = finiteNumber(data.creditsTotal);
+      const hasLimit = total > 0 && !data.error;
+      const percent = hasLimit ? clampPercent(data.percentage) : 0;
+      const level = percent >= 90 ? 'critical' : percent >= 70 ? 'warning' : 'safe';
+      const fill = document.getElementById('credit-bar-fill');
+      const bar = document.getElementById('credit-bar');
+
+      document.getElementById('credit-used').textContent = used.toLocaleString();
+      document.getElementById('credit-total').textContent = total.toLocaleString();
+      document.getElementById('credit-usage-percent').textContent = hasLimit ? percent.toFixed(2) + '%' : '--%';
+      document.getElementById('credit-plan').textContent = data.planTitle || (data.error ? 'USAGE.ERROR' : 'USAGE.UNAVAILABLE');
+      fill.style.width = hasLimit ? percent + '%' : '0%';
+      fill.dataset.level = level;
+      bar.setAttribute('aria-valuenow', String(percent));
     }
 
     let showUsd = false;
@@ -369,24 +472,17 @@ export function getDashboardHtml(nonce: string): string {
 
     async function fetchStats() {
       if (fetchInFlight) return;
-      if (!gatewayToken) {
-        setAuthStatus('AUTH.REQUIRED');
-        return;
-      }
 
       fetchInFlight = true;
       try {
         const res = await fetch('/dashboard/api/stats', {
           method: 'GET',
-          headers: { 'x-api-key': gatewayToken },
           cache: 'no-store',
-          credentials: 'omit',
+          credentials: 'same-origin',
           referrerPolicy: 'no-referrer',
         });
         if (res.status === 401) {
-          clearGatewayToken();
           setAuthStatus('AUTH.REJECTED');
-          scheduleAuthPrompt('Telemetry authentication failed (401). Re-enter the local gateway token:');
           return;
         }
         if (!res.ok) throw new Error('Telemetry request failed: HTTP ' + res.status);
@@ -463,19 +559,39 @@ export function getDashboardHtml(nonce: string): string {
       }
     }
 
-    document.getElementById('auth-status').addEventListener('click', () => {
-      scheduleAuthPrompt('Enter the local gateway token for protected telemetry:');
-    });
+    async function fetchUsage() {
+      if (usageFetchInFlight) return;
+
+      usageFetchInFlight = true;
+      try {
+        const res = await fetch('/dashboard/api/usage', {
+          method: 'GET',
+          cache: 'no-store',
+          credentials: 'same-origin',
+          referrerPolicy: 'no-referrer',
+        });
+        if (res.status === 401) {
+          setAuthStatus('AUTH.REJECTED');
+          return;
+        }
+        if (!res.ok) throw new Error('Credit usage request failed: HTTP ' + res.status);
+        updateCreditUsage(await res.json());
+      } catch (err) {
+        document.getElementById('credit-plan').textContent = 'USAGE.ERROR';
+        console.error('Credit usage connection lost', err);
+      } finally {
+        usageFetchInFlight = false;
+      }
+    }
 
     document.getElementById('toggle-currency').addEventListener('click', toggleCurrency);
 
-    if (gatewayToken) {
-      fetchStats();
-    } else {
-      scheduleAuthPrompt('Enter the local gateway token for protected telemetry:');
-    }
+    fetchStats();
+    fetchUsage();
     // Poll every 1.5s
     setInterval(fetchStats, 1500);
+    // The gateway caches account usage for 20 seconds.
+    setInterval(fetchUsage, 20000);
   </script>
 </body>
 </html>`;

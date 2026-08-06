@@ -164,7 +164,10 @@ function installGatewayCredentials(credentials: GatewayCredentials | null): void
   attachingCatalogsInFlight.clear();
   ownerAccessTokenAliases.clear();
   _creds = credentials;
-  if (!credentials) return;
+  if (!credentials) {
+    stopGatewayUsageRefresh();
+    return;
+  }
   rememberOwnerAccessToken(credentials.accessToken);
   if (credentials.profileArn) {
     seedProfileArn(
@@ -352,6 +355,8 @@ export async function initGatewayAuth(): Promise<void> {
       }
     }
 
+    startGatewayUsageRefresh();
+
     // Catalog discovery can require two management calls. Do not keep /health
     // in a "starting" state while those endpoints are slow or offline; the
     // config hook applies a short budget and falls back to static models while
@@ -499,7 +504,7 @@ async function getAccessToken(signal?: AbortSignal): Promise<string> {
 // ── Kiro account usage limits (credits) ──────────────────────────────
 // Mirrors pi-usage-bars fetchKiroUsage: calls AmazonCodeWhispererService
 // .GetUsageLimits and returns a percentage (used/limit) for the TUI bar.
-// Cached for 2 min to avoid hammering AWS from the TUI poll loop.
+// Cached for 20s to avoid hammering AWS from the TUI/dashboard poll loops.
 
 export interface KiroUsageLimits {
   percentage: number;
@@ -513,7 +518,9 @@ export interface KiroUsageLimits {
 let _usageCache: { data: KiroUsageLimits; at: number } | null = null;
 let _usageInFlight: Promise<KiroUsageLimits> | null = null;
 let _usageAbortController: AbortController | null = null;
-const USAGE_CACHE_MS = 120_000;
+let _usageRefreshTimer: ReturnType<typeof setInterval> | null = null;
+export const USAGE_REFRESH_MS = 20_000;
+export const USAGE_CACHE_MS = USAGE_REFRESH_MS;
 export const USAGE_REQUEST_TIMEOUT_MS = 10_000;
 
 function formatDuration(sec: number): string {
@@ -526,9 +533,9 @@ function formatDuration(sec: number): string {
 }
 
 export async function fetchKiroUsageLimits(
-  options: { timeoutMs?: number } = {},
+  options: { timeoutMs?: number; force?: boolean } = {},
 ): Promise<KiroUsageLimits> {
-  if (_usageCache && Date.now() - _usageCache.at < USAGE_CACHE_MS) {
+  if (!options.force && _usageCache && Date.now() - _usageCache.at < USAGE_CACHE_MS) {
     return _usageCache.data;
   }
   if (_usageInFlight) return _usageInFlight;
@@ -542,15 +549,18 @@ export async function fetchKiroUsageLimits(
   const stale = _usageCache?.data;
   const accountUnchanged = () => _credentialGeneration === generation && _creds === credentials;
   const failure = (message: string): KiroUsageLimits => {
-    if (accountUnchanged() && stale) return { ...stale, error: message };
-    return {
-      percentage: 0,
-      creditsUsed: 0,
-      creditsTotal: 0,
-      planTitle: null,
-      monthlyResetsIn: null,
-      error: message,
-    };
+    const data = accountUnchanged() && stale
+      ? { ...stale, error: message }
+      : {
+          percentage: 0,
+          creditsUsed: 0,
+          creditsTotal: 0,
+          planTitle: null,
+          monthlyResetsIn: null,
+          error: message,
+        };
+    if (accountUnchanged()) _usageCache = { data, at: Date.now() };
+    return data;
   };
 
   const abortController = new AbortController();
@@ -663,6 +673,30 @@ export async function fetchKiroUsageLimits(
   }
 }
 
+/** Keep the owner process's usage cache warm; readers should normally hit it. */
+export function startGatewayUsageRefresh(): void {
+  if (_usageRefreshTimer || !_creds) return;
+
+  const refresh = () => {
+    if (!_creds) return;
+    void fetchKiroUsageLimits({ force: true }).catch((error) => {
+      log.warn("[gateway-usage] Background refresh failed", error);
+    });
+  };
+
+  _usageRefreshTimer = setInterval(refresh, USAGE_REFRESH_MS);
+  (_usageRefreshTimer as unknown as { unref?: () => void }).unref?.();
+  refresh();
+}
+
+export function stopGatewayUsageRefresh(): void {
+  if (_usageRefreshTimer) {
+    clearInterval(_usageRefreshTimer);
+    _usageRefreshTimer = null;
+  }
+  _usageAbortController?.abort(new Error("Gateway usage refresh stopped"));
+}
+
 function resetUsageState(): void {
   _usageAbortController?.abort(new Error("Usage state reset"));
   _usageAbortController = null;
@@ -771,6 +805,62 @@ const DASHBOARD_RESPONSE_HEADERS = {
   "Referrer-Policy": "no-referrer",
   "X-Content-Type-Options": "nosniff",
 } as const;
+
+const DASHBOARD_SESSION_COOKIE = "opencode-kiro-dashboard";
+const DASHBOARD_SESSION_MAX_AGE_SECONDS = 3600;
+const DASHBOARD_SESSION_MAX_ENTRIES = 64;
+
+function createDashboardSession(sessions: Map<string, number>): string {
+  const now = Date.now();
+  for (const [token, expiresAt] of sessions) {
+    if (expiresAt <= now) sessions.delete(token);
+  }
+  while (sessions.size >= DASHBOARD_SESSION_MAX_ENTRIES) {
+    const oldest = sessions.keys().next().value;
+    if (!oldest) break;
+    sessions.delete(oldest);
+  }
+
+  const token = randomBytes(32).toString("hex");
+  sessions.set(token, now + DASHBOARD_SESSION_MAX_AGE_SECONDS * 1000);
+  return token;
+}
+
+function readCookie(req: Request, name: string): string | undefined {
+  const prefix = `${name}=`;
+  for (const part of (req.headers.get("cookie") ?? "").split(";")) {
+    const value = part.trim();
+    if (value.startsWith(prefix)) return value.slice(prefix.length);
+  }
+  return undefined;
+}
+
+function dashboardSessionCookie(sessionToken: string): string {
+  return [
+    `${DASHBOARD_SESSION_COOKIE}=${sessionToken}`,
+    "Path=/dashboard",
+    "HttpOnly",
+    "SameSite=Strict",
+    `Max-Age=${DASHBOARD_SESSION_MAX_AGE_SECONDS}`,
+  ].join("; ");
+}
+
+function hasValidDashboardRequestAuth(
+  req: Request,
+  gatewayToken: string | undefined,
+  sessions: Map<string, number>,
+): boolean {
+  if (!gatewayToken || hasValidGatewayRequestAuth(req, gatewayToken)) return true;
+  const sessionToken = readCookie(req, DASHBOARD_SESSION_COOKIE);
+  if (!sessionToken) return false;
+  const expiresAt = sessions.get(sessionToken);
+  if (expiresAt === undefined) return false;
+  if (expiresAt <= Date.now()) {
+    sessions.delete(sessionToken);
+    return false;
+  }
+  return true;
+}
 
 function dashboardError(status: 401 | 403, message: string): Response {
   const response = anthropicError(status, "authentication_error", message);
@@ -934,6 +1024,7 @@ export function startGatewayServer(
   options: GatewayServerOptions = {},
 ): Promise<Server<any>> {
   return new Promise((resolve) => {
+    const dashboardSessions = new Map<string, number>();
     const server = Bun.serve({
       hostname: "127.0.0.1",
       port,
@@ -980,20 +1071,24 @@ export function startGatewayServer(
         // Dashboard endpoints
         if (url.pathname === "/dashboard") {
           const nonce = randomBytes(18).toString("base64");
+          const headers: Record<string, string> = {
+            "Content-Type": "text/html; charset=utf-8",
+            ...DASHBOARD_RESPONSE_HEADERS,
+            "Content-Security-Policy": `default-src 'none'; connect-src 'self'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`,
+            "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+          };
+          if (options.gatewayToken) {
+            headers["Set-Cookie"] = dashboardSessionCookie(createDashboardSession(dashboardSessions));
+          }
           return new Response(getDashboardHtml(nonce), {
-            headers: {
-              "Content-Type": "text/html; charset=utf-8",
-              ...DASHBOARD_RESPONSE_HEADERS,
-              "Content-Security-Policy": `default-src 'none'; connect-src 'self'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`,
-              "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
-            },
+            headers,
           });
         }
         if (url.pathname === "/dashboard/api/stats") {
           if (isDisallowedBrowserRequest(req)) {
             return dashboardError(403, "Browser origin not allowed");
           }
-          if (!hasValidGatewayRequestAuth(req, options.gatewayToken)) {
+          if (!hasValidDashboardRequestAuth(req, options.gatewayToken, dashboardSessions)) {
             return dashboardError(401, "Invalid local gateway token");
           }
           return new Response(JSON.stringify(stats.getStats()), {
@@ -1008,7 +1103,7 @@ export function startGatewayServer(
           if (isDisallowedBrowserRequest(req)) {
             return dashboardError(403, "Browser origin not allowed");
           }
-          if (!hasValidGatewayRequestAuth(req, options.gatewayToken)) {
+          if (!hasValidDashboardRequestAuth(req, options.gatewayToken, dashboardSessions)) {
             return dashboardError(401, "Invalid local gateway token");
           }
           const usage = await fetchKiroUsageLimits();

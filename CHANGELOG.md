@@ -1,5 +1,21 @@
 # @javargasm/opencode-kiro-auth
 
+## 8.2.1
+
+### Patch Changes
+
+- Improve dashboard telemetry access and account credit reporting.
+
+  Dashboard:
+
+  - Remove the manual gateway-token prompt and authenticate same-origin telemetry with a short-lived, opaque `HttpOnly` session cookie without embedding the gateway secret in the HTML.
+  - Add a compact responsive footer bar showing consumed credits, total credits, percentage used, plan status, and color thresholds for normal, warning, and critical usage.
+
+  Usage cache:
+
+  - Refresh account usage immediately and every 20 seconds in the owned gateway process while serving dashboard and TUI reads from the shared cache.
+  - Stop background refresh on gateway disposal, prevent duplicate refreshes for shared gateway attachments, and cache failure responses for the same interval.
+
 ## 8.2.0
 
 ### Minor Changes

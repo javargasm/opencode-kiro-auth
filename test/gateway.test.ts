@@ -11,6 +11,10 @@ import {
   fetchKiroUsageLimits,
   refreshGatewayModels,
   startGatewayServer,
+  USAGE_CACHE_MS,
+  USAGE_REFRESH_MS,
+  startGatewayUsageRefresh,
+  stopGatewayUsageRefresh,
   _clearCredentials,
   _hasValidGatewayRequestAuthForTest,
   _resetGatewayNoncesForTest,
@@ -315,6 +319,66 @@ describe("Local HTTP Gateway Server (Anthropic Protocol)", () => {
     }
   });
 
+  it("serves usage from the gateway cache for 20 seconds", async () => {
+    const profileArn = "arn:aws:codewhisperer:us-east-1:123:profile/cache";
+    _seedCredentials("cache-access-token", "us-east-1", Date.now() + 60_000, profileArn);
+    const upstream = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
+      usageBreakdownList: [{ currentUsage: 2, usageLimit: 10 }],
+    }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    vi.useFakeTimers();
+
+    try {
+      expect(USAGE_CACHE_MS).toBe(20_000);
+      expect((await fetchKiroUsageLimits()).creditsUsed).toBe(2);
+      expect((await fetchKiroUsageLimits()).creditsUsed).toBe(2);
+      expect(upstream).toHaveBeenCalledTimes(1);
+
+      vi.advanceTimersByTime(USAGE_CACHE_MS - 1);
+      expect((await fetchKiroUsageLimits()).creditsUsed).toBe(2);
+      expect(upstream).toHaveBeenCalledTimes(1);
+
+      upstream.mockResolvedValueOnce(new Response(JSON.stringify({
+        usageBreakdownList: [{ currentUsage: 4, usageLimit: 10 }],
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+      vi.advanceTimersByTime(1);
+      expect((await fetchKiroUsageLimits()).creditsUsed).toBe(4);
+      expect(upstream).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+      upstream.mockRestore();
+    }
+  });
+
+  it("refreshes the usage cache from the gateway every 20 seconds", async () => {
+    const profileArn = "arn:aws:codewhisperer:us-east-1:123:profile/background-cache";
+    _seedCredentials("background-cache-token", "us-east-1", Date.now() + 60_000, profileArn);
+    const upstream = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
+      usageBreakdownList: [{ currentUsage: 2, usageLimit: 10 }],
+    }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    vi.useFakeTimers();
+
+    try {
+      startGatewayUsageRefresh();
+      expect((await fetchKiroUsageLimits({ force: true })).creditsUsed).toBe(2);
+      expect(upstream).toHaveBeenCalledTimes(1);
+
+      upstream.mockResolvedValueOnce(new Response(JSON.stringify({
+        usageBreakdownList: [{ currentUsage: 4, usageLimit: 10 }],
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+      vi.advanceTimersByTime(USAGE_REFRESH_MS);
+      expect((await fetchKiroUsageLimits({ force: true })).creditsUsed).toBe(4);
+      expect(upstream).toHaveBeenCalledTimes(2);
+
+      stopGatewayUsageRefresh();
+      vi.advanceTimersByTime(USAGE_REFRESH_MS * 2);
+      expect(upstream).toHaveBeenCalledTimes(2);
+    } finally {
+      stopGatewayUsageRefresh();
+      vi.useRealTimers();
+      upstream.mockRestore();
+    }
+  });
+
   it("protects dashboard stats with auth, browser-origin, and loopback Host checks", async () => {
     const gatewayToken = "dashboard-stats-gateway-token-long";
     const server = await startGatewayServer(0, { gatewayToken });
@@ -338,7 +402,7 @@ describe("Local HTTP Gateway Server (Anthropic Protocol)", () => {
     }
   });
 
-  it("keeps dashboard telemetry token-free, memory-only, and safe for untrusted stats", async () => {
+  it("authenticates dashboard telemetry automatically without embedding the gateway token", async () => {
     const gatewayToken = "dashboard-html-secret-that-must-not-be-embedded";
     const server = await startGatewayServer(0, { gatewayToken });
     const origin = `http://127.0.0.1:${server.port}`;
@@ -347,6 +411,12 @@ describe("Local HTTP Gateway Server (Anthropic Protocol)", () => {
       expect(response.status).toBe(200);
       expect(response.headers.get("cache-control")).toBe("no-store");
       expect(response.headers.get("referrer-policy")).toBe("no-referrer");
+      const sessionCookie = response.headers.get("set-cookie") ?? "";
+      expect(sessionCookie).toMatch(/^opencode-kiro-dashboard=/);
+      expect(sessionCookie).toContain("Path=/dashboard");
+      expect(sessionCookie).toContain("HttpOnly");
+      expect(sessionCookie).toContain("SameSite=Strict");
+      expect(sessionCookie).toContain("Max-Age=3600");
       const csp = response.headers.get("content-security-policy") ?? "";
       expect(csp).toContain("connect-src 'self'");
       expect(csp).not.toContain("'unsafe-inline'");
@@ -356,13 +426,21 @@ describe("Local HTTP Gateway Server (Anthropic Protocol)", () => {
       const html = await response.text();
       expect(html).toContain(`<script nonce="${nonce}">`);
       expect(html).toContain(`<style nonce="${nonce}">`);
-      expect(html).toContain("headers: { 'x-api-key': gatewayToken }");
+      expect(html).toContain("credentials: 'same-origin'");
+      expect(html).toContain("/dashboard/api/usage");
+      expect(html).toContain("credit-bar-fill");
+      expect(html).toContain('<footer class="credit-usage-card"');
+      expect(html).toContain("grid-template-columns: minmax(145px, auto) minmax(140px, 1fr) auto");
+      expect(html).toContain("creditsUsed");
+      expect(html).toContain("creditsTotal");
+      expect(html).toContain("setInterval(fetchUsage, 20000)");
       expect(html).toContain("res.status === 401");
-      expect(html).toContain("clearGatewayToken()");
       expect(html).toContain("document.createElement('td')");
       expect(html).toContain("tbody.replaceChildren(fragment)");
       expect(html).not.toContain("sessionStorage");
       expect(html).not.toContain("innerHTML");
+      expect(html).not.toContain("window.prompt");
+      expect(html).not.toContain("local gateway token");
       expect(html).not.toMatch(/\s(?:style|onclick)=/);
       expect(html).not.toContain(gatewayToken);
       expect(html).not.toMatch(/[?&](?:token|api[-_]?key)=/i);
@@ -371,6 +449,13 @@ describe("Local HTTP Gateway Server (Anthropic Protocol)", () => {
       expect((await fetch(`${origin}/dashboard/api/stats`, {
         headers: { "x-api-key": gatewayToken },
       })).status).toBe(200);
+      const dashboardCookie = sessionCookie.split(";", 1)[0]!;
+      expect((await fetch(`${origin}/dashboard/api/stats`, {
+        headers: { Cookie: dashboardCookie },
+      })).status).toBe(200);
+      expect((await fetch(`${origin}/v1/models`, {
+        headers: { Cookie: dashboardCookie },
+      })).status).toBe(401);
     } finally {
       await server.stop(true);
     }

@@ -9,6 +9,7 @@ import {
   OPENCODE_EFFORT_HEADER,
   OPENCODE_PROFILE_ARN_HEADER,
   OPENCODE_REGION_HEADER,
+  stopGatewayUsageRefresh,
   startGatewayServer,
 } from "./server";
 import {
@@ -716,6 +717,7 @@ export const KiroPlugin: Plugin = async (input) => {
         const server = gatewayServer;
         gatewayServer = null;
         gatewayMode = "stopped";
+        stopGatewayUsageRefresh();
         log.info("[opencode-kiro] Shutting down owned gateway server...");
         const stopping = server.stop(true);
         gatewayStopping = stopping;

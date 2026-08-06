@@ -12,7 +12,7 @@ import { fetchVerifiedGatewayJson, readGatewayToken } from "./tui-gateway";
 //   - reads usage over HTTP from the gateway (which lives in the server
 //     process) at /dashboard/api/usage.
 const GATEWAY_ORIGIN = "http://127.0.0.1:7438";
-const USAGE_REFRESH_MS = 30_000;
+const USAGE_REFRESH_MS = 20_000;
 const DETECT_POLL_MS = 2_000;
 const FETCH_TIMEOUT_MS = 3_000;
 const LOG_FILE = "/tmp/kiro-logs/tui.log";
