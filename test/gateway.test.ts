@@ -2242,4 +2242,92 @@ describe("Gateway bug fixes (#2, #3, #7, #13)", () => {
       await server.stop(true);
     }
   });
+
+  describe("Gateway Restart & Robust Error Handling", () => {
+    it("authenticates /v1/restart and triggers onRestart callback", async () => {
+      let restartTriggered = false;
+      const gatewayToken = "mock-gateway-token-12345678901234567890123456789012";
+      const server = await startGatewayServer(0, {
+        gatewayToken,
+        onRestart: () => {
+          restartTriggered = true;
+        },
+      });
+
+      try {
+        const unauth = await fetch(`http://127.0.0.1:${server.port}/v1/restart`, {
+          method: "POST",
+        });
+        expect(unauth.status).toBe(401);
+
+        const auth = await fetch(`http://127.0.0.1:${server.port}/v1/restart`, {
+          method: "POST",
+          headers: { "x-api-key": gatewayToken },
+        });
+        expect(auth.status).toBe(200);
+        const body = await auth.json() as any;
+        expect(body.status).toBe("restarting");
+
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        expect(restartTriggered).toBe(true);
+      } finally {
+        await server.stop(true);
+      }
+    });
+
+    it("authenticates /dashboard/api/restart endpoint", async () => {
+      let restartTriggered = false;
+      const gatewayToken = "mock-gateway-token-12345678901234567890123456789012";
+      const server = await startGatewayServer(0, {
+        gatewayToken,
+        onRestart: () => {
+          restartTriggered = true;
+        },
+      });
+
+      try {
+        const resp = await fetch(`http://127.0.0.1:${server.port}/dashboard/api/restart`, {
+          method: "POST",
+          headers: { "x-api-key": gatewayToken },
+        });
+        expect(resp.status).toBe(200);
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        expect(restartTriggered).toBe(true);
+      } finally {
+        await server.stop(true);
+      }
+    });
+
+    it("handles missing/throwing kiroStream.result() gracefully in non-streaming mode", async () => {
+      mockStreamKiro.mockImplementation(() => ({
+        async *[Symbol.asyncIterator]() {
+          // empty
+        },
+        result: () => {
+          throw new Error("Simulated stream result failure");
+        },
+      }));
+
+      const server = await startGatewayServer(0);
+      try {
+        const resp = await fetch(`http://127.0.0.1:${server.port}/v1/messages`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: "Bearer mock-token",
+          },
+          body: JSON.stringify({
+            model: "claude-sonnet-4-6",
+            messages: [{ role: "user", content: "Hi" }],
+            stream: false,
+          }),
+        });
+        expect(resp.status).toBe(502);
+        const body = await resp.json() as any;
+        expect(body.error.message).toContain("Simulated stream result failure");
+      } finally {
+        await server.stop(true);
+      }
+    });
+  });
 });

@@ -132,6 +132,28 @@ interface GatewayCredentials {
 
 let _creds: GatewayCredentials | null = null;
 
+export function formatKiroErrorDetail(errorObj: unknown): string {
+  const raw = errorObj instanceof Error
+    ? errorObj.message
+    : typeof errorObj === "string"
+      ? errorObj
+      : (errorObj as any)?.errorMessage || (errorObj as any)?.message || String(errorObj ?? "");
+  if (!raw || raw === "error" || raw === "[object Object]") return "Unknown Kiro error";
+  try {
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const parsed = JSON.parse(jsonMatch[0]);
+      if (parsed?.message) {
+        const reason = parsed.reason ? ` (${parsed.reason})` : "";
+        return `${parsed.message}${reason}`;
+      }
+    }
+  } catch {
+    // fallback to raw
+  }
+  return raw;
+}
+
 // Single-flight guard: concurrent requests that all observe an expired token
 // must share ONE refresh, not fire N parallel refreshes. With rotating refresh
 // tokens (the desktop endpoint), parallel refreshes invalidate each other and
@@ -1017,6 +1039,7 @@ export function stripTitleMarkdown(text: string): string {
 export interface GatewayServerOptions {
   isReady?: () => boolean;
   gatewayToken?: string;
+  onRestart?: () => void | Promise<void>;
 }
 
 export function startGatewayServer(
@@ -1113,6 +1136,23 @@ export function startGatewayServer(
               ...DASHBOARD_RESPONSE_HEADERS,
               "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
             },
+          });
+        }
+
+        if ((url.pathname === "/v1/restart" || url.pathname === "/dashboard/api/restart") && req.method === "POST") {
+          if (isDisallowedBrowserRequest(req)) {
+            return anthropicError(403, "authentication_error", "Browser origin not allowed");
+          }
+          if (!hasValidGatewayRequestAuth(req, options.gatewayToken) && !hasValidDashboardRequestAuth(req, options.gatewayToken, dashboardSessions)) {
+            return anthropicError(401, "authentication_error", "Invalid local gateway token");
+          }
+          if (options.onRestart) {
+            setTimeout(() => {
+              void options.onRestart?.();
+            }, 50);
+          }
+          return new Response(JSON.stringify({ status: "restarting", message: "Gateway restart initiated" }), {
+            headers: { "Content-Type": "application/json" },
           });
         }
 
@@ -1388,6 +1428,18 @@ export function startGatewayServer(
               cacheProfileArn: ownerRequest,
               signal: upstreamSignal,
             });
+            const safeKiroStreamResult = async (stream: typeof kiroStream): Promise<any> => {
+              try {
+                if (!stream || typeof stream.result !== "function") {
+                  return { stopReason: "error", errorMessage: "Kiro stream initialization failed" };
+                }
+                return await stream.result();
+              } catch (err: unknown) {
+                const msg = err instanceof Error ? err.message : String(err);
+                log.error("[gateway] Error awaiting kiroStream.result():", msg);
+                return { stopReason: "error", errorMessage: msg };
+              }
+            };
 
             if (streamRequested) {
               // Buffer first event: if the stream fails immediately (auth, profileArn, etc.)
@@ -1429,7 +1481,7 @@ export function startGatewayServer(
               // If any buffered event is an error, return HTTP error
               const errorEvent = bufferedEvents.find((e) => e.type === "error");
               if (errorEvent) {
-                const errMsg = errorEvent.error?.errorMessage || errorEvent.reason || "Unknown Kiro error";
+                const errMsg = formatKiroErrorDetail(errorEvent.error ?? errorEvent.reason);
                 upstreamController.abort(new Error(errMsg));
                 log.error("[gateway] Kiro stream error:", errMsg);
                 return anthropicError(502, "api_error", `Kiro: ${errMsg}`);
@@ -1696,7 +1748,7 @@ export function startGatewayServer(
 
                     closeActiveBlock();
 
-                    const finalMsg = await kiroStream.result();
+                    const finalMsg = await safeKiroStreamResult(kiroStream);
                     // Surface a stream-level error that occurred AFTER the
                     // initial buffering (e.g. failure after MAX_RETRIES). Any
                     // partial content was already streamed, so emit an Anthropic
@@ -1709,7 +1761,7 @@ export function startGatewayServer(
                           type: "error",
                           error: {
                             type: "api_error",
-                            message: finalMsg.errorMessage || "Kiro stream error",
+                            message: formatKiroErrorDetail(finalMsg.errorMessage) || "Kiro stream error",
                           },
                         }) + "\n\n",
                       );
@@ -1810,11 +1862,11 @@ export function startGatewayServer(
                 }
               });
             } else {
-              const finalMsg = await kiroStream.result();
+              const finalMsg = await safeKiroStreamResult(kiroStream);
               // Surface stream-level errors instead of returning an empty,
               // successful-looking message.
               if (finalMsg.stopReason === "error" || finalMsg.errorMessage) {
-                return anthropicError(502, "api_error", `Kiro: ${finalMsg.errorMessage || "stream error"}`);
+                return anthropicError(502, "api_error", `Kiro: ${formatKiroErrorDetail(finalMsg.errorMessage)}`);
               }
               const contentParts = finalMsg.content;
               const anthropicContent: any[] = [];

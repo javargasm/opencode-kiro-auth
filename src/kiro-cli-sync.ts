@@ -71,6 +71,7 @@ interface SqliteStatement {
   all(): unknown[];
   get(...params: string[]): unknown;
   run(...params: string[]): unknown;
+  finalize?(): void;
 }
 
 interface SqliteDb {
@@ -83,6 +84,26 @@ interface SqliteDb {
 interface SqliteDatabaseConstructor {
   new (path: string, options?: { readonly?: boolean }): SqliteDb;
 }
+
+function withSqliteStatement<T>(
+  db: SqliteDb,
+  sql: string,
+  callback: (statement: SqliteStatement) => T,
+): T {
+  const statement = db.prepare(sql);
+  try {
+    return callback(statement);
+  } finally {
+    try {
+      statement.finalize?.();
+    } catch {
+      // A failed cleanup must not hide the operation result or prevent db.close().
+    }
+  }
+}
+
+/** @internal — deterministic SQLite statement-lifetime seam for focused tests. */
+export const _withKiroSqliteStatementForTest = withSqliteStatement;
 
 const SQLITE_CLI_TIMEOUT_MS = 5000;
 
@@ -412,8 +433,11 @@ async function importFromKiroDb(): Promise<KiroCliCredentials | null> {
 
       // Read auth_kv table
       try {
-        const stmt = db.prepare("SELECT key, value FROM auth_kv");
-        rows = stmt.all() as AuthKvRow[];
+        rows = withSqliteStatement(
+          db,
+          "SELECT key, value FROM auth_kv",
+          (stmt) => stmt.all() as AuthKvRow[],
+        );
       } catch {
         log.debug("Failed to read auth_kv table from Kiro DB");
         try { db.close(); } catch { /* ignore */ }
@@ -422,8 +446,11 @@ async function importFromKiroDb(): Promise<KiroCliCredentials | null> {
 
       // Try to read active profile ARN from state table
       try {
-        const stateStmt = db.prepare("SELECT value FROM state WHERE key = ?");
-        const stateRow = stateStmt.get("api.codewhisperer.profile") as
+        const stateRow = withSqliteStatement(
+          db,
+          "SELECT value FROM state WHERE key = ?",
+          (stmt) => stmt.get("api.codewhisperer.profile"),
+        ) as
           | { value?: unknown }
           | undefined;
         const parsed = safeJsonParse(stateRow?.value);
@@ -678,8 +705,11 @@ export async function saveKiroCliCredentials(creds: KiroCliCredentials): Promise
       }
 
       try {
-        const stmt = db.prepare("SELECT key, value FROM auth_kv");
-        rows = stmt.all() as AuthKvRow[];
+        rows = withSqliteStatement(
+          db,
+          "SELECT key, value FROM auth_kv",
+          (stmt) => stmt.all() as AuthKvRow[],
+        );
       } catch {
         log.debug("Failed to read auth_kv table for credential write-back");
         try { db.close(); } catch { /* ignore */ }
@@ -711,8 +741,11 @@ export async function saveKiroCliCredentials(creds: KiroCliCredentials): Promise
 
     if (db) {
       try {
-        const updateStmt = db.prepare("UPDATE auth_kv SET value = ? WHERE key = ?");
-        updateStmt.run(updatedValue, tokenRow.key);
+        withSqliteStatement(
+          db,
+          "UPDATE auth_kv SET value = ? WHERE key = ?",
+          (stmt) => stmt.run(updatedValue, tokenRow.key),
+        );
       } catch (err) {
         log.warn(`Failed to write credentials back to Kiro CLI DB: ${err}`);
         try { db.close(); } catch { /* ignore */ }

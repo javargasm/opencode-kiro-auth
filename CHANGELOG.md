@@ -1,5 +1,26 @@
 # @javargasm/opencode-kiro-auth
 
+## 8.2.2
+
+### Patch Changes
+
+- Add gateway restart endpoints, improve stream error formatting, and harden SQLite resource cleanup.
+
+  Gateway server & lifecycle:
+
+  - Add authenticated POST `/v1/restart` and `/dashboard/api/restart` endpoints triggering an `onRestart` callback to support gateway hot-restarting.
+  - Wrap stream result processing with `safeKiroStreamResult` to gracefully catch and log stream initialization/result failures in non-streaming and streaming modes.
+  - Parse nested JSON error strings from Kiro upstream responses in `formatKiroErrorDetail` for human-readable error messages.
+
+  Streaming & timeouts:
+
+  - Enforce mid-stream idle timeouts on `reader.read()` after the first token, cancelling the reader on timeout to prevent hanging connections when upstream stalls.
+  - Expand capacity error detection to handle `MODEL_TEMPORARILY_UNAVAILABLE` alongside `INSUFFICIENT_MODEL_CAPACITY`.
+
+  Kiro CLI sync:
+
+  - Wrap SQLite prepared statement execution in `saveKiroCliCredentials` to guarantee statement disposal even if database queries fail or throw.
+
 ## 8.2.1
 
 ### Patch Changes

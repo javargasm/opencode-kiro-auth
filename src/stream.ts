@@ -112,7 +112,7 @@ function isNonRetryableBodyError(body: string): boolean {
 }
 
 function isCapacityError(body: string): boolean {
-  return body.includes(CAPACITY_PATTERN);
+  return body.includes("INSUFFICIENT_MODEL_CAPACITY") || body.includes("MODEL_TEMPORARILY_UNAVAILABLE");
 }
 
 function isTransientError(status: number): boolean {
@@ -1392,7 +1392,26 @@ export function streamKiro(
               gotFirstToken = true;
               resetIdle();
             } else {
-              readResult = (await reader.read()) as ReadResult;
+              const readPromise = reader.read() as Promise<ReadResult>;
+              let chunkTimer: ReturnType<typeof setTimeout> | null = null;
+              const IDLE_SENTINEL = Symbol("idleTimeout");
+              const result = await Promise.race([
+                readPromise,
+                new Promise<typeof IDLE_SENTINEL>((resolve) => {
+                  chunkTimer = setTimeout(
+                    () => resolve(IDLE_SENTINEL),
+                    idleTimeoutMs,
+                  );
+                }),
+              ]);
+              if (chunkTimer) clearTimeout(chunkTimer);
+              if (result === IDLE_SENTINEL) {
+                readPromise.catch(() => {});
+                idleCancelled = true;
+                void reader.cancel().catch(() => {});
+                break;
+              }
+              readResult = result as ReadResult;
             }
           } catch (error) {
             if (signal.aborted) throw abortReason(signal);

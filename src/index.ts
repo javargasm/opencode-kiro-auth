@@ -309,17 +309,45 @@ async function waitForCompatibleGateway(
   return false;
 }
 
+export async function restartGateway(): Promise<void> {
+  if (gatewayStopping) {
+    await Promise.race([
+      gatewayStopping.catch(() => undefined),
+      new Promise((resolve) => setTimeout(resolve, 1000)),
+    ]);
+  }
+  if (gatewayMode === "owned" && gatewayServer) {
+    const server = gatewayServer;
+    gatewayServer = null;
+    gatewayMode = "stopped";
+    stopGatewayUsageRefresh();
+    log.info("[opencode-kiro] Restarting owned gateway server...");
+    const stopping = Promise.race([
+      Promise.resolve().then(() => server.stop(true)).catch(() => undefined),
+      new Promise((resolve) => setTimeout(resolve, 1000)),
+    ]) as Promise<void>;
+    gatewayStopping = stopping;
+    try {
+      await stopping;
+    } finally {
+      if (gatewayStopping === stopping) gatewayStopping = null;
+    }
+  }
+  gatewayMode = "stopped";
+}
+
 /** Start the gateway or attach to a compatible instance owned by another process. */
 export async function startOrAttachGateway(
   port: number,
   initialize: () => Promise<void> = initGatewayAuth,
   gatewayToken?: string,
   recovery: GatewayRecoveryOptions = {},
+  onRestart: () => void | Promise<void> = restartGateway,
 ): Promise<{ mode: Exclude<GatewayMode, "stopped">; server: GatewayServer | null }> {
   let ready = false;
   let server: GatewayServer | null = null;
   try {
-    server = await startGatewayServer(port, { isReady: () => ready, gatewayToken });
+    server = await startGatewayServer(port, { isReady: () => ready, gatewayToken, onRestart });
   } catch (startError) {
     const timeoutMs = recovery.timeoutMs ?? GATEWAY_RECOVERY_TIMEOUT_MS;
     const probeTimeoutMs = recovery.probeTimeoutMs ?? GATEWAY_PROBE_TIMEOUT_MS;
@@ -343,7 +371,7 @@ export async function startOrAttachGateway(
 
       if (lastStatus === "unavailable") {
         try {
-          server = await startGatewayServer(port, { isReady: () => ready, gatewayToken });
+          server = await startGatewayServer(port, { isReady: () => ready, gatewayToken, onRestart });
           break;
         } catch (retryError) {
           lastStartError = retryError;

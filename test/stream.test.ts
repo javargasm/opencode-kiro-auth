@@ -2701,4 +2701,49 @@ describe("conversationId stability (#17 — one deterministic id per session)", 
     const id1 = JSON.parse(fetchMock.mock.calls[1]?.[1]?.body as string).conversationState.conversationId;
     expect(id0).not.toBe(id1);
   });
+
+  it("aborts and cancels the reader when upstream connection stalls mid-stream after first token", async () => {
+    const encoder = new TextEncoder();
+    let firstCall = true;
+    const cancelMock = vi.fn().mockResolvedValue(undefined);
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: vi.fn().mockImplementation(() => {
+            if (firstCall) {
+              firstCall = false;
+              return Promise.resolve({ done: false, value: encoder.encode('{"content":"Hello chunk"}') });
+            }
+            // Stall indefinitely on second read call
+            return new Promise(() => {});
+          }),
+          cancel: cancelMock,
+        }),
+      },
+    } as any);
+
+    const stream = streamKiro(makeModel(), makeContext("hello"), {
+      apiKey: "test-token",
+      requestTimeoutMs: 1000,
+      modelMetadata: {
+        id: "claude-sonnet-4-6",
+        name: "Claude Sonnet",
+        input: ["text"],
+        contextWindow: 200000,
+        maxTokens: 4096,
+        reasoning: false,
+        idleTimeout: 50,
+        firstTokenTimeout: 500,
+        api: "kiro-api",
+        provider: "kiro",
+        baseUrl: "https://runtime.us-east-1.kiro.dev",
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      },
+    });
+
+    const events = await collect(stream);
+    expect(events.some((e) => e.type === "text_delta" || e.type === "text_start")).toBe(true);
+    expect(cancelMock).toHaveBeenCalled();
+  });
 });

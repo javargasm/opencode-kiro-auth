@@ -21,12 +21,58 @@ import {
   importFromKiroCli,
   getKiroCliCredentialsAllowExpired,
   saveKiroCliCredentials,
+  _withKiroSqliteStatementForTest,
   type AuthKvRow,
   type KiroCliCredentials,
 } from "../src/kiro-cli-sync";
 
 const mockExists = vi.mocked(existsSync);
 const mockReadFile = vi.mocked(readFileSync);
+
+describe("Kiro SQLite statement cleanup", () => {
+  it("finalizes a statement before the database is closed", () => {
+    const calls: string[] = [];
+    const statement = {
+      all: () => [],
+      get: () => undefined,
+      run: () => calls.push("run"),
+      finalize: () => calls.push("finalize"),
+    };
+    const db = {
+      prepare: () => {
+        calls.push("prepare");
+        return statement;
+      },
+      close: () => calls.push("close"),
+    };
+
+    _withKiroSqliteStatementForTest(db, "UPDATE auth_kv SET value = ? WHERE key = ?", (stmt) => {
+      stmt.run("value", "key");
+    });
+    db.close();
+
+    expect(calls).toEqual(["prepare", "run", "finalize", "close"]);
+  });
+
+  it("finalizes a statement when its operation throws", () => {
+    const finalize = vi.fn();
+    const error = new Error("SQLite read failed");
+    const db = {
+      prepare: () => ({
+        all: () => [],
+        get: () => undefined,
+        run: () => undefined,
+        finalize,
+      }),
+      close: () => undefined,
+    };
+
+    expect(() => _withKiroSqliteStatementForTest(db, "SELECT key, value FROM auth_kv", () => {
+      throw error;
+    })).toThrow(error);
+    expect(finalize).toHaveBeenCalledOnce();
+  });
+});
 
 /** Filenames the module derives internally from homedir(). */
 const SSO_CACHE_FILE = "kiro-auth-token.json";
