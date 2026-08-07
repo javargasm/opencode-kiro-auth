@@ -1,5 +1,11 @@
 # @javargasm/opencode-kiro-auth
 
+## 8.2.3
+
+### Patch Changes
+
+- Patch release v8.2.3 to trigger release workflow deployment.
+
 ## 8.2.2
 
 ### Patch Changes
