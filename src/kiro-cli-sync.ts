@@ -356,7 +356,16 @@ export function sameKiroCliCredential(
     left.authMethod === right.authMethod;
 }
 
-/** Match OpenCode's packed refresh credential to its current Kiro CLI row. */
+/**
+ * Match OpenCode's packed refresh credential to its current Kiro CLI row.
+ *
+ * When the packed credential identifies a DB row by source+tokenKey, that row
+ * identity is authoritative: the CLI may re-register its OIDC device at any
+ * time (rotating clientId/clientSecret and the refresh token) while keeping
+ * the same auth_kv row key. Requiring client identity here would make the
+ * loader fall back to the stored (possibly expired) access token and every
+ * subsequent request would fail with HTTP 400 "Invalid token".
+ */
 export function matchesPackedKiroCredential(
   refreshPacked: string,
   candidate: KiroCliCredentials | null,
@@ -368,7 +377,7 @@ export function matchesPackedKiroCredential(
     && (!clientSecret || clientSecret === (candidate.clientSecret ?? ""));
 
   if (source && tokenKey) {
-    return clientMatches && source === candidate.source && tokenKey === candidate.tokenKey;
+    return source === candidate.source && tokenKey === candidate.tokenKey;
   }
   return Boolean(refreshToken) && clientMatches && refreshToken === candidate.refreshToken;
 }

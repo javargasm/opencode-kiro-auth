@@ -20,6 +20,7 @@ import {
   setCachedDynamicModels,
   type KiroModel,
   validateNativeKiroEffort,
+  DEFAULT_PROFILE_ARN,
 } from "./models";
 import { refreshKiroToken, BUILDER_ID_REGION } from "./oauth";
 import { stats } from "./dashboard-stats";
@@ -347,7 +348,7 @@ export async function initGatewayAuth(): Promise<void> {
       refreshPacked: packParts.join("|"),
       region: imported.region,
       authMethod: imported.authMethod,
-      profileArn: imported.profileArn,
+      profileArn: imported.profileArn || DEFAULT_PROFILE_ARN,
       expiresAt: Date.now() + 3500 * 1000, // assume ~1h validity
     };
     installGatewayCredentials(credentials);
@@ -400,7 +401,7 @@ export async function fetchGatewayModelsForCredentials(
   const apiRegion = resolveApiRegion(region);
   const resolvedProfileArn = profileArn
     ?? await resolveProfileArn(accessToken, apiRegion, useProfileCache, signal)
-    ?? undefined;
+    ?? DEFAULT_PROFILE_ARN;
   if (!resolvedProfileArn) return null;
 
   const apiModels = await fetchAvailableModels(accessToken, apiRegion, resolvedProfileArn, signal);
@@ -601,8 +602,7 @@ export async function fetchKiroUsageLimits(
     // Resolve profileArn if missing (Builder ID social login may not have it).
     let profileArn = credentials.profileArn;
     if (!profileArn) {
-      const { resolveProfileArn } = await import("./models");
-      profileArn = await resolveProfileArn(accessToken, apiRegion, true, signal) ?? undefined;
+      profileArn = await resolveProfileArn(accessToken, apiRegion, true, signal) ?? DEFAULT_PROFILE_ARN;
       if (profileArn && _credentialGeneration === generation && _creds === credentials) {
         credentials.profileArn = profileArn;
         seedProfileArn(profileArn, accessToken, apiRegion);

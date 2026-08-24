@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { chmod, link, lstat, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -44,6 +44,7 @@ import {
   formatModelName,
   type KiroModel,
   validateNativeKiroEffort,
+  DEFAULT_PROFILE_ARN,
 } from "./models";
 import {
   matchesPackedKiroCredential,
@@ -417,26 +418,73 @@ export function resolveKiroLoaderCredentials(
   imported: KiroCliCredentials | null,
 ): GatewayCatalogCredentials | null {
   if (!auth || auth.type !== "oauth" || typeof auth.access !== "string" || !auth.access) return null;
-  if (
+  const packedParts = typeof auth.refresh === "string" ? auth.refresh.split("|") : [];
+  const rowMatch =
     typeof auth.refresh === "string"
     && matchesPackedKiroCredential(auth.refresh, imported)
-    && imported?.accessToken
-  ) {
+    && imported?.accessToken;
+  if (rowMatch) {
+    // The CLI re-registered its OIDC device (clientId/clientSecret/refresh
+    // rotated) but kept the same auth_kv row, so we sync to the live CLI
+    // credential instead of the stored one. Log which credential is used so
+    // session logs show the sync happened.
+    const packedClientId = packedParts[1] || "";
+    const synced = imported!.clientId !== packedClientId;
+    if (synced) {
+      log.info("[opencode-kiro] Syncing kiro credential to live CLI row (clientId rotated)", {
+        packedClientId,
+        liveClientId: imported!.clientId || "",
+        source: imported!.source || "",
+        tokenKey: imported!.tokenKey || "",
+        region: imported!.region,
+        authMethod: imported!.authMethod,
+        scope: getKiroCredentialScope(auth.refresh),
+      });
+    }
     return {
-      accessToken: imported.accessToken,
-      region: imported.region || BUILDER_ID_REGION,
-      profileArn: imported.profileArn,
+      accessToken: imported!.accessToken,
+      region: imported!.region || BUILDER_ID_REGION,
+      profileArn: imported!.profileArn || DEFAULT_PROFILE_ARN,
     };
   }
 
+  // The stored credential did not match the live CLI row (or no row exists).
+  // This is the failure mode behind gateway HTTP 400 "Invalid token" catalog
+  // refreshes when the CLI re-registers its OIDC device (rotating clientId /
+  // refresh token) but OpenCode still holds the old packed credential. Log the
+  // credential data used so the mismatch is diagnosable from the session log.
   const metadata = auth.metadata ?? {};
   const scope = typeof auth.refresh === "string"
     ? getKiroCredentialScope(auth.refresh)
     : {};
+  const storedExpired = Number.isFinite(auth.expires) && Date.now() >= Number(auth.expires);
+  const accessDigest = createHash("sha256").update(String(auth.access)).digest("hex").slice(0, 12);
+  log.warn("[opencode-kiro] Stored kiro credential does not match live CLI row; using stored access token", {
+    storedAccessDigest: accessDigest,
+    storedAccessExpired: storedExpired,
+    packed: packedParts.length >= 6
+      ? {
+          clientId: packedParts[1] || "",
+          authMethod: packedParts[3] || "",
+          source: packedParts[4] || "",
+          tokenKey: packedParts[5] || "",
+        }
+      : undefined,
+    liveCli: imported
+      ? {
+          clientId: imported.clientId || "",
+          authMethod: imported.authMethod,
+          source: imported.source || "",
+          tokenKey: imported.tokenKey || "",
+          region: imported.region,
+        }
+      : null,
+    scope,
+  });
   return {
     accessToken: auth.access,
     region: metadata.region || scope.region || BUILDER_ID_REGION,
-    profileArn: metadata.profileArn || scope.profileArn,
+    profileArn: metadata.profileArn || scope.profileArn || DEFAULT_PROFILE_ARN,
   };
 }
 
@@ -449,7 +497,7 @@ async function resolveKiroAuthCredentials(auth: any): Promise<GatewayCatalogCred
   return resolveKiroLoaderCredentials(auth, imported);
 }
 
-async function loadOpenCodeKiroCredentials(): Promise<GatewayCatalogCredentials | null> {
+export async function loadOpenCodeKiroCredentials(): Promise<GatewayCatalogCredentials | null> {
   const parse = (raw: string): any => {
     const record = JSON.parse(raw) as Record<string, unknown>;
     return record?.kiro ?? record?.["kiro/"] ?? null;
@@ -475,7 +523,7 @@ async function loadOpenCodeKiroCredentials(): Promise<GatewayCatalogCredentials 
   return resolveKiroAuthCredentials(auth);
 }
 
-async function loadLocalCatalogCredentials(): Promise<GatewayCatalogCredentials | null> {
+export async function loadLocalCatalogCredentials(): Promise<GatewayCatalogCredentials | null> {
   try {
     const { importFromKiroCli } = await import("./kiro-cli-sync");
     const credentials = await importFromKiroCli();
@@ -758,6 +806,82 @@ export const KiroPlugin: Plugin = async (input) => {
       gatewayMode = "stopped";
     },
 
+    provider: {
+      id: "kiro",
+      models: async (_provider: any, ctx: any) => {
+        try {
+          await ensureGateway();
+          let activeCredentials = ctx?.auth ? await resolveKiroAuthCredentials(ctx.auth) : null;
+          if (!activeCredentials) {
+            activeCredentials = (await loadOpenCodeKiroCredentials()) ?? (await loadLocalCatalogCredentials());
+          }
+          let models = getCachedDynamicModels() ?? kiroModels;
+          if (activeCredentials) {
+            const loaded = await loadGatewayModels(
+              GATEWAY_PORT,
+              await getGatewayToken(),
+              activeCredentials,
+              GATEWAY_CONFIG_CATALOG_TIMEOUT_MS,
+              true,
+            );
+            if (loaded && loaded.length > 0) {
+              models = loaded;
+              accountCatalogModels = loaded;
+            }
+          }
+          const api = `${gatewayOrigin(GATEWAY_PORT)}/v1`;
+          const result: Record<string, any> = {};
+          for (const model of models) {
+            const hasCatalogEfforts = (model.nativeEfforts?.length ?? 0) > 0;
+            const variants = mergeCatalogVariants(model, undefined);
+            result[model.id] = {
+              id: model.id,
+              name: formatModelName(model),
+              reasoning: hasCatalogEfforts ? false : model.reasoning,
+              temperature: true,
+              tool_call: true,
+              attachment: model.input.includes("image"),
+              modalities: {
+                input: model.input.includes("image") ? ["text", "image"] : ["text"],
+                output: ["text"],
+              },
+              cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
+              limit: { context: model.contextWindow, output: model.maxTokens },
+              status: "active",
+              release_date: "2026-06-15",
+              provider: { npm: "@ai-sdk/anthropic", api },
+              ...(variants ? { variants } : {}),
+            };
+          }
+          return result;
+        } catch (error) {
+          log.warn("[opencode-kiro] provider.models failed, falling back to static", error);
+          const api = `${gatewayOrigin(GATEWAY_PORT)}/v1`;
+          const result: Record<string, any> = {};
+          for (const model of kiroModels) {
+            result[model.id] = {
+              id: model.id,
+              name: formatModelName(model),
+              reasoning: model.reasoning,
+              temperature: true,
+              tool_call: true,
+              attachment: model.input.includes("image"),
+              modalities: {
+                input: model.input.includes("image") ? ["text", "image"] : ["text"],
+                output: ["text"],
+              },
+              cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
+              limit: { context: model.contextWindow, output: model.maxTokens },
+              status: "active",
+              release_date: "2026-06-15",
+              provider: { npm: "@ai-sdk/anthropic", api },
+            };
+          }
+          return result;
+        }
+      },
+    },
+
     auth: {
       provider: "kiro",
       loader: async (getAuth, provider) => {
@@ -797,6 +921,7 @@ export const KiroPlugin: Plugin = async (input) => {
               callback: async () => {
                 try {
                   const creds = await waitForCredentials();
+                  const profileArn = creds.profileArn || DEFAULT_PROFILE_ARN;
 
                   return {
                     type: "success" as const,
@@ -806,7 +931,7 @@ export const KiroPlugin: Plugin = async (input) => {
                     metadata: {
                       region: creds.region,
                       authMethod: creds.authMethod,
-                      profileArn: creds.profileArn
+                      profileArn,
                     }
                   };
                 } catch {
@@ -874,22 +999,24 @@ export const KiroPlugin: Plugin = async (input) => {
                   return { type: "failed" };
                 }
 
+                const accessToken = tok.accessToken;
+                const refreshToken = tok.refreshToken;
                 const apiRegion = resolveApiRegion(detectedRegion);
-                const arn = await resolveProfileArn(tok.accessToken, apiRegion);
+                const arn = (await resolveProfileArn(accessToken, apiRegion)) || DEFAULT_PROFILE_ARN;
 
                 return {
                   type: "success",
-                  access: tok.accessToken,
+                  access: accessToken,
                   refresh: withKiroCredentialScope(
-                    `${tok.refreshToken}|${result.clientId}|${result.clientSecret}|idc||`,
+                    `${refreshToken}|${result.clientId}|${result.clientSecret}|idc||`,
                     detectedRegion,
-                    arn ?? undefined,
+                    arn,
                   ),
                   expires: Date.now() + (tok.expiresIn ?? 3600) * 1000 - EXPIRES_BUFFER_MS,
                   metadata: {
                     region: detectedRegion,
                     authMethod: "idc",
-                    profileArn: arn
+                    profileArn: arn,
                   }
                 };
               }
@@ -914,6 +1041,7 @@ export const KiroPlugin: Plugin = async (input) => {
 
             const authMethod = imported.authMethod || "desktop";
             const region = imported.region || "us-east-1";
+            const profileArn = imported.profileArn || DEFAULT_PROFILE_ARN;
             const packParts = [
               imported.refreshToken,
               imported.clientId || "",
@@ -925,7 +1053,7 @@ export const KiroPlugin: Plugin = async (input) => {
             const packedCredential = withKiroCredentialScope(
               packParts.join("|"),
               region,
-              imported.profileArn,
+              profileArn,
             );
 
             return {
@@ -940,7 +1068,7 @@ export const KiroPlugin: Plugin = async (input) => {
                     access: imported.accessToken,
                     refresh: packedCredential,
                     expires: Date.now() + 3600 * 1000 - EXPIRES_BUFFER_MS,
-                    metadata: { region, authMethod, profileArn: imported.profileArn }
+                    metadata: { region, authMethod, profileArn }
                   };
                 }
 
@@ -956,7 +1084,7 @@ export const KiroPlugin: Plugin = async (input) => {
                     access: refreshed.access,
                     refresh: refreshed.refresh,
                     expires: refreshed.expires,
-                    metadata: { region, authMethod, profileArn: imported.profileArn }
+                    metadata: { region, authMethod, profileArn }
                   };
                 } catch {
                   return { type: "failed" as const };

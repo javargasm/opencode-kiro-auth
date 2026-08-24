@@ -221,7 +221,7 @@ describe("Kiro management API requests", () => {
     expect(headers.Authorization).toBe("Bearer access-token");
     expect(headers["Content-Type"]).toBe("application/x-amz-json-1.0");
     expect(headers["X-Amz-Target"]).toBe("AmazonCodeWhispererService.ListAvailableModels");
-    expect(headers["user-agent"]).toContain("md/appVersion-2.15.0 app/AmazonQ-For-CLI");
+    expect(headers["user-agent"]).toContain("md/appVersion-2.19.1 app/AmazonQ-For-CLI");
     expect(headers["x-amz-user-agent"]).toContain("m/F,C");
     expect(headers["x-amzn-codewhisperer-optout"]).toBe("true");
     expect(headers["amz-sdk-request"]).toBe("attempt=1; max=3");
@@ -290,6 +290,33 @@ describe("Kiro management API requests", () => {
 
     const headers = init?.headers as Record<string, string>;
     expect(headers["X-Amz-Target"]).toBe("AmazonCodeWhispererService.ListAvailableProfiles");
-    expect(headers["user-agent"]).toContain("md/appVersion-2.15.0 app/AmazonQ-For-CLI");
+    expect(headers["user-agent"]).toContain("md/appVersion-2.19.1 app/AmazonQ-For-CLI");
+  });
+
+  it("resolveProfileArn falls back to DEFAULT_PROFILE_ARN when ListAvailableProfiles fails (e.g. Builder ID)", async () => {
+    resetProfileArnCache(false);
+    spyFetch().mockResolvedValueOnce(
+      mockResp({
+        ok: false,
+        status: 400,
+        json: {
+          __type: "com.amazon.kiro.controlplane#AccessDeniedException",
+          message: "User is not authorized to access this feature.",
+        },
+      }),
+    );
+
+    const arn = await resolveProfileArn("builder-id-token", "us-east-1");
+
+    expect(arn).toBe("arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX");
+  });
+
+  it("resolveProfileArn falls back to DEFAULT_PROFILE_ARN when ListAvailableProfiles throws", async () => {
+    resetProfileArnCache(false);
+    spyFetch().mockRejectedValueOnce(new Error("network failure"));
+
+    const arn = await resolveProfileArn("token", "us-east-1");
+
+    expect(arn).toBe("arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX");
   });
 });

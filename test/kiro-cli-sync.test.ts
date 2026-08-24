@@ -188,6 +188,12 @@ describe("matchesPackedKiroCredential", () => {
     expect(matchesPackedKiroCredential(packed, candidate)).toBe(true);
   });
 
+  it("matches the same row after the CLI re-registers its OIDC device (clientId rotated)", () => {
+    const rotated = { ...candidate, clientId: "rotated-client-id", clientSecret: "rotated-secret", refreshToken: "rotated-refresh" };
+    const packed = "older-refresh|original-client-id|original-secret|idc|kiro-cli-db|kirocli:odic:token";
+    expect(matchesPackedKiroCredential(packed, rotated)).toBe(true);
+  });
+
   it("does not match a different persisted CLI row", () => {
     const packed = "current-refresh|client-id|client-secret|idc|kiro-cli-db|kirocli:other:token";
     expect(matchesPackedKiroCredential(packed, candidate)).toBe(false);

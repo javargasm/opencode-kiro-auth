@@ -8,7 +8,7 @@
 //   3. Desktop — manual refresh token import from Kiro IDE.
 
 import { log } from "./debug";
-import { resolveApiRegion } from "./models";
+import { resolveApiRegion, DEFAULT_PROFILE_ARN } from "./models";
 import { createServer, type Server as HttpServer } from "node:http";
 import { randomBytes, createHash, timingSafeEqual } from "node:crypto";
 
@@ -812,17 +812,19 @@ export async function startSocialLogin(
           throw new Error("IdC authorization completed but no tokens returned");
         }
 
-        // Resolve profileArn for IdC
+        // Resolve profileArn for IdC / Builder ID
         let profileArn: string | undefined;
         try {
           const apiRegion = resolveApiRegion(detectedRegion);
-          const { resolveProfileArn } = await import("./models");
+          const { resolveProfileArn, DEFAULT_PROFILE_ARN } = await import("./models");
           const resolved = await resolveProfileArn(tok.accessToken, apiRegion);
-          if (resolved) {
-            profileArn = resolved;
-          }
+          profileArn = resolved || DEFAULT_PROFILE_ARN;
         } catch (err) {
           log.warn(`[social-login] IdC: failed to resolve profileArn: ${err}`);
+          try {
+            const { DEFAULT_PROFILE_ARN } = await import("./models");
+            profileArn = DEFAULT_PROFILE_ARN;
+          } catch {}
         }
 
         return {
@@ -871,15 +873,16 @@ export async function startSocialLogin(
         throw new Error("Token exchange returned no tokens");
       }
 
+      const profileArn = data.profileArn || DEFAULT_PROFILE_ARN;
       return {
         accessToken: data.accessToken,
         refreshToken: data.refreshToken,
         refreshPacked: withKiroCredentialScope(
           `${data.refreshToken}|||social`,
           BUILDER_ID_REGION,
-          data.profileArn,
+          profileArn,
         ),
-        profileArn: data.profileArn,
+        profileArn,
         region: BUILDER_ID_REGION,
         authMethod: "social" as const,
         expiresAt: Date.now() + (data.expiresIn ?? 3600) * 1000 - EXPIRES_BUFFER_MS,

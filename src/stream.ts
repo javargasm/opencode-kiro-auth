@@ -21,7 +21,7 @@ import { parseKiroEvents } from "./event-parser";
 import { isPermanentError } from "./health";
 import type { KiroModel } from "./models";
 import { createHash } from "node:crypto";
-import { findKiroModel, resolveKiroModel, resolveProfileArn, resetProfileArnCache, seedProfileArn } from "./models";
+import { findKiroModel, resolveKiroModel, resolveProfileArn, resetProfileArnCache, seedProfileArn, DEFAULT_PROFILE_ARN } from "./models";
 import { ThinkingTagParser } from "./thinking-parser";
 import { countTokens } from "./tokenizer";
 import { abortableDelay } from "./oauth";
@@ -400,7 +400,7 @@ interface KiroRequest {
     currentMessage: { userInputMessage: KiroUserInputMessage };
     history?: KiroHistoryEntry[];
   };
-  profileArn?: string;
+  profileArn: string;
   additionalModelRequestFields?: {
     output_config?: { effort?: string };
     reasoning?: { effort?: string };
@@ -670,12 +670,12 @@ export function streamKiro(
       }
 
       const endpoint = model.baseUrl || "https://runtime.us-east-1.kiro.dev";
-      const profileArn = options?.profileArn ?? await resolveProfileArn(
+      const profileArn = options?.profileArn ?? (await resolveProfileArn(
         accessToken,
         regionFromEndpoint(endpoint),
         options?.cacheProfileArn !== false,
         signal,
-      );
+      )) ?? DEFAULT_PROFILE_ARN;
       const kiroModelId = resolveKiroModel(model.id);
       const nativeEffort = options?.nativeEffort;
       const thinkingEnabled = nativeEffort === "none"
@@ -977,7 +977,7 @@ export function streamKiro(
             },
             ...(history.length > 0 ? { history } : {}),
           },
-          ...(profileArn ? { profileArn } : {}),
+          profileArn: profileArn || DEFAULT_PROFILE_ARN,
         };
 
         // Native effort is reserved for validated gateway values. Existing
@@ -1067,8 +1067,8 @@ export function streamKiro(
         while (true) {
           await stream.waitForCapacity(STREAM_EVENT_PUSH_RESERVE, signal);
           const osName = resolveOS();
-          const ua = `aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17975 os/${osName} lang/rust/1.92.0 md/appVersion-2.15.0 app/AmazonQ-For-CLI`;
-          const xAmzUa = `aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17975 os/${osName} lang/rust/1.92.0 m/F app/AmazonQ-For-CLI`;
+          const ua = `aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17975 os/${osName} lang/rust/1.92.0 md/appVersion-2.19.1 app/AmazonQ-For-CLI`;
+          const xAmzUa = `aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17975 os/${osName} lang/rust/1.92.0 m/F,C app/AmazonQ-For-CLI`;
           const requestBody = JSON.stringify(request);
 
 

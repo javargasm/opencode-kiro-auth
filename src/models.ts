@@ -86,7 +86,7 @@ const BASE_URL = "https://runtime.us-east-1.kiro.dev";
 const ZERO_COST = Object.freeze({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
 const KIRO_CLI_ORIGIN = "KIRO_CLI";
 const KIRO_CLI_USER_AGENT =
-  "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererruntime/0.1.17593 os/macos lang/rust/1.92.0 md/appVersion-2.15.0 app/AmazonQ-For-CLI";
+  "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererruntime/0.1.17975 os/macos lang/rust/1.92.0 md/appVersion-2.19.1 app/AmazonQ-For-CLI";
 const KIRO_CLI_X_AMZ_USER_AGENT = `${KIRO_CLI_USER_AGENT} m/F,C`;
 const KIRO_MANAGEMENT_TARGET = {
   listAvailableProfiles: "AmazonCodeWhispererService.ListAvailableProfiles",
@@ -550,6 +550,9 @@ function managementSignal(signal?: AbortSignal): AbortSignal {
   return signal ? AbortSignal.any([signal, timeout]) : timeout;
 }
 
+export const DEFAULT_PROFILE_ARN = "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
+export const BUILDER_ID_PROFILE_ARN = DEFAULT_PROFILE_ARN;
+
 export function resetProfileArnCache(skipResolution = false): void {
   cachedProfileArns.clear();
   profileArnSkipResolution = skipResolution;
@@ -561,8 +564,9 @@ export function seedProfileArn(arn: string, accessToken: string, apiRegion: stri
 
 /**
  * Resolve the Kiro profile ARN by calling ListAvailableProfiles.
- * Builder ID device-code login doesn't receive a profileArn, so we
- * discover it here. Returns null on failure (graceful fallback).
+ * Builder ID device-code login doesn't receive a profileArn and gets
+ * AccessDenied on ListAvailableProfiles, so we fall back to Kiro's
+ * standard Builder ID profile ARN.
  */
 export async function resolveProfileArn(
   accessToken: string,
@@ -575,26 +579,37 @@ export async function resolveProfileArn(
   const cached = cachedProfileArns.get(cacheKey);
   if (useCache && cached !== undefined) return cached;
 
-  const endpoint = `https://management.${apiRegion}.kiro.dev/`;
-  const resp = await fetch(endpoint, {
-    method: "POST",
-    headers: kiroManagementHeaders(accessToken, KIRO_MANAGEMENT_TARGET.listAvailableProfiles),
-    body: "{}",
-    signal: managementSignal(signal),
-  });
-  if (!resp || !resp.ok) return null;
-
-  const data = (await resp.json()) as {
-    profiles?: { arn?: string; profileType?: string; status?: string }[];
-  };
-  const profiles = data.profiles ?? [];
-  const kiroProfile = profiles.find((p) => p.profileType === "KIRO" && p.status === "ACTIVE");
-  const arn = kiroProfile?.arn ?? profiles[0]?.arn ?? null;
-  
-  if (arn && useCache) {
-    cacheProfileArn(cacheKey, arn);
+  try {
+    const endpoint = `https://management.${apiRegion}.kiro.dev/`;
+    const resp = await fetch(endpoint, {
+      method: "POST",
+      headers: kiroManagementHeaders(accessToken, KIRO_MANAGEMENT_TARGET.listAvailableProfiles),
+      body: "{}",
+      signal: managementSignal(signal),
+    });
+    if (resp && resp.ok) {
+      const data = (await resp.json()) as {
+        profiles?: { arn?: string; profileType?: string; status?: string }[];
+      };
+      const profiles = data.profiles ?? [];
+      const kiroProfile = profiles.find((p) => p.profileType === "KIRO" && p.status === "ACTIVE");
+      const arn = kiroProfile?.arn ?? profiles[0]?.arn ?? DEFAULT_PROFILE_ARN;
+      
+      if (arn && useCache) {
+        cacheProfileArn(cacheKey, arn);
+      }
+      return arn;
+    }
+  } catch {
+    // Best-effort; fall through to DEFAULT_PROFILE_ARN
   }
-  return arn;
+
+  // Builder ID accounts cannot call ListAvailableProfiles (returns 400 AccessDeniedException),
+  // so we fall back to Kiro's standard Builder ID profile ARN.
+  if (useCache) {
+    cacheProfileArn(cacheKey, DEFAULT_PROFILE_ARN);
+  }
+  return DEFAULT_PROFILE_ARN;
 }
 
 /**
@@ -622,6 +637,9 @@ export async function fetchAvailableModels(
     endpoint: safeEndpoint,
     target,
     profileArn: redactProfileArn(profileArn),
+    // Correlation id for the access token used — lets session logs tie a 400
+    // back to the exact credential (stale stored token vs live CLI row).
+    accessTokenDigest: createHash("sha256").update(accessToken).digest("hex").slice(0, 12),
   };
   const logError = (error: unknown, status?: number) => {
     log.error("model_catalog_error", {
