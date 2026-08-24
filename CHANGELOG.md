@@ -1,5 +1,13 @@
 # @javargasm/opencode-kiro-auth
 
+## 8.2.4
+
+### Patch Changes
+
+- Update User-Agent and x-amz-user-agent headers to align with `kiro-cli` 2.19.1 (`appVersion-2.19.1`, runtime/streaming API `0.1.17975`, and `m/F,C`).
+- Implement `@opencode-ai/plugin` v2 `provider.models` hook to ensure dynamic models load immediately upon `/connect` or login.
+- Ensure fallback to `DEFAULT_PROFILE_ARN` across Builder ID authentication and token exchange flows.
+
 ## 8.2.3
 
 ### Patch Changes

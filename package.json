@@ -1,6 +1,6 @@
 {
   "name": "@javargasm/opencode-kiro-auth",
-  "version": "8.2.3",
+  "version": "8.2.4",
   "description": "Kiro provider plugin for OpenCode: AWS Builder ID / Identity Center login and Anthropic-compatible local gateway for CodeWhisperer streaming.",
   "type": "module",
   "license": "MIT",
