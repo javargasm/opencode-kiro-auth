@@ -7,6 +7,8 @@ import type {
 } from "./types.js";
 import { awsTool } from "./tools/aws.js";
 import { webFetchTool } from "./tools/web-fetch.js";
+import { webSearchTool } from "./tools/web-search.js";
+import { thinkingTool } from "./tools/thinking.js";
 import { usageTool } from "./tools/usage.js";
 import { checkpointTool } from "./tools/checkpoint.js";
 
@@ -22,6 +24,8 @@ export class McpServer {
     // Register built-in native tools
     this.registerTool(awsTool);
     this.registerTool(webFetchTool);
+    this.registerTool(webSearchTool);
+    this.registerTool(thinkingTool);
     this.registerTool(usageTool);
     this.registerTool(checkpointTool);
   }

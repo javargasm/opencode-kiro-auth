@@ -5,6 +5,8 @@ import { join } from "node:path";
 import { type Plugin, type Hooks, type PluginModule, tool } from "@opencode-ai/plugin";
 import { awsTool } from "./mcp/tools/aws";
 import { webFetchTool } from "./mcp/tools/web-fetch";
+import { webSearchTool } from "./mcp/tools/web-search";
+import { thinkingTool } from "./mcp/tools/thinking";
 import { usageTool } from "./mcp/tools/usage";
 import { checkpointTool } from "./mcp/tools/checkpoint";
 import {
@@ -834,6 +836,29 @@ export const KiroPlugin: Plugin = async (input) => {
         },
         async execute(args) {
           const res = await webFetchTool.handler(args);
+          return res.content.map((c) => c.text).join("\n");
+        },
+      }),
+
+      web_search: tool({
+        description: webSearchTool.tool.description,
+        args: {
+          query: tool.schema.string().describe("The search query to look up on the web."),
+          max_results: tool.schema.number().optional().describe("Maximum results to return (default: 5, max: 10)."),
+        },
+        async execute(args) {
+          const res = await webSearchTool.handler(args);
+          return res.content.map((c) => c.text).join("\n");
+        },
+      }),
+
+      thinking: tool({
+        description: thinkingTool.tool.description,
+        args: {
+          thought: tool.schema.string().describe("The intermediate reasoning step or reflection."),
+        },
+        async execute(args) {
+          const res = await thinkingTool.handler(args);
           return res.content.map((c) => c.text).join("\n");
         },
       }),

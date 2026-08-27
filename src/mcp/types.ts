@@ -1,7 +1,7 @@
-/**
- * Model Context Protocol (MCP) TypeScript definitions.
- * Conforms to MCP Specification (2024-11-05).
- */
+import type { spawn } from "child_process";
+
+export type SpawnFn = typeof spawn;
+
 
 export interface JsonRpcRequest {
   jsonrpc: "2.0";

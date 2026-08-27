@@ -49,6 +49,8 @@ The plugin automatically provides native Kiro utilities to OpenCode through the 
 |:---|:---|:---|
 | **`use_aws`** | `service_name`, `operation_name`, `parameters`, `positional_args` | Makes AWS CLI/SDK calls with automatic credential passing and argument formatting. |
 | **`web_fetch`** | `url`, `mode` (`selective` \| `truncated` \| `full`), `search_terms` | Smart web scraper. In `selective` mode, extracts only sections relevant to `search_terms` saving up to 80% context window tokens. |
+| **`web_search`** | `query`, `max_results` | Searches the web for up-to-date documentation, API references, and technical information with clean snippet parsing. |
+| **`thinking`** | `thought` | Structured intermediate reasoning and scratchpad mechanism for complex multi-step tasks and constraints planning. |
 | **`kiro_usage`** | `force` (boolean) | Queries real-time account usage percentage, credits used/total, and monthly reset duration. |
 | **`kiro_checkpoint`** | `action` (`create` \| `list` \| `diff` \| `restore`), `message`, `checkpoint_id` | Manages workspace snapshots and safe restore points backed by Git. |
 
@@ -364,6 +366,8 @@ src/
     └── tools/
         ├── aws.ts         # use_aws tool handler
         ├── web-fetch.ts   # web_fetch selective extraction handler
+        ├── web-search.ts  # web_search fast search handler
+        ├── thinking.ts    # thinking structured reasoning handler
         ├── usage.ts       # kiro_usage limits handler
         └── checkpoint.ts  # kiro_checkpoint git snapshot handler
 test/

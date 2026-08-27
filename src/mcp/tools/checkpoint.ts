@@ -1,21 +1,45 @@
 import { spawn } from "child_process";
-import type { RegisteredTool, McpToolResult } from "../types.js";
+import type { RegisteredTool, McpToolResult, SpawnFn } from "../types.js";
 
-function execGit(args: string[], cwd?: string): Promise<{ stdout: string; stderr: string; code: number }> {
+let _spawnFn: SpawnFn = spawn;
+
+export function setGitSpawnRunner(fn: SpawnFn): void {
+  _spawnFn = fn;
+}
+
+export function resetGitSpawnRunner(): void {
+  _spawnFn = spawn;
+}
+
+function execGit(args: string[], cwd?: string, env?: NodeJS.ProcessEnv): Promise<{ stdout: string; stderr: string; code: number }> {
   return new Promise((resolve) => {
-    const child = spawn("git", args, { cwd: cwd || process.cwd() });
+    const child = _spawnFn("git", args, {
+      cwd: cwd || process.cwd(),
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: process.env.GIT_AUTHOR_NAME || "opencode-kiro",
+        GIT_AUTHOR_EMAIL: process.env.GIT_AUTHOR_EMAIL || "opencode-kiro@local",
+        GIT_COMMITTER_NAME: process.env.GIT_COMMITTER_NAME || "opencode-kiro",
+        GIT_COMMITTER_EMAIL: process.env.GIT_COMMITTER_EMAIL || "opencode-kiro@local",
+        ...env,
+      },
+    });
     let stdout = "";
     let stderr = "";
 
-    child.stdout.on("data", (d) => {
-      stdout += d.toString();
-    });
-    child.stderr.on("data", (d) => {
-      stderr += d.toString();
-    });
+    if (child.stdout) {
+      child.stdout.on("data", (d) => {
+        stdout += d.toString();
+      });
+    }
+    if (child.stderr) {
+      child.stderr.on("data", (d) => {
+        stderr += d.toString();
+      });
+    }
 
     child.on("error", (err: any) => {
-      resolve({ stdout: "", stderr: err.message, code: 1 });
+      resolve({ stdout: "", stderr: err?.message || String(err), code: 1 });
     });
 
     child.on("close", (code) => {
@@ -66,7 +90,7 @@ export const checkpointTool: RegisteredTool = {
         const msg = args.message || `Checkpoint at ${new Date().toISOString()}`;
         // Create a stash-like commit object without modifying current index/HEAD
         const headRes = await execGit(["rev-parse", "HEAD"]);
-        const headSha = headRes.stdout || "HEAD";
+        const parentArgs = headRes.code === 0 && headRes.stdout ? ["-p", headRes.stdout] : [];
 
         // Save tree
         await execGit(["add", "-A"]);
@@ -74,7 +98,7 @@ export const checkpointTool: RegisteredTool = {
         if (writeTree.code !== 0 || !writeTree.stdout) {
           return {
             isError: true,
-            content: [{ type: "text", text: `Failed to create checkpoint tree: ${writeTree.stderr}` }],
+            content: [{ type: "text", text: `Failed to create checkpoint tree: ${writeTree.stderr || "Unknown error"}` }],
           };
         }
 
@@ -82,8 +106,7 @@ export const checkpointTool: RegisteredTool = {
         const commitTree = await execGit([
           "commit-tree",
           treeSha,
-          "-p",
-          headSha,
+          ...parentArgs,
           "-m",
           `kiro-checkpoint: ${msg}`,
         ]);
@@ -91,7 +114,7 @@ export const checkpointTool: RegisteredTool = {
         if (commitTree.code !== 0 || !commitTree.stdout) {
           return {
             isError: true,
-            content: [{ type: "text", text: `Failed to create checkpoint commit: ${commitTree.stderr}` }],
+            content: [{ type: "text", text: `Failed to create checkpoint commit: ${commitTree.stderr || "Unknown error"}` }],
           };
         }
 

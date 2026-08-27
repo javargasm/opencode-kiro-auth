@@ -3,19 +3,23 @@ import { EventEmitter } from "node:events";
 import { McpServer } from "../src/mcp/server.js";
 import { awsTool, setAwsSpawnRunner, resetAwsSpawnRunner } from "../src/mcp/tools/aws.js";
 import { webFetchTool } from "../src/mcp/tools/web-fetch.js";
+import { webSearchTool } from "../src/mcp/tools/web-search.js";
+import { thinkingTool } from "../src/mcp/tools/thinking.js";
 import { usageTool } from "../src/mcp/tools/usage.js";
-import { checkpointTool } from "../src/mcp/tools/checkpoint.js";
+import { checkpointTool, setGitSpawnRunner, resetGitSpawnRunner } from "../src/mcp/tools/checkpoint.js";
 import * as serverModule from "../src/server.js";
 
 describe("Model Context Protocol (MCP) Server & Tools Coverage", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
     resetAwsSpawnRunner();
+    resetGitSpawnRunner();
   });
 
   afterEach(() => {
     vi.restoreAllMocks();
     resetAwsSpawnRunner();
+    resetGitSpawnRunner();
   });
 
   describe("McpServer Core Protocol Handling", () => {
@@ -67,6 +71,8 @@ describe("Model Context Protocol (MCP) Server & Tools Coverage", () => {
       const toolNames = tools.map((t: any) => t.name);
       expect(toolNames).toContain("use_aws");
       expect(toolNames).toContain("web_fetch");
+      expect(toolNames).toContain("web_search");
+      expect(toolNames).toContain("thinking");
       expect(toolNames).toContain("kiro_usage");
       expect(toolNames).toContain("kiro_checkpoint");
     });
@@ -436,6 +442,103 @@ console.log(a);</code></pre>
     });
   });
 
+  describe("web_search Tool", () => {
+    it("rejects missing query parameter", async () => {
+      const res = await webSearchTool.handler({});
+      expect(res.isError).toBe(true);
+      expect(res.content[0]!.text).toContain("Error: 'query' parameter is required");
+    });
+
+    it("parses DuckDuckGo search results and decodes redirect URLs", async () => {
+      const mockDuckDuckGoHtml = `
+        <!DOCTYPE html>
+        <html>
+          <body>
+            <div class="result results_links results_links_deep web-result">
+              <div class="links_main links_deep result__body">
+                <h2 class="result__title">
+                  <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdocs.aws.amazon.com%2Fbedrock%2F">AWS Bedrock Documentation</a>
+                </h2>
+                <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdocs.aws.amazon.com%2Fbedrock%2F">Comprehensive guide &amp; API reference for AWS Bedrock generative AI models.</a>
+              </div>
+            </div>
+            <div class="result results_links results_links_deep web-result">
+              <div class="links_main links_deep result__body">
+                <h2 class="result__title">
+                  <a class="result__a" href="https://example.com/guide">Example Guide</a>
+                </h2>
+                <a class="result__snippet" href="https://example.com/guide">Direct documentation guide snippet.</a>
+              </div>
+            </div>
+          </body>
+        </html>
+      `;
+
+      vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+        new Response(mockDuckDuckGoHtml, {
+          status: 200,
+          headers: { "content-type": "text/html" },
+        })
+      );
+
+      const res = await webSearchTool.handler({ query: "AWS Bedrock", max_results: 5 });
+      expect(res.isError).toBeUndefined();
+      expect(res.content[0]!.text).toContain('Web Search Results for "AWS Bedrock"');
+      expect(res.content[0]!.text).toContain("AWS Bedrock Documentation");
+      expect(res.content[0]!.text).toContain("https://docs.aws.amazon.com/bedrock/");
+      expect(res.content[0]!.text).toContain("API reference for AWS Bedrock");
+      expect(res.content[0]!.text).toContain("Example Guide");
+    });
+
+    it("handles zero search results gracefully", async () => {
+      const mockEmptyHtml = `<html><body><div class="no-results">No results found</div></body></html>`;
+      vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+        new Response(mockEmptyHtml, { status: 200, headers: { "content-type": "text/html" } })
+      );
+
+      const res = await webSearchTool.handler({ query: "nonexistent_query_string_12345" });
+      expect(res.isError).toBeUndefined();
+      expect(res.content[0]!.text).toContain("No search results found for query");
+    });
+
+    it("handles HTTP error status from search provider", async () => {
+      vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+        new Response("Service Unavailable", { status: 503, statusText: "Service Unavailable" })
+      );
+
+      const res = await webSearchTool.handler({ query: "query" });
+      expect(res.isError).toBe(true);
+      expect(res.content[0]!.text).toContain("HTTP status 503 Service Unavailable");
+    });
+
+    it("handles fetch network exceptions gracefully", async () => {
+      vi.spyOn(globalThis, "fetch").mockRejectedValueOnce(new Error("DNS resolution failed"));
+
+      const res = await webSearchTool.handler({ query: "query" });
+      expect(res.isError).toBe(true);
+      expect(res.content[0]!.text).toContain("DNS resolution failed");
+    });
+  });
+
+  describe("thinking Tool", () => {
+    it("rejects missing thought parameter", async () => {
+      const res = await thinkingTool.handler({});
+      expect(res.isError).toBe(true);
+      expect(res.content[0]!.text).toContain("Error: 'thought' parameter is required");
+    });
+
+    it("records reasoning step and returns acknowledgment", async () => {
+      const res = await thinkingTool.handler({
+        thought: "I will first fetch the latest API documentation, then plan the database migration.",
+      });
+
+      expect(res.isError).toBeUndefined();
+      expect(res.content[0]!.text).toContain("[Reasoning Step Recorded]");
+      expect(res.content[0]!.text).toContain("fetch the latest API documentation");
+      expect(res.content[0]!.text).toContain("Proceed with the next planned step");
+    });
+  });
+
   describe("kiro_usage Tool", () => {
     it("formats account limits, credits, percentage, and reset duration", async () => {
       vi.spyOn(serverModule, "fetchKiroUsageLimits").mockResolvedValueOnce({
@@ -493,30 +596,147 @@ console.log(a);</code></pre>
   });
 
   describe("kiro_checkpoint Tool", () => {
-    it("handles action: 'list' in repository", async () => {
+    function createMockGitProcess(stdoutText = "", stderrText = "", exitCode = 0) {
+      const child: any = new EventEmitter();
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      process.nextTick(() => {
+        if (stdoutText) child.stdout.emit("data", Buffer.from(stdoutText));
+        if (stderrText) child.stderr.emit("data", Buffer.from(stderrText));
+        child.emit("close", exitCode);
+      });
+      return child;
+    }
+
+    it("returns error if not inside git repository", async () => {
+      setGitSpawnRunner(((_cmd: any, args: any) => {
+        if (args[0] === "rev-parse" && args[1] === "--is-inside-work-tree") {
+          return createMockGitProcess("", "fatal: not a git repository", 128);
+        }
+        return createMockGitProcess("", "", 0);
+      }) as any);
+
       const res = await checkpointTool.handler({ action: "list" });
-      expect(res.content[0]!.text).toBeDefined();
+      expect(res.isError).toBe(true);
+      expect(res.content[0]!.text).toContain("Current directory is not a Git repository");
+    });
+
+    it("handles action: 'list' with no saved checkpoints", async () => {
+      setGitSpawnRunner(((_cmd: any, args: any) => {
+        if (args[0] === "rev-parse") {
+          return createMockGitProcess("true", "", 0);
+        }
+        if (args[0] === "for-each-ref") {
+          return createMockGitProcess("", "", 0);
+        }
+        return createMockGitProcess("", "", 0);
+      }) as any);
+
+      const res = await checkpointTool.handler({ action: "list" });
+      expect(res.isError).toBeUndefined();
+      expect(res.content[0]!.text).toContain("No saved checkpoints found");
+    });
+
+    it("handles action: 'list' with existing checkpoints", async () => {
+      setGitSpawnRunner(((_cmd: any, args: any) => {
+        if (args[0] === "rev-parse") {
+          return createMockGitProcess("true", "", 0);
+        }
+        if (args[0] === "for-each-ref") {
+          return createMockGitProcess("refs/kiro/checkpoints/abc12345|abc12345|kiro-checkpoint: Test snapshot|2 hours ago\n", "", 0);
+        }
+        return createMockGitProcess("", "", 0);
+      }) as any);
+
+      const res = await checkpointTool.handler({ action: "list" });
+      expect(res.isError).toBeUndefined();
+      expect(res.content[0]!.text).toContain("Saved Workspace Checkpoints");
+      expect(res.content[0]!.text).toContain("abc12345");
+      expect(res.content[0]!.text).toContain("Test snapshot");
     });
 
     it("handles action: 'diff' requiring checkpoint_id", async () => {
+      setGitSpawnRunner((() => createMockGitProcess("true", "", 0)) as any);
       const res = await checkpointTool.handler({ action: "diff" });
       expect(res.isError).toBe(true);
       expect(res.content[0]!.text).toContain("Error: 'checkpoint_id' parameter is required");
     });
 
+    it("handles action: 'diff' with valid checkpoint_id", async () => {
+      setGitSpawnRunner(((_cmd: any, args: any) => {
+        if (args[0] === "diff") {
+          return createMockGitProcess("+ added line\n- removed line", "", 0);
+        }
+        return createMockGitProcess("true", "", 0);
+      }) as any);
+
+      const res = await checkpointTool.handler({ action: "diff", checkpoint_id: "abc12345" });
+      expect(res.isError).toBeUndefined();
+      expect(res.content[0]!.text).toContain("```diff");
+      expect(res.content[0]!.text).toContain("+ added line");
+    });
+
     it("handles action: 'restore' requiring checkpoint_id", async () => {
+      setGitSpawnRunner((() => createMockGitProcess("true", "", 0)) as any);
       const res = await checkpointTool.handler({ action: "restore" });
       expect(res.isError).toBe(true);
       expect(res.content[0]!.text).toContain("Error: 'checkpoint_id' parameter is required");
     });
 
+    it("handles action: 'restore' success and failure", async () => {
+      setGitSpawnRunner(((_cmd: any, args: any) => {
+        if (args[0] === "checkout") {
+          return createMockGitProcess("", "", 0);
+        }
+        return createMockGitProcess("true", "", 0);
+      }) as any);
+
+      const res = await checkpointTool.handler({ action: "restore", checkpoint_id: "abc12345" });
+      expect(res.isError).toBeUndefined();
+      expect(res.content[0]!.text).toContain("Workspace successfully restored to checkpoint `abc12345`");
+
+      setGitSpawnRunner(((_cmd: any, args: any) => {
+        if (args[0] === "checkout") {
+          return createMockGitProcess("", "pathspec did not match", 1);
+        }
+        return createMockGitProcess("true", "", 0);
+      }) as any);
+
+      const resFail = await checkpointTool.handler({ action: "restore", checkpoint_id: "invalid-id" });
+      expect(resFail.isError).toBe(true);
+      expect(resFail.content[0]!.text).toContain("Failed to restore checkpoint");
+    });
+
     it("returns error for unknown action", async () => {
+      setGitSpawnRunner((() => createMockGitProcess("true", "", 0)) as any);
       const res = await checkpointTool.handler({ action: "invalid_action" });
       expect(res.isError).toBe(true);
       expect(res.content[0]!.text).toContain("Unknown action 'invalid_action'");
     });
 
     it("creates a new workspace checkpoint with action: 'create'", async () => {
+      setGitSpawnRunner(((_cmd: any, args: any) => {
+        if (args[0] === "rev-parse" && args[1] === "--is-inside-work-tree") {
+          return createMockGitProcess("true", "", 0);
+        }
+        if (args[0] === "rev-parse" && args[1] === "HEAD") {
+          return createMockGitProcess("1111222233334444555566667777888899990000", "", 0);
+        }
+        if (args[0] === "add") {
+          return createMockGitProcess("", "", 0);
+        }
+        if (args[0] === "write-tree") {
+          return createMockGitProcess("aaaabbbbccccddddeeeeffff0000111122223333", "", 0);
+        }
+        if (args[0] === "commit-tree") {
+          return createMockGitProcess("1234567890abcdef1234567890abcdef12345678", "", 0);
+        }
+        if (args[0] === "update-ref") {
+          return createMockGitProcess("", "", 0);
+        }
+        return createMockGitProcess("", "", 0);
+      }) as any);
+
       const res = await checkpointTool.handler({
         action: "create",
         message: "Test unit checkpoint",
@@ -525,6 +745,27 @@ console.log(a);</code></pre>
       expect(res.isError).toBeUndefined();
       expect(res.content[0]!.text).toContain("Checkpoint created successfully");
       expect(res.content[0]!.text).toContain("Test unit checkpoint");
+      expect(res.content[0]!.text).toContain("12345678");
+    });
+
+    it("handles create checkpoint failure when write-tree fails", async () => {
+      setGitSpawnRunner(((_cmd: any, args: any) => {
+        if (args[0] === "rev-parse" && args[1] === "--is-inside-work-tree") {
+          return createMockGitProcess("true", "", 0);
+        }
+        if (args[0] === "write-tree") {
+          return createMockGitProcess("", "index file corrupt", 1);
+        }
+        return createMockGitProcess("", "", 0);
+      }) as any);
+
+      const res = await checkpointTool.handler({
+        action: "create",
+        message: "Test fail",
+      });
+
+      expect(res.isError).toBe(true);
+      expect(res.content[0]!.text).toContain("Failed to create checkpoint tree");
     });
   });
 });

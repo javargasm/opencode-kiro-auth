@@ -1,7 +1,6 @@
 import { spawn } from "child_process";
-import type { RegisteredTool, McpToolResult } from "../types.js";
+import type { RegisteredTool, McpToolResult, SpawnFn } from "../types.js";
 
-export type SpawnFn = typeof spawn;
 let _spawnFn: SpawnFn = spawn;
 
 export function setAwsSpawnRunner(fn: SpawnFn): void {
