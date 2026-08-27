@@ -1,6 +1,17 @@
 import { spawn } from "child_process";
 import type { RegisteredTool, McpToolResult } from "../types.js";
 
+export type SpawnFn = typeof spawn;
+let _spawnFn: SpawnFn = spawn;
+
+export function setAwsSpawnRunner(fn: SpawnFn): void {
+  _spawnFn = fn;
+}
+
+export function resetAwsSpawnRunner(): void {
+  _spawnFn = spawn;
+}
+
 export const awsTool: RegisteredTool = {
   tool: {
     name: "use_aws",
@@ -66,15 +77,15 @@ export const awsTool: RegisteredTool = {
       let stdout = "";
       let stderr = "";
 
-      const child = spawn("aws", cliArgs, {
+      const child = _spawnFn("aws", cliArgs, {
         env: { ...process.env, AWS_PAGER: "" },
         timeout: 30000,
       });
 
-      child.stdout.on("data", (d) => {
+      child.stdout?.on("data", (d) => {
         stdout += d.toString();
       });
-      child.stderr.on("data", (d) => {
+      child.stderr?.on("data", (d) => {
         stderr += d.toString();
       });
 
