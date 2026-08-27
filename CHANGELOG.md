@@ -1,5 +1,13 @@
 # @javargasm/opencode-kiro-auth
 
+## 8.3.0
+
+### Minor Changes
+
+- Add native Kiro tools (`use_aws`, `web_fetch`, `kiro_usage`, `kiro_checkpoint`) directly to OpenCode plugin tool hooks and standalone stdio MCP Server (`--mcp`).
+- Update User-Agent to `kiro-cli` 2.20.0 (`md/appVersion-2.20.0 app/AmazonQ-For-CLI`) with `KIRO_CUSTOM_USER_AGENT` environment override support.
+- Synchronize live model rate multipliers for GPT 5.6 Terra (1.0x) and GPT 5.6 Luna (0.1x).
+
 ## 8.2.4
 
 ### Patch Changes

@@ -1,6 +1,6 @@
 {
   "name": "@javargasm/opencode-kiro-auth",
-  "version": "8.2.4",
+  "version": "8.3.0",
   "description": "Kiro provider plugin for OpenCode: AWS Builder ID / Identity Center login and Anthropic-compatible local gateway for CodeWhisperer streaming.",
   "type": "module",
   "license": "MIT",
@@ -25,6 +25,9 @@
   ],
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "bin": {
+    "opencode-kiro-mcp": "./dist/mcp/index.js"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -37,6 +40,10 @@
     "./tui": {
       "types": "./dist/tui.d.ts",
       "default": "./dist/tui.js"
+    },
+    "./mcp": {
+      "types": "./dist/mcp/index.d.ts",
+      "default": "./dist/mcp/index.js"
     }
   },
   "oc-plugin": [
@@ -49,7 +56,7 @@
   ],
   "scripts": {
     "clean": "rm -rf dist",
-    "build:js": "bun build src/index.ts --outdir dist --target node --format esm --external '@opencode-ai/*'",
+    "build:js": "bun build src/index.ts src/mcp/index.ts --outdir dist --target node --format esm --external '@opencode-ai/*'",
     "build:tui": "bun ./build-tui.ts",
     "build:types": "tsc -p tsconfig.build.json",
     "build": "bun run clean && bun run build:js && bun run build:tui && bun run build:types",

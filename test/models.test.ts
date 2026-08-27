@@ -184,10 +184,10 @@ describe("Kiro model catalog", () => {
       expect(model!.nativeEfforts).toContain("max");
     }
 
-    // Verify specific rate multipliers
+    // Verify specific rate multipliers matching live kiro-cli
     expect(kiroModels.find((m) => m.id === "gpt-5-6-sol")!.rateMultiplier).toBe(2.4);
-    expect(kiroModels.find((m) => m.id === "gpt-5-6-terra")!.rateMultiplier).toBe(1.2);
-    expect(kiroModels.find((m) => m.id === "gpt-5-6-luna")!.rateMultiplier).toBe(0.6);
+    expect(kiroModels.find((m) => m.id === "gpt-5-6-terra")!.rateMultiplier).toBe(1.0);
+    expect(kiroModels.find((m) => m.id === "gpt-5-6-luna")!.rateMultiplier).toBe(0.1);
   });
 });
 

@@ -2,7 +2,11 @@ import { createHash, randomBytes } from "node:crypto";
 import { chmod, link, lstat, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { Plugin, Hooks, PluginModule } from "@opencode-ai/plugin";
+import { type Plugin, type Hooks, type PluginModule, tool } from "@opencode-ai/plugin";
+import { awsTool } from "./mcp/tools/aws";
+import { webFetchTool } from "./mcp/tools/web-fetch";
+import { usageTool } from "./mcp/tools/usage";
+import { checkpointTool } from "./mcp/tools/checkpoint";
 import {
   initGatewayAuth,
   OPENCODE_CWD_HEADER,
@@ -804,6 +808,59 @@ export const KiroPlugin: Plugin = async (input) => {
         }
       }
       gatewayMode = "stopped";
+    },
+
+    tool: {
+      use_aws: tool({
+        description: awsTool.tool.description,
+        args: {
+          service_name: tool.schema.string().describe("The name of the AWS service (e.g. s3, lambda, iam)."),
+          operation_name: tool.schema.string().describe("The name of the operation to perform (e.g. list-buckets)."),
+          parameters: tool.schema.record(tool.schema.string(), tool.schema.any()).optional().describe("CLI options as key-value pairs."),
+          positional_args: tool.schema.array(tool.schema.string()).optional().describe("Optional positional arguments."),
+        },
+        async execute(args) {
+          const res = await awsTool.handler(args);
+          return res.content.map((c) => c.text).join("\n");
+        },
+      }),
+
+      web_fetch: tool({
+        description: webFetchTool.tool.description,
+        args: {
+          url: tool.schema.string().describe("URL to fetch content from."),
+          mode: tool.schema.enum(["selective", "truncated", "full"]).optional().describe("Extraction mode."),
+          search_terms: tool.schema.array(tool.schema.string()).optional().describe("Keywords for selective extraction."),
+        },
+        async execute(args) {
+          const res = await webFetchTool.handler(args);
+          return res.content.map((c) => c.text).join("\n");
+        },
+      }),
+
+      kiro_usage: tool({
+        description: usageTool.tool.description,
+        args: {
+          force: tool.schema.boolean().optional().describe("Force refresh limits from the remote API."),
+        },
+        async execute(args) {
+          const res = await usageTool.handler(args);
+          return res.content.map((c) => c.text).join("\n");
+        },
+      }),
+
+      kiro_checkpoint: tool({
+        description: checkpointTool.tool.description,
+        args: {
+          action: tool.schema.enum(["create", "list", "diff", "restore"]).describe("Checkpoint action to execute."),
+          message: tool.schema.string().optional().describe("Descriptive message when creating checkpoint."),
+          checkpoint_id: tool.schema.string().optional().describe("Checkpoint ID for diff or restore."),
+        },
+        async execute(args) {
+          const res = await checkpointTool.handler(args);
+          return res.content.map((c) => c.text).join("\n");
+        },
+      }),
     },
 
     provider: {

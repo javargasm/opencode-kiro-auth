@@ -1,15 +1,17 @@
 # @javargasm/opencode-kiro-auth
 
-Kiro provider plugin for [OpenCode](https://opencode.ai). Authenticates via AWS Builder ID or IAM Identity Center and exposes all Kiro models through an Anthropic-compatible local gateway.
+Kiro provider plugin for [OpenCode](https://opencode.ai). Authenticates via AWS Builder ID or IAM Identity Center and exposes all Kiro models through an Anthropic-compatible local gateway, alongside native Kiro CLI tools and a standalone MCP server.
 
 ## Features
 
 - **AWS Builder ID / IAM Identity Center** — OAuth device-code login with automatic token refresh
 - **Dynamic model discovery** — fetches available models from the Kiro API at runtime; falls back to a curated static catalog
 - **Credit-aware model names** — appends each Kiro `rateMultiplier` to the model picker label, e.g. `Claude Sonnet 5 (1.3x)`
+- **Native Kiro Tools in OpenCode** — auto-loads `use_aws`, `web_fetch` (smart context-saving extractor), `kiro_usage`, and `kiro_checkpoint` into OpenCode with zero manual configuration
+- **Standalone MCP Server** — provides a high-performance, zero-dependency JSON-RPC 2.0 stdio server (`--mcp`) compatible with MCP clients (Claude Desktop, Cursor, external tools)
 - **Local Anthropic gateway** — translates Anthropic Messages API requests to Kiro's CodeWhisperer streaming protocol
 - **Transport retries** — retries transient socket/proxy disconnects with exponential backoff before any output is streamed
-- **Adaptive thinking** — maps reasoning effort levels (`low` → `max`) through the `output_config.effort` parameter
+- **Adaptive thinking** — maps reasoning effort levels (`low` → `max`) through `output_config.effort` and `reasoning.effort`
 - **Multi-region** — supports `us-east-1` and `eu-central-1` Kiro API regions with automatic SSO region mapping
 - **Zero external dependencies** — self-contained plugin; no runtime deps beyond the OpenCode SDK
 
@@ -21,8 +23,8 @@ Kiro provider plugin for [OpenCode](https://opencode.ai). Authenticates via AWS 
 | Claude Opus 5 | ✅ | 1M | 2.2x | low, medium, high, xhigh, max |
 | Claude Opus 4.8 | ✅ | 1M | 2.2x | low, medium, high, xhigh, max |
 | GPT 5.6 Sol | ✅ | 272K | 2.4x | none, low, medium, high, xhigh, max |
-| GPT 5.6 Terra | ✅ | 272K | 1.2x | none, low, medium, high, xhigh, max |
-| GPT 5.6 Luna | ✅ | 272K | 0.6x | none, low, medium, high, xhigh, max |
+| GPT 5.6 Terra | ✅ | 272K | 1.0x | none, low, medium, high, xhigh, max |
+| GPT 5.6 Luna | ✅ | 272K | 0.1x | none, low, medium, high, xhigh, max |
 | Claude Opus 4.7 | ✅ | 1M | 2.2x | low, medium, high, xhigh, max |
 | Claude Opus 4.6 | ✅ | 1M | 2.2x | low, medium, high, max |
 | Claude Sonnet 4.6 | ✅ | 1M | 1.3x | low, medium, high, max |
@@ -38,6 +40,41 @@ Kiro provider plugin for [OpenCode](https://opencode.ai). Authenticates via AWS 
 | Auto | ✅ | 1M | 1x | — |
 
 > Models without effort levels listed use Kiro's default reasoning behavior. Additional models may appear dynamically via the `ListAvailableModels` API. The model picker displays the upstream `rateMultiplier` next to every model returned by the endpoint or fallback catalog. `Claude Fable 5 (disabled)` remains in the fallback catalog for compatibility but is not advertised as an active model.
+
+## Native Kiro Tools
+
+The plugin automatically provides native Kiro utilities to OpenCode through the plugin tool hooks.
+
+| Tool | Parameters | Description |
+|:---|:---|:---|
+| **`use_aws`** | `service_name`, `operation_name`, `parameters`, `positional_args` | Makes AWS CLI/SDK calls with automatic credential passing and argument formatting. |
+| **`web_fetch`** | `url`, `mode` (`selective` \| `truncated` \| `full`), `search_terms` | Smart web scraper. In `selective` mode, extracts only sections relevant to `search_terms` saving up to 80% context window tokens. |
+| **`kiro_usage`** | `force` (boolean) | Queries real-time account usage percentage, credits used/total, and monthly reset duration. |
+| **`kiro_checkpoint`** | `action` (`create` \| `list` \| `diff` \| `restore`), `message`, `checkpoint_id` | Manages workspace snapshots and safe restore points backed by Git. |
+
+### Standalone Model Context Protocol (MCP) Server
+
+You can also use these tools in external MCP clients (such as Claude Desktop, Cursor, or standalone agents):
+
+#### Running via CLI
+```bash
+npx -y @javargasm/opencode-kiro-auth --mcp
+# or with global binary
+opencode-kiro-mcp
+```
+
+#### Configuring in OpenCode MCP (`opencode.json`)
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "kiro-tools": {
+      "command": "npx",
+      "args": ["-y", "@javargasm/opencode-kiro-auth", "--mcp"]
+    }
+  }
+}
+```
 
 ## Installation
 
@@ -238,16 +275,16 @@ opencode plugin @javargasm/opencode-kiro-auth
 ### Commands
 
 ```bash
-# Type-check + run tests
+# Type-check + run tests + build
 bun run check
 
 # Type-check only
 bun run typecheck
 
-# Run tests
+# Run Vitest unit tests
 bun run test
 
-# Run Bun gateway tests
+# Run Bun gateway integration tests
 bun run test:bun
 
 # Run tests in watch mode
@@ -304,7 +341,7 @@ plugin (`bun run build`) and restart OpenCode after changing it.
 
 ```
 src/
-├── index.ts            # Plugin entry: auth hooks, model registration, gateway lifecycle
+├── index.ts            # Plugin entry: auth hooks, model registration, tool hooks, gateway lifecycle
 ├── types.ts            # Local type definitions and runtime utilities
 ├── server.ts           # Bun.serve Anthropic gateway (Messages API → Kiro SSE)
 ├── stream.ts           # Kiro streaming orchestrator (request build, retry, event parsing)
@@ -319,9 +356,19 @@ src/
 ├── debug.ts            # Structured logging
 ├── tui.tsx             # TUI usage bar component (OpenTUI / Solid)
 ├── tui-detect.ts       # Provider detection helpers for the TUI bar
-└── session-probe.ts    # Session/message provider resolution
+├── session-probe.ts    # Session/message provider resolution
+└── mcp/
+    ├── index.ts        # MCP server entrypoint and CLI runner
+    ├── server.ts       # McpServer JSON-RPC 2.0 stdio implementation
+    ├── types.ts        # MCP and JSON-RPC type definitions
+    └── tools/
+        ├── aws.ts         # use_aws tool handler
+        ├── web-fetch.ts   # web_fetch selective extraction handler
+        ├── usage.ts       # kiro_usage limits handler
+        └── checkpoint.ts  # kiro_checkpoint git snapshot handler
 test/
 ├── stream.test.ts          # Stream orchestrator tests
+├── mcp.test.ts             # MCP server & native tool unit tests
 ├── kiro-detector.test.ts   # Provider detection unit tests
 └── session-probe.test.ts   # Session probe unit tests
 ```
@@ -335,11 +382,12 @@ test/
 │   anthropic) │◀────│                     │◀────│   Streaming)     │
 │              │ SSE │  POST /v1/messages   │     │                  │
 └──────────────┘     └─────────────────────┘     └──────────────────┘
-                        ▲
-                        │ Translates:
-                        │ • Anthropic Messages → Kiro request body
-                        │ • Kiro JSON events → Anthropic SSE events
-                        │ • Handles retry, capacity, context truncation
+        │                       ▲
+        ▼                       │ Translates:
+┌──────────────┐                │ • Anthropic Messages → Kiro request body
+│ Plugin Tools │                │ • Kiro JSON events → Anthropic SSE events
+│  & MCP Stdio │                │ • Handles retry, capacity, context truncation
+└──────────────┘
 ```
 
 The gateway runs on the fixed loopback address `127.0.0.1:7438` so multiple
