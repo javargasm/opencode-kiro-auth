@@ -1067,8 +1067,11 @@ export function streamKiro(
         while (true) {
           await stream.waitForCapacity(STREAM_EVENT_PUSH_RESERVE, signal);
           const osName = resolveOS();
-          const ua = `aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17975 os/${osName} lang/rust/1.92.0 md/appVersion-2.19.1 app/AmazonQ-For-CLI`;
-          const xAmzUa = `aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17975 os/${osName} lang/rust/1.92.0 m/F,C app/AmazonQ-For-CLI`;
+          const ua = process.env.KIRO_CUSTOM_USER_AGENT ||
+            `aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17975 os/${osName} lang/rust/1.92.0 md/appVersion-2.20.0 app/AmazonQ-For-CLI`;
+          const xAmzUa = process.env.KIRO_CUSTOM_USER_AGENT
+            ? `${process.env.KIRO_CUSTOM_USER_AGENT} m/F,C`
+            : `aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17975 os/${osName} lang/rust/1.92.0 m/F,C app/AmazonQ-For-CLI`;
           const requestBody = JSON.stringify(request);
 
 

@@ -197,7 +197,7 @@ describe("streamKiro", () => {
     // user-agent and x-amz-user-agent must differ (m/F vs md/appVersion)
     expect(opts.headers["user-agent"]).toContain("aws-sdk-rust/1.3.15");
     expect(opts.headers["user-agent"]).toContain("api/codewhispererstreaming/0.1.17975");
-    expect(opts.headers["user-agent"]).toContain("md/appVersion-2.19.1");
+    expect(opts.headers["user-agent"]).toContain("md/appVersion-2.20.0");
     expect(opts.headers["x-amz-user-agent"]).toContain("aws-sdk-rust/1.3.15");
     expect(opts.headers["x-amz-user-agent"]).toContain("api/codewhispererstreaming/0.1.17975");
     expect(opts.headers["x-amz-user-agent"]).toContain("m/F");

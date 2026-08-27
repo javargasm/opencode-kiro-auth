@@ -86,7 +86,8 @@ const BASE_URL = "https://runtime.us-east-1.kiro.dev";
 const ZERO_COST = Object.freeze({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
 const KIRO_CLI_ORIGIN = "KIRO_CLI";
 const KIRO_CLI_USER_AGENT =
-  "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererruntime/0.1.17975 os/macos lang/rust/1.92.0 md/appVersion-2.19.1 app/AmazonQ-For-CLI";
+  process.env.KIRO_CUSTOM_USER_AGENT ||
+  "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererruntime/0.1.17975 os/macos lang/rust/1.92.0 md/appVersion-2.20.0 app/AmazonQ-For-CLI";
 const KIRO_CLI_X_AMZ_USER_AGENT = `${KIRO_CLI_USER_AGENT} m/F,C`;
 const KIRO_MANAGEMENT_TARGET = {
   listAvailableProfiles: "AmazonCodeWhispererService.ListAvailableProfiles",
