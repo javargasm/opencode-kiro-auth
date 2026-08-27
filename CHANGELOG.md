@@ -1,5 +1,13 @@
 # @javargasm/opencode-kiro-auth
 
+## 8.3.1
+
+### Patch Changes
+
+- Add native `web_search` tool for fast, zero-dependency web lookups and documentation retrieval.
+- Add native `thinking` tool for structured intermediate reasoning and scratchpad planning across all models.
+- Harden git author environment configuration and spawn testability in `kiro_checkpoint`.
+
 ## 8.3.0
 
 ### Minor Changes

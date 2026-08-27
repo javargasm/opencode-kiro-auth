@@ -17,7 +17,7 @@ export class McpServer {
   private name: string;
   private version: string;
 
-  constructor(name = "@javargasm/opencode-kiro-auth", version = "8.3.0") {
+  constructor(name = "@javargasm/opencode-kiro-auth", version = "8.3.1") {
     this.name = name;
     this.version = version;
 
