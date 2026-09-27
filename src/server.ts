@@ -893,25 +893,50 @@ function dashboardError(status: 401 | 403, message: string): Response {
   return response;
 }
 
-/**
- * Detect OpenCode's title-generation turn. OpenCode prepends a user message
- * that begins with "Generate a title for this conversation" (see opencode
- * src/session/prompt.ts). Keying off this marker means we strip wrapping
- * markdown ONLY for titles — never for normal chat, which legitimately uses
- * **bold**, `code`, and quotes.
- */
-function isTitleGenerationRequest(messages: any[]): boolean {
-  for (const m of messages) {
-    if (m?.role !== "user") continue;
-    const text =
-      typeof m.content === "string"
-        ? m.content
-        : Array.isArray(m.content)
-          ? m.content.map((b: any) => (typeof b === "string" ? b : b?.text || "")).join(" ")
-          : "";
-    if (/generate a title for this conversation/i.test(text)) return true;
+/** Plain text of one Anthropic message (string or text-block array). */
+function messageText(m: any): string {
+  if (typeof m?.content === "string") return m.content;
+  if (Array.isArray(m?.content)) {
+    return m.content
+      .map((b: any) => (typeof b === "string" ? b : b?.text || ""))
+      .join("\n");
   }
-  return false;
+  return "";
+}
+
+/**
+ * OpenCode's title prompt marker. The title turn is built as
+ * `[{ role: "user", content: "Generate a title for this conversation:\n" }, ...msgs]`
+ * (opencode src/session/prompt.ts), so the marker is the very start of the
+ * FIRST user message — after the Anthropic SDK merges consecutive user
+ * messages it is the first text block of that message.
+ */
+const TITLE_PROMPT_MARKER = /^\s*generate a title for this conversation\b/i;
+
+/**
+ * Detect OpenCode's title-generation turn. Keying off the marker means we
+ * strip wrapping markdown (and buffer the text) ONLY for titles — never for
+ * normal chat, which legitimately uses **bold**, `code`, and quotes.
+ *
+ * The check is deliberately strict, because a false positive is not
+ * cosmetic: the streaming path buffers every text delta of a "title" turn
+ * and flushes it at the end, which for a real chat turn silently swallows
+ * the assistant's text (see the flush in the SSE handler).
+ *
+ *  - The marker must be at the START of the first user message. An
+ *    unanchored search over the whole history matched prompts that merely
+ *    QUOTED the marker (a pasted bug report, a compaction transcript with
+ *    "[User]: Generate a title for this conversation:"), flagging real
+ *    build/compaction turns as titles.
+ *  - A request that defines tools is never a title turn: OpenCode sends
+ *    title generation with `tools: {}`.
+ */
+export function isTitleGenerationRequest(messages: any[], tools?: unknown): boolean {
+  if (Array.isArray(tools) && tools.length > 0) return false;
+  if (!Array.isArray(messages)) return false;
+  const firstUser = messages.find((m) => m?.role === "user");
+  if (!firstUser) return false;
+  return TITLE_PROMPT_MARKER.test(messageText(firstUser));
 }
 
 /** Short, stable, filesystem-safe hash for grouping log files. */
@@ -991,7 +1016,7 @@ function deriveLogSessionId(body: any, messages: any[], headers?: Headers): stri
 
   const seed = conversationSeed(messages);
 
-  if (isTitleGenerationRequest(messages)) {
+  if (isTitleGenerationRequest(messages, body?.tools)) {
     return `title-${shortHash(seed || "untitled")}`;
   }
 
@@ -1312,10 +1337,7 @@ export function startGatewayServer(
 
             const context: Context = {
               messages: piMessages,
-              // Don't send OpenCode's system prompt to Kiro — it's designed
-              // for Anthropic's native API and bloats the content to 34KB+.
-              // Kiro uses its own agent prompt via the synthetic seed pair.
-              systemPrompt: "",
+              systemPrompt,
               tools: body.tools ? translateAnthropicToolsToPi(body.tools) : undefined,
             };
 
@@ -1406,7 +1428,10 @@ export function startGatewayServer(
 
             // Title-generation turns need wrapping markdown stripped from the
             // model's output (Kiro models return "**Title**" despite the prompt).
-            const isTitleTurn = isTitleGenerationRequest(anthropicMessages);
+            // Strict detection (marker at the start of the first user message,
+            // no tools): a false positive here makes the SSE path buffer the
+            // whole assistant text of a real turn.
+            const isTitleTurn = isTitleGenerationRequest(anthropicMessages, body.tools);
 
             log.info(`[gateway] → ${kiroEndpoint} model=${anthropicModelId} region=${apiRegion} stream=${streamRequested}`);
 
@@ -1579,6 +1604,11 @@ export function startGatewayServer(
                     // For title turns we buffer text deltas and emit the
                     // markdown-stripped title once at the end, since wrapping
                     // like **Title** can't be detected from a single delta.
+                    // No text block is opened while buffering: the title is
+                    // flushed into a block opened at flush time so its index
+                    // stays correct even when tool_use / redacted_thinking
+                    // blocks arrive after the text (Kiro emits a trailing
+                    // redacted reasoning block on every gpt-5-6 response).
                     let titleTextBuffer = "";
 
                     const closeActiveBlock = () => {
@@ -1664,14 +1694,19 @@ export function startGatewayServer(
                           closeActiveBlock();
                         }
                       } else if (event.type === "text_delta") {
-                        ensureBlockStarted("text");
                         if (isTitleTurn) {
                           // Buffer instead of streaming: we can only strip
                           // wrapping markdown (**Title**) once we have the
-                          // whole title. Flushed in finalizeTitleBlock().
+                          // whole title. Do NOT open a text block here — an
+                          // empty block opened now would be closed by the next
+                          // tool_use/thinking block, and the final flush would
+                          // then target a foreign index ("text part N not
+                          // found" in @ai-sdk/anthropic). Flushed after the
+                          // event loop below.
                           titleTextBuffer += event.delta;
                           return;
                         }
+                        ensureBlockStarted("text");
                         enqueue(
                           "event: content_block_delta\ndata: " +
                           JSON.stringify({
@@ -1731,11 +1766,14 @@ export function startGatewayServer(
                     }
 
                     // Flush the buffered title (markdown-stripped) as a single
-                    // text delta before closing the block. Only set on title
-                    // turns; normal chat streamed its deltas live above.
+                    // text delta inside a text block opened right here, so the
+                    // delta's index always matches an open text block — even
+                    // after tool_use / redacted_thinking blocks. Only set on
+                    // title turns; normal chat streamed its deltas live above.
                     if (isTitleTurn && titleTextBuffer.length > 0) {
-                      const cleanTitle = stripTitleMarkdown(titleTextBuffer);
+                      const cleanTitle = stripTitleMarkdown(titleTextBuffer) || titleTextBuffer.trim();
                       await waitForCapacity();
+                      ensureBlockStarted("text");
                       enqueue(
                         "event: content_block_delta\ndata: " +
                         JSON.stringify({

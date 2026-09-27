@@ -1,5 +1,14 @@
 # @javargasm/opencode-kiro-auth
 
+## 8.3.2
+
+### Patch Changes
+
+- Forward OpenCode's external system prompt (`context.systemPrompt`) directly through the gateway to Kiro, ensuring custom agent instructions, personas, and rules are retained alongside Kiro's synthetic baseline instruction pair.
+- Harden title generation turn detection by anchoring `TITLE_PROMPT_MARKER` to the start of the first user message and disabling it when tools are defined, preventing false-positive buffering on chat turns that merely quote the marker.
+- Resolve SSE title flush and content block ordering issues ("text part N not found") by opening title text blocks at flush time after trailing reasoning blocks.
+- Update documentation and README to reflect system prompt preservation, title streaming resilience, and repository structure.
+
 ## 8.3.1
 
 ### Patch Changes

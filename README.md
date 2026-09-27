@@ -7,9 +7,11 @@ Kiro provider plugin for [OpenCode](https://opencode.ai). Authenticates via AWS 
 - **AWS Builder ID / IAM Identity Center** — OAuth device-code login with automatic token refresh
 - **Dynamic model discovery** — fetches available models from the Kiro API at runtime; falls back to a curated static catalog
 - **Credit-aware model names** — appends each Kiro `rateMultiplier` to the model picker label, e.g. `Claude Sonnet 5 (1.3x)`
-- **Native Kiro Tools in OpenCode** — auto-loads `use_aws`, `web_fetch` (smart context-saving extractor), `kiro_usage`, and `kiro_checkpoint` into OpenCode with zero manual configuration
+- **Native Kiro Tools in OpenCode** — auto-loads `use_aws`, `web_fetch` (smart context-saving extractor), `web_search` (fast web lookup), `thinking` (scratchpad reasoning), `kiro_usage`, and `kiro_checkpoint` into OpenCode with zero manual configuration
 - **Standalone MCP Server** — provides a high-performance, zero-dependency JSON-RPC 2.0 stdio server (`--mcp`) compatible with MCP clients (Claude Desktop, Cursor, external tools)
 - **Local Anthropic gateway** — translates Anthropic Messages API requests to Kiro's CodeWhisperer streaming protocol
+- **Full system prompt support** — forwards OpenCode's system prompts (custom instructions, agents, rules) directly to Kiro alongside baseline agent instructions
+- **Resilient SSE streaming & title lifecycle** — strictly anchors title-generation detection and flushes content blocks cleanly, preventing index desync and "text part not found" errors
 - **Transport retries** — retries transient socket/proxy disconnects with exponential backoff before any output is streamed
 - **Adaptive thinking** — maps reasoning effort levels (`low` → `max`) through `output_config.effort` and `reasoning.effort`
 - **Multi-region** — supports `us-east-1` and `eu-central-1` Kiro API regions with automatic SSO region mapping
@@ -298,11 +300,11 @@ bun run build
 
 ### Release
 
-Patch/minor releases are tagged with `vX.Y.Z`. Pushing a tag triggers `.github/workflows/release.yaml`, which runs checks, builds the package, and publishes to npm with provenance through npm trusted publishing.
+Patch/minor releases are tagged with `vX.Y.Z`. Pushing a tag triggers `.github/workflows/release.yml`, which runs checks, builds the package, and publishes to npm with provenance through npm trusted publishing.
 
 Required npm setup:
 
-- Configure npm trusted publishing for `@javargasm/opencode-kiro-auth` and allow the GitHub workflow `.github/workflows/release.yaml`
+- Configure npm trusted publishing for `@javargasm/opencode-kiro-auth` and allow the GitHub workflow `.github/workflows/release.yml`
 
 Release commands:
 
@@ -352,12 +354,15 @@ src/
 ├── transform.ts        # Message format conversion (OpenCode ↔ Kiro wire format)
 ├── thinking-parser.ts  # Streaming <thinking> tag parser for inline reasoning
 ├── event-parser.ts     # Kiro JSON event stream parser
+├── kiro-cli-sync.ts    # Sync and import tokens from Kiro CLI SQLite / SSO cache
 ├── kiro-defaults.ts    # Static protocol constants (system seed, tool schemas)
 ├── health.ts           # Permanent error classification
 ├── tokenizer.ts        # Lightweight token estimation
-├── debug.ts            # Structured logging
+├── file-logger.ts      # Structured disk logging for gateway turns
+├── debug.ts            # Logging helpers
 ├── tui.tsx             # TUI usage bar component (OpenTUI / Solid)
 ├── tui-detect.ts       # Provider detection helpers for the TUI bar
+├── tui-gateway.ts      # Local gateway status and usage helper for TUI
 ├── session-probe.ts    # Session/message provider resolution
 └── mcp/
     ├── index.ts        # MCP server entrypoint and CLI runner
@@ -371,10 +376,17 @@ src/
         ├── usage.ts       # kiro_usage limits handler
         └── checkpoint.ts  # kiro_checkpoint git snapshot handler
 test/
-├── stream.test.ts          # Stream orchestrator tests
+├── gateway.test.ts         # Anthropic HTTP gateway protocol & SSE tests
+├── stream.test.ts          # Stream orchestrator & wire format tests
 ├── mcp.test.ts             # MCP server & native tool unit tests
+├── oauth.test.ts           # OAuth device flow & token refresh tests
+├── kiro-cli-sync.test.ts   # Kiro CLI credentials import & SQLite tests
+├── models.test.ts          # Model resolution & dynamic discovery tests
+├── event-parser.test.ts    # Event stream parser tests
 ├── kiro-detector.test.ts   # Provider detection unit tests
-└── session-probe.test.ts   # Session probe unit tests
+├── session-probe.test.ts   # Session probe unit tests
+├── transform.test.ts       # Message structure conversion tests
+└── types.test.ts           # Type guard & utility unit tests
 ```
 
 ## Architecture

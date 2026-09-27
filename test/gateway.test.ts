@@ -1448,7 +1448,7 @@ describe("Local HTTP Gateway Server (Anthropic Protocol)", () => {
     expect(mockStreamKiro).toHaveBeenCalled();
     const [modelArg, contextArg] = mockStreamKiro.mock.calls[0] as [any, any];
     expect(modelArg.id).toBe("claude-sonnet-4-6");
-    expect(contextArg.systemPrompt).toBe("");
+    expect(contextArg.systemPrompt).toBe("System prompt");
     expect(contextArg.messages[0].role).toBe("user");
     expect(contextArg.messages[0].content).toBe("Hello");
 
@@ -2331,3 +2331,356 @@ describe("Gateway bug fixes (#2, #3, #7, #13)", () => {
     });
   });
 });
+
+describe("Title-generation detection and SSE title flush (\"text part N not found\")", () => {
+  beforeEach(() => {
+    mockStreamKiro.mockReset();
+    mockRefresh.mockReset();
+    _seedCredentials("test-token");
+  });
+
+  const TITLE_MARKER = "Generate a title for this conversation:\n";
+  const OPAQUE = "cmVkYWN0ZWQ=";
+  // A prompt that merely QUOTES the marker (a pasted bug report / compaction
+  // transcript). This is what flagged real build turns as title turns.
+  const QUOTED_MARKER_PROMPT =
+    "verifica y soluciona el siguiente reporte:\n"
+    + "The following is the conversation history:\n"
+    + "[User]: Audita en paralelo el...\n"
+    + "[User]: Generate a title for this conversation:\n"
+    + "if (/generate a title for this conversation/i.test(text)) return true;";
+  const BASH_TOOL = {
+    name: "bash",
+    description: "Run a shell command",
+    input_schema: { type: "object", properties: { command: { type: "string" } } },
+  };
+
+  function parseSse(text: string): any[] {
+    return text
+      .split("\n\n")
+      .filter((b) => b.trim() !== "")
+      .map((b) => JSON.parse(b.slice(b.indexOf("data: ") + "data: ".length)));
+  }
+
+  // Mirrors the bookkeeping of @ai-sdk/anthropic + the `ai` core: a
+  // content_block_delta must address a block that is currently open and of a
+  // matching type. A text_delta aimed at a closed or non-text index is exactly
+  // what OpenCode surfaced as `UnknownError: "text part N not found"`.
+  function validateBlockLifecycle(events: any[]) {
+    const open = new Map<number, string>();
+    const seen = new Set<number>();
+    const starts: Array<{ index: number; type: string }> = [];
+    const textByIndex = new Map<number, string>();
+    for (const ev of events) {
+      if (ev.type === "content_block_start") {
+        if (seen.has(ev.index)) throw new Error(`block index ${ev.index} started twice`);
+        seen.add(ev.index);
+        open.set(ev.index, ev.content_block.type);
+        starts.push({ index: ev.index, type: ev.content_block.type });
+      } else if (ev.type === "content_block_delta") {
+        const blockType = open.get(ev.index);
+        if (blockType === undefined) {
+          throw new Error(`text part ${ev.index} not found (delta ${ev.delta.type} to a block that is not open)`);
+        }
+        const expected =
+          ev.delta.type === "text_delta" ? "text"
+          : ev.delta.type === "input_json_delta" ? "tool_use"
+          : "thinking";
+        if (blockType !== expected) {
+          throw new Error(`delta ${ev.delta.type} sent to a ${blockType} block at index ${ev.index}`);
+        }
+        if (ev.delta.type === "text_delta") {
+          textByIndex.set(ev.index, (textByIndex.get(ev.index) ?? "") + ev.delta.text);
+        }
+      } else if (ev.type === "content_block_stop") {
+        if (!open.has(ev.index)) throw new Error(`block index ${ev.index} stopped while not open`);
+        open.delete(ev.index);
+      }
+    }
+    if (open.size > 0) throw new Error(`blocks left open: ${[...open.keys()].join(",")}`);
+    return { starts, textByIndex };
+  }
+
+  async function postStream(port: number | undefined, body: Record<string, unknown>): Promise<any[]> {
+    const resp = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer mock-token" },
+      body: JSON.stringify({ model: "claude-sonnet-4-6", stream: true, ...body }),
+    });
+    expect(resp.status).toBe(200);
+    const events = parseSse(await resp.text());
+    expect(events[0]?.type).toBe("message_start");
+    expect(events[events.length - 1]?.type).toBe("message_stop");
+    return events;
+  }
+
+  it("isTitleGenerationRequest is anchored to the start of the first user message and off when tools exist", async () => {
+    const { isTitleGenerationRequest } = await import("../src/server");
+
+    // OpenCode layout: [{ user: marker }, ...msgs] — merged into one user
+    // message with two text blocks by the Anthropic SDK...
+    expect(isTitleGenerationRequest([
+      { role: "user", content: [{ type: "text", text: TITLE_MARKER }, { type: "text", text: "verifica el reporte" }] },
+    ])).toBe(true);
+    // ...or left as two consecutive user messages.
+    expect(isTitleGenerationRequest([
+      { role: "user", content: TITLE_MARKER },
+      { role: "user", content: "verifica el reporte" },
+    ])).toBe(true);
+    // String content, leading whitespace, case-insensitive, empty tools list.
+    expect(isTitleGenerationRequest([{ role: "user", content: "  generate a title for this conversation:\nhola" }], [])).toBe(true);
+
+    // The reported false positive: marker quoted inside a pasted report.
+    expect(isTitleGenerationRequest([{ role: "user", content: QUOTED_MARKER_PROMPT }])).toBe(false);
+    expect(isTitleGenerationRequest([{ role: "user", content: QUOTED_MARKER_PROMPT }], [BASH_TOOL])).toBe(false);
+    // Follow-up turn ("continua") of that same conversation.
+    expect(isTitleGenerationRequest([
+      { role: "user", content: QUOTED_MARKER_PROMPT },
+      { role: "assistant", content: [{ type: "text", text: "..." }] },
+      { role: "user", content: "continua" },
+    ], [BASH_TOOL])).toBe(false);
+    // Marker at the start but tools defined → a real agent turn, never a title.
+    expect(isTitleGenerationRequest([{ role: "user", content: TITLE_MARKER + "hola" }], [BASH_TOOL])).toBe(false);
+    // Marker only in a later user message, not the first.
+    expect(isTitleGenerationRequest([
+      { role: "user", content: "hola" },
+      { role: "assistant", content: "hola!" },
+      { role: "user", content: TITLE_MARKER },
+    ])).toBe(false);
+    // Degenerate inputs.
+    expect(isTitleGenerationRequest([])).toBe(false);
+    expect(isTitleGenerationRequest([{ role: "assistant", content: TITLE_MARKER }])).toBe(false);
+    expect(isTitleGenerationRequest([{ role: "user", content: [{ type: "image", source: {} }] }])).toBe(false);
+  });
+
+  it("title turn: flushes the stripped title into a text block opened AFTER a trailing redacted_thinking block", async () => {
+    // Shape of every gpt-5-6 title response seen in the Kiro logs:
+    // text deltas first, then one redacted reasoning block, then END_TURN.
+    mockStreamKiro.mockImplementation(() => ({
+      async *[Symbol.asyncIterator]() {
+        yield { type: "text_delta", delta: "**Corrección" };
+        yield { type: "text_delta", delta: " del error**" };
+        const partial = {
+          content: [
+            { type: "text", text: "**Corrección del error**" },
+            { type: "thinking", thinking: "", redacted: true, redactedContent: OPAQUE },
+          ],
+        };
+        yield { type: "thinking_start", contentIndex: 1, partial };
+        yield { type: "thinking_end", contentIndex: 1, content: "", partial };
+      },
+      async result() {
+        return {
+          role: "assistant",
+          content: [
+            { type: "text", text: "**Corrección del error**" },
+            { type: "thinking", thinking: "", redacted: true, redactedContent: OPAQUE },
+          ],
+          usage: { input: 1, output: 1 },
+        };
+      },
+    }));
+
+    const server = await startGatewayServer(0);
+    try {
+      const events = await postStream(server.port, {
+        messages: [
+          { role: "user", content: [{ type: "text", text: TITLE_MARKER }, { type: "text", text: "verifica el reporte" }] },
+        ],
+      });
+      // Before the fix this threw: text_delta sent to index 1, which was the
+      // (already closed) redacted_thinking block → "text part 1 not found".
+      const { starts, textByIndex } = validateBlockLifecycle(events);
+      expect(starts).toEqual([
+        { index: 0, type: "redacted_thinking" },
+        { index: 1, type: "text" },
+      ]);
+      expect([...textByIndex.entries()]).toEqual([[1, "Corrección del error"]]);
+      // Buffered: nothing was streamed before the redacted block.
+      const firstTextDelta = events.findIndex((e) => e.type === "content_block_delta" && e.delta.type === "text_delta");
+      const redactedStop = events.findIndex((e) => e.type === "content_block_stop" && e.index === 0);
+      expect(firstTextDelta).toBeGreaterThan(redactedStop);
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  it("title turn without trailing blocks still yields a single stripped text block at index 0", async () => {
+    mockStreamKiro.mockImplementation(() => ({
+      async *[Symbol.asyncIterator]() {
+        yield { type: "text_delta", delta: "**Debugging" };
+        yield { type: "text_delta", delta: " Gateway**" };
+      },
+      async result() {
+        return { role: "assistant", content: [{ type: "text", text: "**Debugging Gateway**" }], usage: { input: 1, output: 1 } };
+      },
+    }));
+
+    const server = await startGatewayServer(0);
+    try {
+      const events = await postStream(server.port, {
+        messages: [{ role: "user", content: TITLE_MARKER + "help me debug the gateway" }],
+      });
+      const { starts, textByIndex } = validateBlockLifecycle(events);
+      expect(starts).toEqual([{ index: 0, type: "text" }]);
+      expect([...textByIndex.entries()]).toEqual([[0, "Debugging Gateway"]]);
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  it("build turn with tools that QUOTES the marker streams text live and keeps every block index valid", async () => {
+    // Shape of the failing build attempts: text, tool calls, trailing redacted
+    // reasoning. Misclassified as a title turn, the gateway buffered the text
+    // and flushed it to the redacted block's index → "text part 4 not found".
+    mockStreamKiro.mockImplementation(() => ({
+      async *[Symbol.asyncIterator]() {
+        yield { type: "text_delta", delta: "Voy a **revisar** el reporte." };
+        const toolPartial = { content: [
+          { type: "text", text: "Voy a **revisar** el reporte." },
+          { type: "toolCall", id: "call_1", name: "bash", arguments: {} },
+        ] };
+        yield { type: "toolcall_start", contentIndex: 1, partial: toolPartial };
+        yield { type: "toolcall_delta", contentIndex: 1, delta: "{\"command\":\"ls\"}", partial: toolPartial };
+        yield { type: "toolcall_end", contentIndex: 1, partial: toolPartial };
+        const partial = { content: [
+          ...toolPartial.content,
+          { type: "thinking", thinking: "", redacted: true, redactedContent: OPAQUE },
+        ] };
+        yield { type: "thinking_start", contentIndex: 2, partial };
+        yield { type: "thinking_end", contentIndex: 2, content: "", partial };
+      },
+      async result() {
+        return {
+          role: "assistant",
+          content: [
+            { type: "text", text: "Voy a **revisar** el reporte." },
+            { type: "toolCall", id: "call_1", name: "bash", arguments: { command: "ls" } },
+            { type: "thinking", thinking: "", redacted: true, redactedContent: OPAQUE },
+          ],
+          usage: { input: 1, output: 1 },
+          stopReason: "toolUse",
+        };
+      },
+    }));
+
+    const server = await startGatewayServer(0);
+    try {
+      const events = await postStream(server.port, {
+        messages: [{ role: "user", content: QUOTED_MARKER_PROMPT }],
+        tools: [BASH_TOOL],
+      });
+      const { starts, textByIndex } = validateBlockLifecycle(events);
+      expect(starts).toEqual([
+        { index: 0, type: "text" },
+        { index: 1, type: "tool_use" },
+        { index: 2, type: "redacted_thinking" },
+      ]);
+      // Not a title turn: text is streamed live and its markdown is intact.
+      expect([...textByIndex.entries()]).toEqual([[0, "Voy a **revisar** el reporte."]]);
+      const firstTextDelta = events.findIndex((e) => e.type === "content_block_delta" && e.delta.type === "text_delta");
+      const toolStart = events.findIndex((e) => e.type === "content_block_start" && e.content_block.type === "tool_use");
+      expect(firstTextDelta).toBeLessThan(toolStart);
+      const toolStartEvent = events[toolStart];
+      expect(toolStartEvent.content_block.name).toBe("bash");
+      expect(mockStreamKiro).toHaveBeenCalledTimes(1);
+      expect((mockStreamKiro.mock.calls[0] as any[])[1].tools).toHaveLength(1);
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  it("tool-less auxiliary turn (compaction transcript quoting the marker) is not treated as a title", async () => {
+    mockStreamKiro.mockImplementation(() => ({
+      async *[Symbol.asyncIterator]() {
+        yield { type: "text_delta", delta: "# Summary\n" };
+        yield { type: "text_delta", delta: "- point" };
+        const partial = { content: [
+          { type: "text", text: "# Summary\n- point" },
+          { type: "thinking", thinking: "", redacted: true, redactedContent: OPAQUE },
+        ] };
+        yield { type: "thinking_start", contentIndex: 1, partial };
+        yield { type: "thinking_end", contentIndex: 1, content: "", partial };
+      },
+      async result() {
+        return {
+          role: "assistant",
+          content: [
+            { type: "text", text: "# Summary\n- point" },
+            { type: "thinking", thinking: "", redacted: true, redactedContent: OPAQUE },
+          ],
+          usage: { input: 1, output: 1 },
+        };
+      },
+    }));
+
+    const server = await startGatewayServer(0);
+    try {
+      const events = await postStream(server.port, {
+        messages: [
+          { role: "user", content: "hola" },
+          { role: "assistant", content: [{ type: "text", text: "hola!" }] },
+          { role: "user", content: QUOTED_MARKER_PROMPT },
+        ],
+      });
+      const { starts, textByIndex } = validateBlockLifecycle(events);
+      expect(starts).toEqual([
+        { index: 0, type: "text" },
+        { index: 1, type: "redacted_thinking" },
+      ]);
+      // Live-streamed and NOT markdown-stripped (heading kept).
+      expect([...textByIndex.entries()]).toEqual([[0, "# Summary\n- point"]]);
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  it("PoC: no debe descartar el system prompt recibido desde OpenCode", async () => {
+    const externalSystemPrompt =
+      "__OPEN_CODE_SYSTEM_PROMPT__ auditor-global FASE 1";
+
+    mockStreamKiro.mockImplementation(() => ({
+      async *[Symbol.asyncIterator]() {},
+      async result() {
+        return {
+          role: "assistant",
+          content: [{ type: "text", text: "ok" }],
+          usage: { input: 1, output: 1 },
+        };
+      },
+    }));
+
+    const server = await startGatewayServer(0);
+
+    try {
+      const response = await fetch(`http://127.0.0.1:${server.port}/v1/messages`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer mock-token",
+        },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-6",
+          system: externalSystemPrompt,
+          messages: [
+            {
+              role: "user",
+              content: "INICIAR",
+            },
+          ],
+        }),
+      });
+
+      expect(response.status).toBe(200);
+
+      const [, context] = mockStreamKiro.mock.calls.at(-1)!;
+
+      // Esta es la expectativa correcta.
+      // Actualmente falla porque server.ts pasa systemPrompt: "".
+      expect(context.systemPrompt).toBe(externalSystemPrompt);
+    } finally {
+      await server.stop(true);
+    }
+  });
+});
+

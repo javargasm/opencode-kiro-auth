@@ -2746,4 +2746,56 @@ describe("conversationId stability (#17 — one deterministic id per session)", 
     expect(events.some((e) => e.type === "text_delta" || e.type === "text_start")).toBe(true);
     expect(cancelMock).toHaveBeenCalled();
   });
+
+  it("PoC: conserva el seed de Kiro y el system prompt externo", async () => {
+    const externalSystemPrompt =
+      "__OPEN_CODE_SYSTEM_PROMPT__ auditor-global FASE 1";
+
+    const fetchMock = mockFetchOk(
+      '{"content":"ok"}{"contextUsagePercentage":5}',
+    );
+    vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
+
+    const context: Context = {
+      systemPrompt: externalSystemPrompt,
+      messages: [
+        {
+          role: "user",
+          content: "INICIAR",
+          timestamp: Date.now(),
+        },
+      ],
+      tools: [],
+    };
+
+    await collect(
+      streamKiro(makeModel({ reasoning: false }), context, {
+        apiKey: "test-token",
+        profileArn: "arn:aws:codewhisperer:us-east-1:123:profile/test",
+      }),
+    );
+
+    const request = JSON.parse(
+      fetchMock.mock.calls[0]?.[1]?.body as string,
+    );
+
+    const conversation = request.conversationState;
+    const history = conversation.history;
+    const current =
+      conversation.currentMessage.userInputMessage.content;
+
+    // 1. El baseline obligatorio de Kiro sigue presente.
+    expect(history[0].userInputMessage.content).toContain(
+      "Follow this instruction: # Kiro CLI Default Agent",
+    );
+
+    expect(history[1].assistantResponseMessage.content).toContain(
+      "I will fully incorporate this information",
+    );
+
+    // 2. El prompt de OpenCode también llega al modelo.
+    expect(current).toContain(externalSystemPrompt);
+    expect(current).toContain("INICIAR");
+  });
 });
+
